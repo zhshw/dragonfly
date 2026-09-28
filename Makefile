@@ -77,3 +77,10 @@ package:
 release: configure build
 
 default: release
+
+.PHONY: dev
+
+# Local Debug build. Use `make dev JOBS=4` to limit Ninja parallelism.
+dev:
+	./helio/blaze.sh -DWITH_AWS=OFF -DWITH_GCP=OFF
+	ninja -C build-dbg $(if $(JOBS),-j $(JOBS)) dragonfly
