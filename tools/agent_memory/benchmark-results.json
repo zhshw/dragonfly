@@ -1,0 +1,654 @@
+{
+  "timestamp_utc": "2026-09-30T18:45:35.148541+00:00",
+  "versions": {
+    "redisvl": "0.12.1",
+    "redis": "6.4.0",
+    "pydocket": "0.18.2"
+  },
+  "python": "3.12.14",
+  "host": "Linux-7.0.0-34-generic-x86_64-with-glibc2.43",
+  "cpu_count": 24,
+  "load_average": [
+    2.86083984375,
+    2.474609375,
+    1.9833984375
+  ],
+  "binary_sha256": "13492d9728b3836d06509b7ab07388b49973ac57a7549e93f640fd4989ff4d4f",
+  "binary": "/home/zhangshenwang/workspace/db/dragonfly/build-dbg/dragonfly",
+  "server_flags": [
+    "--port=57789",
+    "--bind=127.0.0.1",
+    "--force_epoll=true",
+    "--proactor_threads=3",
+    "--num_shards=2",
+    "--dbfilename=",
+    "--logtostderr",
+    "--default_lua_flags=",
+    "--lua_allow_undeclared_auto_correct=false",
+    "--lua_undeclared_keys_shas=8929ea55fc26d043e4a7d3f010a74baeff87a465"
+  ],
+  "configuration": {
+    "binary": "/home/zhangshenwang/workspace/db/dragonfly/build-dbg/dragonfly",
+    "output": "tools/agent_memory/benchmark-results.json",
+    "vectors": 1000,
+    "dimensions": 1536,
+    "json_bytes": 1024,
+    "samples": 100,
+    "concurrency": 4,
+    "repeats": 3,
+    "batch_size": 64,
+    "lua_repetitions": 8,
+    "background_calls": 64,
+    "docket_batch_sizes": [
+      1,
+      16,
+      64,
+      256
+    ],
+    "allowed_sha": "8929ea55fc26d043e4a7d3f010a74baeff87a465"
+  },
+  "scope":
+      "SDK backend latency on local Debug binary; 4 vector and 4 JSON clients; no HTTP/models/workers; shared host, not production capacity",
+  "atomicity":
+      "Both comparison scripts explicitly declare all keys. GLOBAL uses only that SHA's allow-undeclared-keys flag; atomicity stays enabled.",
+  "trials": [
+    {
+      "scenario": "baseline",
+      "repeat": 0,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.41156,
+        "throughput_per_second": 165.87,
+        "latency_ms": {
+          "p50": 23.9952,
+          "p95": 36.0418,
+          "p99": 41.9892,
+          "max": 53.3736
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 2.508244,
+        "throughput_per_second": 159.47,
+        "latency_ms": {
+          "p50": 17.9723,
+          "p95": 71.8792,
+          "p99": 136.7809,
+          "max": 145.4218
+        }
+      }
+    },
+    {
+      "scenario": "declared_atomic",
+      "repeat": 0,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.421904,
+        "throughput_per_second": 165.16,
+        "latency_ms": {
+          "p50": 18.4057,
+          "p95": 46.1297,
+          "p99": 54.8399,
+          "max": 59.4373
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 2.538274,
+        "throughput_per_second": 157.59,
+        "latency_ms": {
+          "p50": 18.9889,
+          "p95": 91.6996,
+          "p99": 171.2604,
+          "max": 265.0532
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 3.179658,
+        "throughput_per_second": 20.13,
+        "latency_ms": {
+          "p50": 10.3566,
+          "p95": 10.8216,
+          "p99": 947.1165,
+          "max": 2485.0566
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 2
+      }
+    },
+    {
+      "scenario": "global_atomic",
+      "repeat": 0,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 3.115821,
+        "throughput_per_second": 128.38,
+        "latency_ms": {
+          "p50": 30.0394,
+          "p95": 50.7197,
+          "p99": 82.1426,
+          "max": 158.504
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 3.224466,
+        "throughput_per_second": 124.05,
+        "latency_ms": {
+          "p50": 16.2197,
+          "p95": 102.8165,
+          "p99": 141.9454,
+          "max": 168.0543
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 2.216697,
+        "throughput_per_second": 28.87,
+        "latency_ms": {
+          "p50": 34.1815,
+          "p95": 38.6366,
+          "p99": 65.5482,
+          "max": 74.264
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 64
+      }
+    },
+    {
+      "scenario": "docket_global_scheduler",
+      "repeat": 0,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.485448,
+        "throughput_per_second": 160.94,
+        "latency_ms": {
+          "p50": 23.903,
+          "p95": 40.2404,
+          "p99": 42.7642,
+          "max": 47.699
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 2.896293,
+        "throughput_per_second": 138.11,
+        "latency_ms": {
+          "p50": 13.306,
+          "p95": 107.5075,
+          "p99": 129.8732,
+          "max": 162.1888
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 3.107256,
+        "throughput_per_second": 20.6,
+        "latency_ms": {
+          "p50": 11.358,
+          "p95": 332.9822,
+          "p99": 379.9086,
+          "max": 397.2717
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 43
+      }
+    },
+    {
+      "scenario": "docket_global_scheduler",
+      "repeat": 1,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.615415,
+        "throughput_per_second": 152.94,
+        "latency_ms": {
+          "p50": 19.3797,
+          "p95": 53.3881,
+          "p99": 58.3404,
+          "max": 66.5527
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 3.043362,
+        "throughput_per_second": 131.43,
+        "latency_ms": {
+          "p50": 12.4156,
+          "p95": 90.9855,
+          "p99": 156.8959,
+          "max": 227.7624
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 3.082971,
+        "throughput_per_second": 20.76,
+        "latency_ms": {
+          "p50": 11.8345,
+          "p95": 147.9829,
+          "p99": 236.7493,
+          "max": 240.979
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 60
+      }
+    },
+    {
+      "scenario": "global_atomic",
+      "repeat": 1,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.936069,
+        "throughput_per_second": 136.24,
+        "latency_ms": {
+          "p50": 31.7813,
+          "p95": 48.3656,
+          "p99": 50.089,
+          "max": 51.9938
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 3.05898,
+        "throughput_per_second": 130.76,
+        "latency_ms": {
+          "p50": 8.0794,
+          "p95": 74.5289,
+          "p99": 140.557,
+          "max": 152.5406
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 2.059422,
+        "throughput_per_second": 31.08,
+        "latency_ms": {
+          "p50": 32.515,
+          "p95": 38.2483,
+          "p99": 39.4204,
+          "max": 40.0465
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 64
+      }
+    },
+    {
+      "scenario": "declared_atomic",
+      "repeat": 1,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.386173,
+        "throughput_per_second": 167.63,
+        "latency_ms": {
+          "p50": 23.5549,
+          "p95": 37.0147,
+          "p99": 45.642,
+          "max": 51.6436
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 2.569229,
+        "throughput_per_second": 155.69,
+        "latency_ms": {
+          "p50": 2.88,
+          "p95": 122.7121,
+          "p99": 149.5574,
+          "max": 218.0876
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 3.104787,
+        "throughput_per_second": 20.61,
+        "latency_ms": {
+          "p50": 9.5275,
+          "p95": 30.8873,
+          "p99": 913.0492,
+          "max": 2340.266
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 7
+      }
+    },
+    {
+      "scenario": "baseline",
+      "repeat": 1,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.391133,
+        "throughput_per_second": 167.28,
+        "latency_ms": {
+          "p50": 23.1676,
+          "p95": 36.2581,
+          "p99": 46.8581,
+          "max": 57.3479
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 2.515326,
+        "throughput_per_second": 159.03,
+        "latency_ms": {
+          "p50": 12.1931,
+          "p95": 79.556,
+          "p99": 185.141,
+          "max": 239.1773
+        }
+      }
+    },
+    {
+      "scenario": "baseline",
+      "repeat": 2,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.419155,
+        "throughput_per_second": 165.35,
+        "latency_ms": {
+          "p50": 23.954,
+          "p95": 35.3064,
+          "p99": 42.3878,
+          "max": 43.2989
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 2.487017,
+        "throughput_per_second": 160.84,
+        "latency_ms": {
+          "p50": 18.0362,
+          "p95": 64.4271,
+          "p99": 71.887,
+          "max": 85.5837
+        }
+      }
+    },
+    {
+      "scenario": "declared_atomic",
+      "repeat": 2,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.401874,
+        "throughput_per_second": 166.54,
+        "latency_ms": {
+          "p50": 23.503,
+          "p95": 37.2919,
+          "p99": 41.134,
+          "max": 44.5731
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 2.582406,
+        "throughput_per_second": 154.89,
+        "latency_ms": {
+          "p50": 2.4672,
+          "p95": 134.0936,
+          "p99": 161.2311,
+          "max": 204.8009
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 3.203304,
+        "throughput_per_second": 19.98,
+        "latency_ms": {
+          "p50": 10.3372,
+          "p95": 39.6617,
+          "p99": 937.3481,
+          "max": 2430.6622
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 4
+      }
+    },
+    {
+      "scenario": "global_atomic",
+      "repeat": 2,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 3.002063,
+        "throughput_per_second": 133.24,
+        "latency_ms": {
+          "p50": 32.8011,
+          "p95": 38.9656,
+          "p99": 45.5566,
+          "max": 49.9284
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 3.110609,
+        "throughput_per_second": 128.59,
+        "latency_ms": {
+          "p50": 14.3395,
+          "p95": 71.4503,
+          "p99": 110.1648,
+          "max": 175.4911
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 2.156,
+        "throughput_per_second": 29.68,
+        "latency_ms": {
+          "p50": 33.2362,
+          "p95": 38.3161,
+          "p99": 44.0055,
+          "max": 44.0174
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 64
+      }
+    },
+    {
+      "scenario": "docket_global_scheduler",
+      "repeat": 2,
+      "vector": {
+        "samples": 400,
+        "elapsed_seconds": 2.54388,
+        "throughput_per_second": 157.24,
+        "latency_ms": {
+          "p50": 12.5943,
+          "p95": 23.2009,
+          "p99": 226.1751,
+          "max": 451.5525
+        }
+      },
+      "json_cas": {
+        "samples": 400,
+        "elapsed_seconds": 3.086086,
+        "throughput_per_second": 129.61,
+        "latency_ms": {
+          "p50": 13.1832,
+          "p95": 66.3728,
+          "p99": 95.1267,
+          "max": 1251.7502
+        }
+      },
+      "background": {
+        "samples": 64,
+        "elapsed_seconds": 3.299029,
+        "throughput_per_second": 19.4,
+        "latency_ms": {
+          "p50": 13.8238,
+          "p95": 156.8942,
+          "p99": 607.5518,
+          "max": 1328.6788
+        },
+        "offered_calls": 64,
+        "completed_before_frontend_end": 47
+      }
+    }
+  ],
+  "docket_batches": [
+    {
+      "batch_size": 1,
+      "repeats": 3,
+      "tasks": 3,
+      "producer_concurrency": 1,
+      "enqueue_tasks_per_second": 1159.32,
+      "scheduler_tasks_per_second": 3397.96,
+      "scheduler_latency_ms": {
+        "p50": 0.2949,
+        "p95": 0.3211,
+        "p99": 0.3234,
+        "max": 0.324
+      },
+      "raw": [
+        {
+          "enqueue_seconds": 0.0011564120068214834,
+          "scheduler_seconds": 0.000323993997881189,
+          "total_seconds": 0.0014804060047026724
+        },
+        {
+          "enqueue_seconds": 0.0007291829970199615,
+          "scheduler_seconds": 0.00029488399741239846,
+          "total_seconds": 0.00102406699443236
+        },
+        {
+          "enqueue_seconds": 0.000702134013408795,
+          "scheduler_seconds": 0.0002640040183905512,
+          "total_seconds": 0.0009661380317993462
+        }
+      ],
+      "producer_to_stream_tasks_per_second": 864.4
+    },
+    {
+      "batch_size": 16,
+      "repeats": 3,
+      "tasks": 48,
+      "producer_concurrency": 16,
+      "enqueue_tasks_per_second": 1955.09,
+      "scheduler_tasks_per_second": 8796.72,
+      "scheduler_latency_ms": {
+        "p50": 1.8455,
+        "p95": 1.8908,
+        "p99": 1.8948,
+        "max": 1.8958
+      },
+      "raw": [
+        {
+          "enqueue_seconds": 0.009341324010165408,
+          "scheduler_seconds": 0.0018454600067343563,
+          "total_seconds": 0.011186784016899765
+        },
+        {
+          "enqueue_seconds": 0.008064215013291687,
+          "scheduler_seconds": 0.001895842986414209,
+          "total_seconds": 0.009960057999705896
+        },
+        {
+          "enqueue_seconds": 0.007145761017454788,
+          "scheduler_seconds": 0.0017152770014945418,
+          "total_seconds": 0.00886103801894933
+        }
+      ],
+      "producer_to_stream_tasks_per_second": 1599.58
+    },
+    {
+      "batch_size": 64,
+      "repeats": 3,
+      "tasks": 192,
+      "producer_concurrency": 16,
+      "enqueue_tasks_per_second": 2583.14,
+      "scheduler_tasks_per_second": 10412.53,
+      "scheduler_latency_ms": {
+        "p50": 5.9365,
+        "p95": 6.6351,
+        "p99": 6.6973,
+        "max": 6.7128
+      },
+      "raw": [
+        {
+          "enqueue_seconds": 0.024605054000858217,
+          "scheduler_seconds": 0.006712776987114921,
+          "total_seconds": 0.03131783098797314
+        },
+        {
+          "enqueue_seconds": 0.024472449003951624,
+          "scheduler_seconds": 0.005790091003291309,
+          "total_seconds": 0.030262540007242933
+        },
+        {
+          "enqueue_seconds": 0.025250782986404374,
+          "scheduler_seconds": 0.005936459987424314,
+          "total_seconds": 0.031187242973828688
+        }
+      ],
+      "producer_to_stream_tasks_per_second": 2069.69
+    },
+    {
+      "batch_size": 256,
+      "repeats": 3,
+      "tasks": 768,
+      "producer_concurrency": 16,
+      "enqueue_tasks_per_second": 2557.83,
+      "scheduler_tasks_per_second": 10995.98,
+      "scheduler_latency_ms": {
+        "p50": 23.1799,
+        "p95": 23.7972,
+        "p99": 23.852,
+        "max": 23.8657
+      },
+      "raw": [
+        {
+          "enqueue_seconds": 0.10076536500127986,
+          "scheduler_seconds": 0.02386574901174754,
+          "total_seconds": 0.1246311140130274
+        },
+        {
+          "enqueue_seconds": 0.09916836398770101,
+          "scheduler_seconds": 0.022798088990384713,
+          "total_seconds": 0.12196645297808573
+        },
+        {
+          "enqueue_seconds": 0.100320471014129,
+          "scheduler_seconds": 0.02317986302659847,
+          "total_seconds": 0.12350033404072747
+        }
+      ],
+      "producer_to_stream_tasks_per_second": 2075.13
+    }
+  ],
+  "database_memory": {
+    "used_memory": 21481482,
+    "used_memory_human": "20.49MiB",
+    "used_memory_peak": 21585962,
+    "used_memory_peak_human": "20.59MiB",
+    "fibers_stack_vms": 3710416,
+    "fibers_count": 61,
+    "used_memory_rss": 138141696,
+    "used_memory_rss_human": "131.74MiB",
+    "used_memory_peak_rss": 138100736,
+    "maxmemory": 39101720166,
+    "maxmemory_human": "36.42GiB",
+    "used_memory_lua": 1457112,
+    "object_used_memory": 7751712,
+    "type_used_memory_hash": 7594048,
+    "type_used_memory_key": 39936,
+    "type_used_memory_ReJSON-RL": 117728,
+    "table_used_memory": 516992,
+    "prime_capacity": 13440,
+    "num_entries": 1160,
+    "inline_keys": 0,
+    "small_string_bytes": 39936,
+    "pipeline_cache_bytes": 34184,
+    "dispatch_queue_bytes": 0,
+    "pipeline_queue_bytes": 0,
+    "dispatch_queue_subscriber_bytes": 0,
+    "dispatch_queue_peak_bytes": 0,
+    "client_read_buffer_peak_bytes": 199680,
+    "tls_bytes": 207088,
+    "snapshot_serialization_bytes": 0,
+    "commands_squashing_replies_bytes": 0,
+    "psync_buffer_size": 0,
+    "psync_buffer_bytes": 0,
+    "cache_mode": "store",
+    "maxmemory_policy": "noeviction",
+    "replication_streaming_buffer_bytes": 0,
+    "replication_full_sync_buffer_bytes": 0
+  },
+  "server_version": "df-dev"
+}

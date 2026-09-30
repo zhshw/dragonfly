@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <limits>
 #include <numbers>
 #include <string>
 #include <variant>
@@ -320,6 +321,43 @@ template <double (*Fn)(double)> Value MathFunc1(FuncArgs args) {
   return Fn(*d);
 }
 
+// max accepts one or more numeric values, including numeric strings. Missing or
+// nonnumeric inputs propagate null; NaN propagates regardless of argument order.
+Value FnMax(FuncArgs args) {
+  if (args.empty())
+    return {};
+  double result = -std::numeric_limits<double>::infinity();
+  bool has_nan = false;
+  for (const auto& arg : args) {
+    auto d = AsDouble(arg);
+    if (!d)
+      return {};
+    has_nan |= std::isnan(*d);
+    result = std::max(result, *d);
+  }
+  return has_nan ? std::numeric_limits<double>::quiet_NaN() : result;
+}
+
+// Like the unary math functions, pow preserves IEEE NaN/Inf results rather than
+// converting domain errors or overflow into a valid score.
+Value FnPow(FuncArgs args) {
+  if (args.size() != 2)
+    return {};
+  auto base = AsDouble(args[0]);
+  auto exponent = AsDouble(args[1]);
+  if (!base || !exponent)
+    return {};
+  return std::pow(*base, *exponent);
+}
+
+Value FnCoalesce(FuncArgs args) {
+  for (const auto& arg : args) {
+    if (!std::holds_alternative<std::monostate>(arg))
+      return arg;
+  }
+  return {};
+}
+
 // Date/time functions
 
 Value FnHour(FuncArgs args) {
@@ -528,6 +566,9 @@ const absl::flat_hash_map<std::string, FuncImpl>& Registry() {
       {"log2", MathFunc1<MathLog2>},
       {"log10", MathFunc1<MathLog10>},
       {"exp", MathFunc1<MathExp>},
+      {"max", FnMax},
+      {"pow", FnPow},
+      {"coalesce", FnCoalesce},
       // Date/time
       {"hour", FnHour},
       {"minute", FnMinute},

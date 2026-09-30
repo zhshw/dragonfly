@@ -1,0 +1,99 @@
+{
+  "version": "0.18.2",
+  "allowed_sha": "8929ea55fc26d043e4a7d3f010a74baeff87a465",
+  "allowed_shas": [
+    "8929ea55fc26d043e4a7d3f010a74baeff87a465",
+    "46dec5a67c168033d38f45742aba3572a9d73be9"
+  ],
+  "ams_scripts": [
+    {
+      "module": "agent_memory_server.docket_worker",
+      "constant": "BOUNDED_SCHEDULER_SCRIPT",
+      "sha": "46dec5a67c168033d38f45742aba3572a9d73be9",
+      "purpose": "atomic due scheduler with LIMIT 64 and selected-ID ZREM"
+    },
+    {
+      "module": "agent_memory_server.bounded_docket",
+      "constant": "BOUNDED_SCHEDULE_SCRIPT",
+      "sha": "1b322decba9108c8e214b74cb1d738e174c700c7",
+      "purpose": "atomic ZCARD plus XLEN admission with six declared keys"
+    },
+    {
+      "module": "agent_memory_server.bounded_docket",
+      "constant": "BOUNDED_CLAIM_SCRIPT",
+      "sha": "c0ab9cdb9c62be6dad3aec38a7cdd62b2b5590e8",
+      "purpose": "claim retains stream ID for atomic active cancellation"
+    },
+    {
+      "module": "agent_memory_server.bounded_docket",
+      "constant": "BOUNDED_CANCEL_SCRIPT",
+      "sha": "873e2fc3b95ec471ddce519d46bb3d8b30491156",
+      "purpose": "atomic cancel XACK and XDEL with six declared keys"
+    }
+  ],
+  "scripts": [
+    {
+      "file": "execution.py",
+      "sha": "cd7d9c77b5fec5a727af7a246da08acd8b105e5a",
+      "purpose": "schedule/reschedule",
+      "keys": "six explicit KEYS",
+      "ams_required": true
+    },
+    {
+      "file": "execution.py",
+      "sha": "1cf94a01b975aa9c7d4d35148b778b38752162e8",
+      "purpose": "claim",
+      "keys": "four explicit KEYS",
+      "ams_required": true
+    },
+    {
+      "file": "execution.py",
+      "sha": "8b51cd099d9bcd3ff5c790481013ff8b9acfc6d2",
+      "purpose": "terminal state",
+      "keys": "one explicit KEY",
+      "ams_required": true
+    },
+    {
+      "file": "docket.py",
+      "sha": "96fa24cbf19e5ec5b9ec2bf2d5cd1123496cefcd",
+      "purpose": "cancel",
+      "keys": "six explicit KEYS",
+      "ams_required": true
+    },
+    {
+      "file": "worker.py",
+      "sha": "8929ea55fc26d043e4a7d3f010a74baeff87a465",
+      "purpose": "due scheduler",
+      "keys": "two explicit KEYS plus dynamic parked/runs keys",
+      "ams_required": true
+    },
+    {
+      "file": "dependencies/_concurrency.py",
+      "sha": "6f36caecd532ce3f2892764a8423b6dd9df8005b",
+      "purpose": "concurrency admission",
+      "keys": "explicit KEYS",
+      "ams_required": false
+    },
+    {
+      "file": "dependencies/_concurrency.py",
+      "sha": "b69b109249f18c5309d490d611ceedb83cca5200",
+      "purpose": "concurrency release",
+      "keys": "explicit KEYS",
+      "ams_required": false
+    },
+    {
+      "file": "dependencies/_ratelimit.py",
+      "sha": "a61f01834344baed7a4c56e5c61b03696673907c",
+      "purpose": "rate limit admission",
+      "keys": "one explicit KEY",
+      "ams_required": false
+    },
+    {
+      "file": "dependencies/_debounce.py",
+      "sha": "af2770b0fd0dd8572f74316c47080cac3f18b1d2",
+      "purpose": "debounce admission",
+      "keys": "two explicit KEYS",
+      "ams_required": false
+    }
+  ]
+}

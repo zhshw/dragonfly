@@ -496,6 +496,58 @@ TEST(FilterExprTest, FuncGeoDistanceUnknownUnit) {
 
 // Built-in functions -- math
 
+TEST(FilterExprTest, FuncMax) {
+  DocValues doc{{"age", "-2"s}};
+  EXPECT_EQ(Eval("max(0, 1)", doc), Value(1.0));
+  EXPECT_EQ(Eval("max(@age)", doc), Value(-2.0));
+  EXPECT_EQ(Eval("max(-3, @age, -1)", doc), Value(-1.0));
+  EXPECT_EQ(Eval("max(0, (86400 - to_number(@age))/86400)", doc), Value((86400.0 + 2.0) / 86400.0));
+  for (auto expr : {"max()", "max(0, NULL)", "max(0, @missing)", "max('bad', 0)"})
+    EXPECT_EQ(Eval(expr, doc), Value{}) << expr;
+  EXPECT_EQ(Eval("max(-inf, 1, inf)", doc), Value(std::numeric_limits<double>::infinity()));
+  EXPECT_TRUE(std::isnan(std::get<double>(Eval("max(sqrt(-1), 0)", doc))));
+  EXPECT_TRUE(std::isnan(std::get<double>(Eval("max(0, sqrt(-1))", doc))));
+  EXPECT_EQ(Eval("max(sqrt(-1), NULL)", doc), Value{});
+  EXPECT_EQ(Eval("max(NULL, sqrt(-1))", doc), Value{});
+}
+
+TEST(FilterExprTest, FuncPow) {
+  DocValues doc;
+  EXPECT_EQ(Eval("pow(2, -1)", doc), Value(0.5));
+  EXPECT_EQ(Eval("pow('2', '3')", doc), Value(8.0));
+  EXPECT_EQ(Eval("pow(-2, 3)", doc), Value(-8.0));
+  EXPECT_EQ(Eval("pow(0, 0)", doc), Value(1.0));
+  EXPECT_EQ(Eval("pow(2, -inf)", doc), Value(0.0));
+  for (auto expr : {"pow()", "pow(2)", "pow(2, 3, 4)", "pow(NULL, 2)", "pow(2, NULL)",
+                    "pow('bad', 2)", "pow(2, @missing)"})
+    EXPECT_EQ(Eval(expr, doc), Value{}) << expr;
+  EXPECT_TRUE(std::isnan(std::get<double>(Eval("pow(-2, 0.5)", doc))));
+  EXPECT_TRUE(std::isinf(std::get<double>(Eval("pow(0, -1)", doc))));
+  EXPECT_TRUE(std::isinf(std::get<double>(Eval("pow(2, 1024)", doc))));
+}
+
+TEST(FilterExprTest, RecencyDecay) {
+  DocValues doc{{"last_accessed", 0.0}, {"created_at", 0.0}};
+  EXPECT_EQ(Eval("pow(2, -max(0, (604800 - @last_accessed)/86400)/7)", doc), Value(0.5));
+  doc["last_accessed"] = 700000.0;
+  EXPECT_EQ(Eval("pow(2, -max(0, (604800 - @last_accessed)/86400)/7)", doc), Value(1.0));
+  doc.erase("last_accessed");
+  EXPECT_EQ(Eval("pow(2, -max(0, (604800 - @last_accessed)/86400)/7)", doc), Value{});
+  EXPECT_EQ(Eval("pow(2, -max(0, (604800 - coalesce(to_number(@last_accessed), -inf))"
+                 "/86400)/7)",
+                 doc),
+            Value(0.0));
+}
+
+TEST(FilterExprTest, FuncCoalesce) {
+  DocValues doc;
+  EXPECT_EQ(Eval("coalesce(NULL, @missing, 0, 1)", doc), Value(0.0));
+  EXPECT_EQ(Eval("coalesce(NULL, '', 'fallback')", doc), Value(""s));
+  EXPECT_EQ(Eval("coalesce(NULL, 'fallback')", doc), Value("fallback"s));
+  EXPECT_EQ(Eval("coalesce(NULL, @missing)", doc), Value{});
+  EXPECT_EQ(Eval("coalesce()", doc), Value{});
+}
+
 TEST(FilterExprTest, FuncAbs) {
   DocValues doc{{"val", -3.5}};
   EXPECT_TRUE(EvalBool("abs(@val) == 3.5", doc));
