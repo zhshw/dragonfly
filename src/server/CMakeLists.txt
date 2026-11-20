@@ -131,6 +131,7 @@ endif()
 
 add_library(dfly_test_lib test_utils.cc)
 cxx_link(dfly_test_lib dragonfly_lib facade_test gtest_main_ext)
+helio_cxx_test(cluster/raft/data/data_dispatch_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(cluster/raft/data/set_executor_test dfly_test_lib LABELS DFLY)
 
 helio_cxx_test(dragonfly_test dfly_test_lib LABELS DFLY)

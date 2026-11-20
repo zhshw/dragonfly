@@ -1709,6 +1709,19 @@ void ServerFamily::Init(util::AcceptServer* acceptor, std::vector<facade::Listen
     fq_threadpool_.reset(new fb2::FiberQueueThreadPool(absl::GetFlag(FLAGS_epoll_file_threads)));
   }
 
+  if (service_.raft_data_commands()) {
+    if (GetFlag(FLAGS_aof) || GetFlag(FLAGS_replicaof).has_value() || GetFlag(FLAGS_cache_mode) ||
+        GetFlag(FLAGS_snapshot_cron).cron_expr || !GetFlag(FLAGS_save_schedule).empty())
+      ErrorAndExit(
+          "Raft data groups require their group log for recovery. Disable cache eviction, "
+          "snapshot schedules, AOF and legacy replication");
+
+    // The group runtime replays its committed prefix over a fresh DB. The initial SET effect
+    // clears TTL, so an individual replica must never expire or evict data on its own.
+    AllowExpiryOnAllShards(false);
+    save_on_shutdown_ = false;
+    return;
+  }
   string flag_dir = GetFlag(FLAGS_dir);
 
   if (detail::IsCloudPath(flag_dir)) {

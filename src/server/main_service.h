@@ -24,6 +24,10 @@ namespace facade {
 class RedisReplyBuilder;
 }  // namespace facade
 
+namespace dfly::cluster::raft {
+class DataCommandHandler;
+}
+
 namespace dfly {
 
 using facade::MemcacheParser;
@@ -36,6 +40,15 @@ class Service : public facade::ServiceInterface {
   void Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners);
 
   void Shutdown();
+
+  // Startup wiring. The caller owns the handler until service shutdown completes.
+  void SetRaftDataCommands(cluster::raft::DataCommandHandler* handler) {
+    raft_data_commands_ = handler;
+  }
+
+  cluster::raft::DataCommandHandler* raft_data_commands() const {
+    return raft_data_commands_;
+  }
 
   // Prepare command execution, verify and execute, reply to context
   facade::DispatchResult DispatchCommand(
@@ -198,7 +211,12 @@ class Service : public facade::ServiceInterface {
 
   base::VarzValue::Map GetVarzStats();
 
+  std::optional<facade::DispatchResult> DispatchRaftCommand(const CommandId& cid,
+                                                            const facade::ParsedArgs& args,
+                                                            CommandContext* cmd_cntx);
+
   util::ProactorPool& pp_;
+  cluster::raft::DataCommandHandler* raft_data_commands_ = nullptr;
 
   acl::UserRegistry user_registry_;
   acl::AclFamily acl_family_;

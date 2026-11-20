@@ -6,6 +6,7 @@
 
 #include "absl/strings/str_split.h"
 #include "facade/resp_expr.h"
+#include "server/cluster/raft/data/command_handler.h"
 #include "util/fibers/detail/fiber_interface.h"
 #include "util/fibers/fibers.h"
 #include "util/fibers/proactor_base.h"
@@ -993,6 +994,10 @@ void RegisterMutableFlags(ConfigRegistry* reg, absl::Span<const std::string> nam
 }
 
 void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners) {
+  if (IsRaftClusterEnabled() && !raft_data_commands_) {
+    LOG(ERROR) << "Raft data service requires a data group runtime";
+    exit(1);
+  }
   InitRedisTables();
   LockTagOptions::InitFromFlags();
   server.max_map_field_len = absl::GetFlag(FLAGS_listpack_max_field_len);
@@ -1409,7 +1414,7 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId& cid,
       return ErrorReply{absl::StrCat("'", cmd_name, "' not allowed inside a transaction")};
   }
 
-  if (IsClusterEnabled()) {
+  if (IsClusterEnabled() && !raft_data_commands_) {
     if (auto err = CheckKeysOwnership(cid, tail_args, dfly_cntx); err)
       return err;
   }
@@ -1453,6 +1458,49 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId& cid,
   return nullopt;
 }
 
+optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, const ParsedArgs& args,
+                                                      CommandContext* cmd) {
+  auto* cntx = cmd->server_conn_cntx();
+  auto reject = [&](string_view message) {
+    cmd->SendError(message);
+    return DispatchResult::ERROR;
+  };
+  string_view name = cid.name();
+  if (name == "SET" || name == "GET") {
+    if (cntx->ns != &namespaces->GetDefaultNamespace())
+      return reject("Raft data groups currently support the default namespace");
+    if (name == "SET" && args.size() != 2)
+      return reject("Raft data groups currently support SET key value");
+    if (name == "SET" && ServerState::tlocal()->ShouldDenyOnOOM())
+      return reject(kOutOfMemory);
+    auto status = name == "SET" ? raft_data_commands_->Set(cntx->db_index(), args[0], args[1])
+                                : raft_data_commands_->CheckRead(cntx->db_index(), args[0]);
+    if (!status.ok())
+      return reject(status.message());
+    if (name == "SET") {
+      cmd->SendSimpleString("OK");
+      return DispatchResult::OK;
+    }
+
+    // Continue GET through the ordinary shard transaction after the group read barrier.
+    return nullopt;
+  }
+  if (name == "READWRITE" || name == "READONLY") {
+    cmd->SendSimpleString("OK");
+    return DispatchResult::OK;
+  }
+  if (name == "CLUSTER" || name == "AUTH" || name == "HELLO" || name == "PING" || name == "ECHO" ||
+      name == "QUIT" || name == "RESET" || name == "SELECT" || name == "COMMAND" || name == "INFO")
+    return nullopt;
+  if (name == "CLIENT" && !args.empty()) {
+    auto sub = absl::AsciiStrToUpper(args[0]);
+    if (sub == "SETNAME" || sub == "GETNAME" || sub == "SETINFO" || sub == "ID" || sub == "INFO" ||
+        sub == "LIST" || sub == "HELP")
+      return nullopt;
+  }
+  return reject("Command is not supported by this Raft data group");
+}
+
 DispatchResult Service::DispatchCommand(
     facade::ParsedArgs args, facade::ParsedCommand* parsed_cmd, facade::AsyncPreference async_pref,
     absl::FunctionRef<void(facade::ParsedCommand*)>* pre_dispatch_cb) {
@@ -1465,6 +1513,17 @@ DispatchResult Service::DispatchCommand(
       (*pre_dispatch_cb)(parsed_cmd);
   };
 
+  bool raft_client =
+      raft_data_commands_ &&
+      !static_cast<CommandContext*>(parsed_cmd)->server_conn_cntx()->journal_emulated;
+  // Raft requests must stay in connection order. V2 retries as the head when ONLY_ASYNC blocks.
+  if (raft_client && async_pref == AsyncPreference::ONLY_ASYNC)
+    return DispatchResult::WOULD_BLOCK;
+  if (raft_client && parsed_cmd->mc_command()) {
+    invoke_pre_dispatch();
+    parsed_cmd->SendSimpleString("CLIENT_ERROR Raft data groups require RESP");
+    return DispatchResult::ERROR;
+  }
   if (parsed_cmd->mc_command()) {
     auto mc_res = HandleMemcacheCommand(parsed_cmd, async_pref);
     if (std::holds_alternative<facade::DispatchResult>(mc_res)) {
@@ -1480,7 +1539,7 @@ DispatchResult Service::DispatchCommand(
   parsed_cmd->SetReadOnly(cid && cid->IsReadOnly());
   if (cid == nullptr) {
     invoke_pre_dispatch();
-    if (async_pref != AsyncPreference::ONLY_SYNC) {
+    if (!raft_client && async_pref != AsyncPreference::ONLY_SYNC) {
       parsed_cmd->SetDeferredReply();
     }
     if (parsed_cmd->mc_command()) {
@@ -1505,7 +1564,7 @@ DispatchResult Service::DispatchCommand(
         return DispatchResult::WOULD_BLOCK;
       [[fallthrough]];
     case AsyncPreference::PREFER_ASYNC:
-      if (cid->SupportsAsync())
+      if (!raft_client && cid->SupportsAsync())
         parsed_cmd->SetDeferredReply();
       break;
   };
@@ -1565,6 +1624,11 @@ DispatchResult Service::DispatchCommand(
     DCHECK(!err->status);
     cmd_cntx->SendError(*err);
     return DispatchResult::ERROR;
+  }
+
+  if (raft_client) {
+    if (auto result = DispatchRaftCommand(*cid, args_no_cmd, cmd_cntx))
+      return *result;
   }
 
   VLOG_IF(1, cid->opt_mask() & CO::CommandOpt::DANGEROUS)
@@ -1748,7 +1812,7 @@ uint32_t Service::DispatchSquashedBatch(
   auto* ss = ServerState::tlocal();
 
   // Don't even start when paused. We can only continue if DispatchTracker is aware of us running.
-  if (ss->IsPaused())
+  if (ss->IsPaused() || raft_data_commands_)
     return 0;
 
   vector<CmdRef> cmd_refs;

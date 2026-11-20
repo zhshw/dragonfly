@@ -19,6 +19,7 @@ enum class ClusterMode {
   kNoCluster,
   kEmulatedCluster,
   kRealCluster,
+  kRaftCluster,
 };
 
 inline ClusterMode cluster_mode = ClusterMode::kUninitialized;
@@ -58,8 +59,12 @@ SlotId KeySlot(std::string_view key);
 
 void InitializeCluster();
 
+inline bool IsRaftClusterEnabled() {
+  return detail::cluster_mode == detail::ClusterMode::kRaftCluster;
+}
+
 inline bool IsClusterEnabled() {
-  return detail::cluster_mode == detail::ClusterMode::kRealCluster;
+  return detail::cluster_mode == detail::ClusterMode::kRealCluster || IsRaftClusterEnabled();
 }
 
 inline bool IsClusterEmulated() {

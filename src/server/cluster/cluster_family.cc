@@ -23,6 +23,7 @@
 #include "server/acl/acl_commands_def.h"
 #include "server/channel_store.h"
 #include "server/cluster/coordinator.h"
+#include "server/cluster/raft/data/command_handler.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/dflycmd.h"
@@ -199,7 +200,11 @@ void ClusterFamily::ClusterHelp(SinkReplyBuilder* builder) {
 }
 
 namespace {
-void ClusterShardsImpl(const ClusterShardInfos& config, SinkReplyBuilder* builder) {
+void ClusterShardsImpl(ClusterShardInfos config, SinkReplyBuilder* builder) {
+  for (auto& shard : config)
+    std::erase_if(shard.replicas,
+                  [](const auto& node) { return node.health == NodeHealth::HIDDEN; });
+
   // For more details https://redis.io/commands/cluster-shards/
   SinkReplyBuilder::ReplyAggregator agg(builder);
   constexpr unsigned int kEntrySize = 4;
@@ -247,14 +252,8 @@ void ClusterShardsImpl(const ClusterShardInfos& config, SinkReplyBuilder* builde
 
 void ClusterFamily::ClusterShards(SinkReplyBuilder* builder, ConnectionContext* cntx) {
   auto config = GetShardInfos(cntx);
-  if (config) {
-    // we need to remove hiden replicas
-    auto shards_info = config->Unwrap();
-    for (auto& shard : shards_info) {
-      std::erase_if(shard.replicas, [](const auto& r) { return r.health == NodeHealth::HIDDEN; });
-    }
-    return ClusterShardsImpl({shards_info}, builder);
-  }
+  if (config)
+    return ClusterShardsImpl(std::move(*config), builder);
   return builder->SendError(kClusterNotConfigured);
 }
 
@@ -453,6 +452,23 @@ void ClusterFamily::Cluster(CmdArgParser parser, CommandContext* cmd_cntx) {
 
   if (parser.HasNext()) {
     return builder->SendError(WrongNumArgsError(absl::StrCat("CLUSTER ", sub_cmd)));
+  }
+
+  if (auto* raft = server_family_->service().raft_data_commands();
+      raft && (sub_cmd == "MYID" || sub_cmd == "SLOTS" || sub_cmd == "SHARDS" ||
+               sub_cmd == "NODES" || sub_cmd == "INFO")) {
+    auto topology = raft->Topology();
+    if (!topology.ok())
+      return builder->SendError("-CLUSTERDOWN Cluster metadata is unavailable");
+    if (sub_cmd == "MYID")
+      return static_cast<RedisReplyBuilder*>(builder)->SendBulkString(topology->local_node_id);
+    if (sub_cmd == "SLOTS")
+      return ClusterSlotsImpl(std::move(topology->shards), builder);
+    if (sub_cmd == "SHARDS")
+      return ClusterShardsImpl(std::move(topology->shards), builder);
+    if (sub_cmd == "NODES")
+      return ClusterNodesImpl(topology->shards, topology->local_node_id, builder);
+    return ClusterInfoImpl(topology->shards, builder);
   }
 
   auto* cntx = cmd_cntx->server_conn_cntx();

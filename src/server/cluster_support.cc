@@ -56,6 +56,8 @@ void InitializeCluster() {
     cluster_mode = ClusterMode::kEmulatedCluster;
   } else if (cluster_mode_str == "yes") {
     cluster_mode = ClusterMode::kRealCluster;
+  } else if (cluster_mode_str == "raft") {
+    cluster_mode = ClusterMode::kRaftCluster;
   } else if (cluster_mode_str.empty()) {
     cluster_mode = ClusterMode::kNoCluster;
   } else {
