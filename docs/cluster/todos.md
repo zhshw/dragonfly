@@ -28,6 +28,7 @@
 
 - [ ] 02.1 建立逐 API 版本表，列出 header、flexible 版本、nullable 字段、tagged fields、错误码与默认值。实现 ApiVersions，只通告已实现的版本。
 - [ ] 02.2 分批实现 Vote、Begin/EndQuorumEpoch、Fetch、FetchSnapshot、DescribeQuorum，再接入动态 voter、BrokerRegistration 和 BrokerHeartbeat 消息。为每批保留请求、成功响应和错误响应样本。
+  - [x] 完成 Vote v0–2 请求与响应体的 schema 生成与编解码，对照 Java 产物核验目录 ID、预投票、错误回包及嵌套 tagged fields。[字节级用例](../../src/server/cluster/raft/protocol/vote_test.cc)
 - [ ] 02.3 实现 record batch 头、CRC、控制批次、快照头尾和元数据记录。为 slot 归属、迁移阶段与 KV 效果定义独立记录版本及启用条件。
 - [ ] 02.4 双向核对 Java 和 C++ 产物的字节与解码结果。覆盖未知 tagged field、未知元数据记录、截断消息、坏 CRC，以及 RPC 版本可用但 kraft.version 或 metadata.version 不满足的组合。
 
