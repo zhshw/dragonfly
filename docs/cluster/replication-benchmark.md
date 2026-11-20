@@ -189,7 +189,7 @@ Raft 可以借用旧版按字段写入同一块内存的做法。先算出整笔
 
 **网络已支持。** Linux 启动时探测 io_uring，可用时 Raft 的 Fetch 和 FetchSnapshot 连接随 Helio proactor 使用它。通过数据节点的 `INFO SERVER` 可查到 `multiplexing_api:iouring`。[启动探测](../../src/server/dfly_main.cc) · [Raft 连接](../../src/server/cluster/raft/transport/peer_connection.cc) · [进程用例](../../tests/integration/replication_comparison_test.py)
 
-**WAL 异步落盘仍待试验。** 当前每组的单线程 worker 依次执行日志写入和 `fsync`。可以将文件 I/O 交给使用 Helio `LinuxFile` 的 proactor fiber，使其在等磁盘时让出执行线程。DFE4 在同段窗口内仍须依次完成日志段同步和恢复标记长度同步。整条链成功后，本节点才可公布新的持久化位置。单连接 SET 仍需等待多数持久化和 leader 应用，收益需在相同网络后端实测。[组内 worker](../../src/server/cluster/raft/runtime/group.cc) · [分区追加](../../src/server/cluster/raft/log/partition_log.cc) · [恢复位置发布](../../src/server/cluster/raft/log/log_files.cc) · [Helio 文件接口](../../helio/util/fibers/uring_file.h)
+**WAL 刷盘已做 Linux 对照。** 保持同一网络后端，组 worker 提交 io_uring 后立即等待，追加至 HW 的 P95 没有稳定改善。下一步验证刷盘期间处理新到达的 Fetch 能否使两端落盘重叠，并在并发负载下单独测量组提交收益。[io_uring 设计、实测数据与验收方法](io_uring.md)
 
 ## 阻塞与快照恢复
 
