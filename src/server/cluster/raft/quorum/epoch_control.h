@@ -29,6 +29,10 @@ class EpochControl {
   EpochControl(ElectionCampaign& campaign, std::string listener, int32_t fetch_timeout_ms,
                int32_t max_election_backoff_ms);
 
+  std::string_view ListenerName() const {
+    return listener_;
+  }
+
   // Caller sends the eligible notifications subject to per-peer transport backoff.
   // A check-quorum timeout first resigns the leader and returns EndQuorumEpoch messages.
   [[nodiscard]] std::error_code Poll(int64_t now_ms, std::vector<EpochNotification>* notifications);

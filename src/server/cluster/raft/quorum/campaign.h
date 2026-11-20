@@ -67,6 +67,12 @@ class ElectionCampaign {
   // Called only when Fetch succeeds from the current leader in the specified epoch.
   void MarkFetchedFromLeader(int32_t leader_id, int32_t epoch);
 
+  // A failed log flush prevents the replica from safely reporting its log or voting.
+  void FenceStorage() {
+    if (!state_.storage_error)
+      state_.storage_error = std::make_error_code(std::errc::io_error);
+  }
+
   const QuorumVoteState& state() const {
     return state_;
   }
