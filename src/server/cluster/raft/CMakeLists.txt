@@ -7,6 +7,7 @@ add_library(dfly_raft
             log/partition_snapshot.cc
             log/record_batch.cc
             log/snapshot_file.cc
+            metadata/metadata_image.cc
             metadata/record_serde.cc
             protocol/api_versions.cc
             protocol/begin_epoch.cc
@@ -37,6 +38,7 @@ helio_cxx_test(config/quorum_config_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/partition_log_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/partition_snapshot_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/record_batch_test dfly_raft LABELS DFLY)
+helio_cxx_test(metadata/metadata_image_test dfly_raft LABELS DFLY)
 helio_cxx_test(metadata/record_serde_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/fetch_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/rpc_frame_test dfly_raft LABELS DFLY)
