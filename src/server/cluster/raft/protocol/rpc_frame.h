@@ -9,8 +9,10 @@
 
 #include "server/cluster/raft/protocol/api_versions.h"
 #include "server/cluster/raft/protocol/begin_epoch.h"
+#include "server/cluster/raft/protocol/describe_quorum.h"
 #include "server/cluster/raft/protocol/end_epoch.h"
 #include "server/cluster/raft/protocol/fetch.h"
+#include "server/cluster/raft/protocol/fetch_snapshot.h"
 #include "server/cluster/raft/protocol/vote.h"
 
 namespace dfly::cluster::raft::protocol {
@@ -42,6 +44,8 @@ struct RpcHandlers {
   VoteHandler vote;
   RpcHandler<BeginQuorumEpochRequest, BeginQuorumEpochResponse> begin_epoch;
   RpcHandler<EndQuorumEpochRequest, EndQuorumEpochResponse> end_epoch;
+  RpcHandler<DescribeQuorumRequest, DescribeQuorumResponse> describe_quorum;
+  RpcHandler<FetchSnapshotRequest, FetchSnapshotResponse> fetch_snapshot;
   RpcHandler<FetchRequest, FetchResponse> fetch;
 };
 
@@ -103,5 +107,19 @@ struct RequestMetadata {
 [[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
                                               int16_t version, int32_t correlation_id,
                                               FetchResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const DescribeQuorumRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              DescribeQuorumResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const FetchSnapshotRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              FetchSnapshotResponse* response);
 
 }  // namespace dfly::cluster::raft::protocol

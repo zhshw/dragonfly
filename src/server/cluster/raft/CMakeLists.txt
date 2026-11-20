@@ -7,8 +7,10 @@ add_library(dfly_raft
             log/record_batch.cc
             protocol/api_versions.cc
             protocol/begin_epoch.cc
+            protocol/describe_quorum.cc
             protocol/end_epoch.cc
             protocol/fetch.cc
+            protocol/fetch_snapshot.cc
             protocol/rpc_frame.cc
             protocol/vote.cc
             quorum/campaign.cc

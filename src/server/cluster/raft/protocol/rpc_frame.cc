@@ -121,6 +121,10 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
       Advertise<BeginQuorumEpochRequest>(&response);
     if (handlers.end_epoch)
       Advertise<EndQuorumEpochRequest>(&response);
+    if (handlers.describe_quorum)
+      Advertise<DescribeQuorumRequest>(&response);
+    if (handlers.fetch_snapshot)
+      Advertise<FetchSnapshotRequest>(&response);
   } else {
     response.error_code = kInvalidRequest;
   }
@@ -184,7 +188,9 @@ FrameResult Dispatch(int16_t version, int32_t correlation_id, Reader* reader,
 
 FrameResult DispatchRequestFrame(std::string_view input, size_t max_payload_size,
                                  const VoteHandler& vote_handler, std::string* response) {
-  return DispatchRpcFrame(input, max_payload_size, {vote_handler, {}, {}, {}}, response);
+  RpcHandlers handlers;
+  handlers.vote = vote_handler;
+  return DispatchRpcFrame(input, max_payload_size, handlers, response);
 }
 
 FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
@@ -224,6 +230,12 @@ FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
       break;
     case EndQuorumEpochRequest::kApiKey:
       dispatched = Dispatch(version, correlation_id, &reader, handlers.end_epoch, response);
+      break;
+    case DescribeQuorumRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.describe_quorum, response);
+      break;
+    case FetchSnapshotRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.fetch_snapshot, response);
       break;
     default:
       return {FrameStatus::kUnknownApi};
@@ -294,6 +306,28 @@ CodecError EncodeRequestFrame(const RequestMetadata& metadata, const FetchReques
 
 FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
                                 int32_t correlation_id, FetchResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata, const DescribeQuorumRequest& request,
+                              int16_t version, std::string* output) {
+  return WriteRequest(metadata, request, version, DescribeQuorumRequest::HeaderVersion(version),
+                      output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, DescribeQuorumResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata, const FetchSnapshotRequest& request,
+                              int16_t version, std::string* output) {
+  return WriteRequest(metadata, request, version, FetchSnapshotRequest::HeaderVersion(version),
+                      output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, FetchSnapshotResponse* response) {
   return ReadResponse(input, max_payload_size, version, correlation_id, response);
 }
 

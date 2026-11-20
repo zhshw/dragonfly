@@ -274,6 +274,133 @@ TEST(RpcFrameTest, KafkaJavaBeginEndEpochFrames) {
   }
 }
 
+// Unaligned snapshot chunks may end in the middle of a record batch.
+TEST(RpcFrameTest, KafkaJavaFetchSnapshotChunks) {
+  constexpr std::string_view requests[] = {
+      "0000003c003b00000102030400016b000000000200000003020274020000002a00000003000000000000002d"
+      "0000000200000000000000000300000100020263",
+      "0000004e003b00010102030400016b000000000200000003020274020000002a00000003000000000000002d"
+      "000000020000000000000000030100100000000000000000000000000000004d000100020263"};
+  constexpr std::string_view responses[] = {
+      "000000390102030400000000000000020274020000002a0000000000000000002d0000000200000000000000"
+      "0010000000000000000304010203000000",
+      "000000450102030400000000000000020274020000002a0000000000000000002d0000000200000000000000"
+      "0010000000000000000304010203000001000a02000000010268238400"};
+
+  for (int16_t v = 0; v <= 1; ++v) {
+    SCOPED_TRACE(v);
+    RpcHandlers handlers;
+    handlers.fetch_snapshot = [&](int16_t version, const FetchSnapshotRequest& request,
+                                  FetchSnapshotResponse* response) {
+      EXPECT_EQ(v, version);
+      std::string encoded;
+      EXPECT_EQ(CodecError::kOk,
+                EncodeRequestFrame({kCorrelationId, "k", {}}, request, version, &encoded));
+      EXPECT_EQ(FromHex(requests[v]), encoded);
+      if (request.topics.size() != 1 || request.topics[0].partitions.size() != 1)
+        return std::make_error_code(std::errc::invalid_argument);
+      const auto& input = request.topics[0].partitions[0];
+      EXPECT_EQ(45, input.snapshot_id.end_offset);
+      EXPECT_EQ(2, input.snapshot_id.epoch);
+      EXPECT_EQ(version ? 77 : 0, input.replica_directory_id.back());
+      auto& topic = response->topics.emplace_back();
+      topic.name = request.topics[0].name;
+      auto& part = topic.partitions.emplace_back();
+      part.index = input.partition;
+      part.size = 16;
+      part.position = input.position;
+      part.snapshot_id.end_offset = input.snapshot_id.end_offset;
+      part.snapshot_id.epoch = input.snapshot_id.epoch;
+      part.unaligned_records.data = FromHex("010203");
+      if (version) {
+        auto& node = response->node_endpoints.emplace_back();
+        node.node_id = 1;
+        node.host = "h";
+        node.port = 9092;
+      }
+      return std::error_code{};
+    };
+    std::string reply;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DispatchRpcFrame(FromHex(requests[v]), kMaxFrame, handlers, &reply).status);
+    EXPECT_EQ(FromHex(responses[v]), reply);
+    FetchSnapshotResponse decoded;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DecodeResponseFrame(reply, kMaxFrame, v, kCorrelationId, &decoded).status);
+    auto& part = decoded.topics.at(0).partitions.at(0);
+    EXPECT_EQ(FromHex("010203"), part.unaligned_records.data);
+    part.unaligned_records.data.reset();
+    std::string body;
+    EXPECT_EQ(CodecError::kInvalidData, Encode(decoded, v, &body));
+    part.unaligned_records.data.emplace();
+    ASSERT_EQ(CodecError::kOk, Encode(decoded, v, &body));
+  }
+}
+
+TEST(RpcFrameTest, KafkaJavaDescribeQuorumVersions) {
+  constexpr std::string_view requests[] = {
+      "00000017003700000102030400016b00020274020000002a000000",
+      "00000017003700010102030400016b00020274020000002a000000",
+      "00000017003700020102030400016b00020274020000002a000000"};
+  constexpr std::string_view responses[] = {
+      "0000003301020304000000020274020000002a00000000000100000003000000000000006502000000010000"
+      "0000000000660001000000",
+      "0000004301020304000000020274020000002a00000000000100000003000000000000006502000000010000"
+      "000000000066000000000000006400000000000000630001000000",
+      "000000630102030400000001020274020000002a000001000000010000000300000000000000650200000001"
+      "0000000000000000000000000000005800000000000000660000000000000064000000000000006300010000"
+      "020000000102027202682384000000"};
+
+  for (int16_t v = 0; v <= 2; ++v) {
+    SCOPED_TRACE(v);
+    RpcHandlers handlers;
+    handlers.describe_quorum = [&](int16_t version, const DescribeQuorumRequest& request,
+                                   DescribeQuorumResponse* response) {
+      EXPECT_EQ(v, version);
+      if (request.topics.size() != 1 || request.topics[0].partitions.size() != 1)
+        return std::make_error_code(std::errc::invalid_argument);
+      std::string encoded;
+      EXPECT_EQ(CodecError::kOk,
+                EncodeRequestFrame({kCorrelationId, "k", {}}, request, version, &encoded));
+      EXPECT_EQ(FromHex(requests[v]), encoded);
+      auto& topic = response->topics.emplace_back();
+      topic.topic_name = request.topics[0].topic_name;
+      auto& part = topic.partitions.emplace_back();
+      part.partition_index = request.topics[0].partitions[0].partition_index;
+      part.leader_id = 1;
+      part.leader_epoch = 3;
+      part.high_watermark = 101;
+      auto& voter = part.current_voters.emplace_back();
+      voter.replica_id = part.leader_id;
+      voter.log_end_offset = 102;
+      if (version >= 1) {
+        voter.last_fetch_timestamp = 100;
+        voter.last_caught_up_timestamp = 99;
+      }
+      if (version >= 2) {
+        voter.replica_directory_id.back() = 88;
+        auto& node = response->nodes.emplace_back();
+        node.node_id = voter.replica_id;
+        auto& listener = node.listeners.emplace_back();
+        listener.name = "r";
+        listener.host = "h";
+        listener.port = 9092;
+      }
+      return std::error_code{};
+    };
+    std::string reply;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DispatchRpcFrame(FromHex(requests[v]), kMaxFrame, handlers, &reply).status);
+    EXPECT_EQ(FromHex(responses[v]), reply);
+    DescribeQuorumResponse decoded;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DecodeResponseFrame(reply, kMaxFrame, v, kCorrelationId, &decoded).status);
+    const auto& part = decoded.topics.at(0).partitions.at(0);
+    EXPECT_EQ(101, part.high_watermark);
+    EXPECT_EQ(102, part.current_voters.at(0).log_end_offset);
+  }
+}
+
 TEST(RpcFrameTest, KafkaJavaApiVersionsFeatureTags) {
   auto frame = FromHex(
       "000000450102030400000100000000040014020e6b726166742e76657273696f6e00000001000108"

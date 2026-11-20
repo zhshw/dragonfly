@@ -49,10 +49,10 @@ def field_name(field):
     return re.sub(r"(?<!^)(?=[A-Z])", "_", field["name"]).lower()
 
 
-def cpp_field(field):
+def cpp_field(field, common):
     raw = field["type"]
     if raw.startswith("[]"):
-        element = raw[2:] if field.get("fields") else TYPES[raw[2:]]
+        element = raw[2:] if field.get("fields") or raw[2:] in common else TYPES[raw[2:]]
         typ = f"std::vector<{element}>"
     elif field.get("fields"):
         typ = raw
@@ -68,9 +68,14 @@ def cpp_field(field):
     return typ
 
 
-def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
+def emit_struct(name, fields, constants, header, impl, flexible, common, parents=()):
     header.append(f"struct {name} {{")
     header.extend(constants)
+    if not parents:
+        for struct in common.values():
+            emit_struct(
+                struct["name"], struct["fields"], [], header, impl, flexible, common, (name,)
+            )
     visitor = []
     tags = ["m.unknown_tags"]
     for field in fields:
@@ -84,6 +89,7 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
                 header,
                 impl,
                 flexible,
+                common,
                 (*parents, name),
             )
         default = field.get("default", "null")
@@ -99,7 +105,13 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
             and field.get("default") != "null"
         ):
             initializer = "{std::in_place}"
-        header.append(f"{cpp_field(field)} {field_name(field)}{initializer};")
+        if (
+            field["type"] == "string"
+            and "nullableVersions" in field
+            and field.get("default") != "null"
+        ):
+            initializer = "{std::in_place}"
+        header.append(f"{cpp_field(field, common)} {field_name(field)}{initializer};")
         if "tag" in field:
             since = first_version(field["taggedVersions"])
             if field["taggedVersions"] != field["versions"] or since < flexible:
@@ -127,6 +139,8 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
             visitor.append("}")
         else:
             visitor.append(f"if (!io.Field({member})) return false;")
+        if field["type"] == "records" and "nullableVersions" not in field:
+            visitor.append(f"if (!{member}.data.has_value()) return false;")
     header.extend(
         ["TaggedFields unknown_tags;", f"bool operator==(const {name}&) const = default;", "};", ""]
     )
@@ -200,7 +214,8 @@ def generate(schema_dir, api, stem):
         else:
             raise ValueError(f"Unsupported header version map {headers}")
         constants.append("")
-        emit_struct(name, schema["fields"], constants, header, impl, flexible)
+        common = {struct["name"]: struct for struct in schema.get("commonStructs", [])}
+        emit_struct(name, schema["fields"], constants, header, impl, flexible, common)
         header.append(
             "// Encode or decode one complete body without the RPC header or frame length."
         )
@@ -236,3 +251,5 @@ if __name__ == "__main__":
     generate(schema_dir, "BeginQuorumEpoch", "begin_epoch")
     generate(schema_dir, "EndQuorumEpoch", "end_epoch")
     generate(schema_dir, "Fetch", "fetch")
+    generate(schema_dir, "DescribeQuorum", "describe_quorum")
+    generate(schema_dir, "FetchSnapshot", "fetch_snapshot")
