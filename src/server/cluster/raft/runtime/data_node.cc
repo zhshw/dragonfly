@@ -167,7 +167,7 @@ class DataNodeImpl final : public DataNode {
   fb2::Fiber migration_fiber_;
 
   // Both loops run on owner_, each with a separate RPC connection.
-  int32_t controller_leader_ = -1;
+  optional<QuorumEndpoint> controller_leader_;
 };
 
 absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broker& broker) {
@@ -271,7 +271,7 @@ void DataNodeImpl::RegisterOrHeartbeat(PeerConnection& peer, const MetadataImage
 }
 
 void DataNodeImpl::BrokerLoop() {
-  int32_t connected = -1;
+  optional<QuorumEndpoint> connected;
   unique_ptr<PeerConnection> peer;
   while (!stopping_) {
     auto view = image_.load();
@@ -285,17 +285,18 @@ void DataNodeImpl::BrokerLoop() {
             break;
           }
         }
-        int32_t leader = -1;
+        optional<QuorumEndpoint> leader;
         auto s = observer_->Visit([&](RaftGroup::State state) {
-          leader = state.election.state().election.leader_id.value_or(-1);
+          if (const auto& ep = state.election.LeaderEndpoint(); ep)
+            leader = QuorumEndpoint{ep->host, ep->port};
           return absl::OkStatus();
         });
-        controller_leader_ = s.ok() && controllers_.contains(leader) ? leader : -1;
-        if (controller_leader_ >= 0) {
+        controller_leader_ = s.ok() ? leader : nullopt;
+        if (controller_leader_) {
           if (connected != leader) {
             if (peer)
               peer->Close();
-            peer = make_unique<PeerConnection>(controllers_.at(leader), 2000, kMaxRaftFrame);
+            peer = make_unique<PeerConnection>(*leader, 2000, kMaxRaftFrame);
             connected = leader;
           }
           RegisterOrHeartbeat(*peer, *view, local->second);
@@ -309,17 +310,17 @@ void DataNodeImpl::BrokerLoop() {
 }
 
 void DataNodeImpl::MigrationLoop() {
-  int32_t connected = -1;
+  optional<QuorumEndpoint> connected;
   unique_ptr<PeerConnection> peer;
   while (!stopping_) {
     auto local = partition_.load();
     const auto leader = controller_leader_;
-    if (local && leader >= 0) {
+    if (local && leader) {
       if (connected != leader) {
         if (peer)
           peer->Close();
         connected = leader;
-        peer = make_unique<PeerConnection>(controllers_.at(connected), 2000, kMaxRaftFrame);
+        peer = make_unique<PeerConnection>(*leader, 2000, kMaxRaftFrame);
       }
       local->migrations->Tick(*peer);
     }

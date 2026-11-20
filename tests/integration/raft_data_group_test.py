@@ -27,6 +27,7 @@ GROUPS = {10: (11, 12), 20: (21, 22)}
 
 class RaftDataGroupFixture(unittest.TestCase):
     learner = None
+    new_controller = None
     controller_admin = False
 
     def setUp(self):
@@ -48,28 +49,37 @@ class RaftDataGroupFixture(unittest.TestCase):
                 return sock.getsockname()[1]
 
             nodes = [1, 2, 3, 11, 12, 21, 22]
+            if self.new_controller is not None:
+                nodes.append(self.new_controller)
             if self.learner is not None:
                 nodes.append(self.learner)
             for node in nodes:
                 self.raft[node] = port()
-                if node > 3:
+                if node > 3 and node != self.new_controller:
                     self.resp[node] = port()
                 elif self.controller_admin:
                     self.admin[node] = port()
+
+            def directory(n):
+                return base64.urlsafe_b64encode(bytes([n]) * 16).decode().rstrip("=")
+
+            def initial_voters(members):
+                return ",".join(f"{n}@{HOST}:{self.raft[n]}:{directory(n)}" for n in members)
+
             for node in nodes:
                 options = []
-                if self.learner and (node in GROUPS[10] or node == self.learner):
-                    directory = (
-                        lambda n: base64.urlsafe_b64encode(bytes([n]) * 16).decode().rstrip("=")
-                    )
+                if self.new_controller and node not in self.resp:
+                    options = [directory(node)]
+                    if node == self.new_controller:
+                        options.append("--no-initial-controllers")
+                    else:
+                        options += ["--initial-controllers", initial_voters((1, 2, 3))]
+                elif self.learner and (node in GROUPS[10] or node == self.learner):
                     options = [directory(node), "--data-group", "10"]
                     if node == self.learner:
                         options.append("--no-initial-controllers")
                     else:
-                        initial = ",".join(
-                            f"{n}@{HOST}:{self.raft[n]}:{directory(n)}" for n in GROUPS[10]
-                        )
-                        options += ["--initial-controllers", initial]
+                        options += ["--initial-controllers", initial_voters(GROUPS[10])]
                 subprocess.run(
                     [
                         self.bin.with_name("raft_storage"),
@@ -109,15 +119,19 @@ class RaftDataGroupFixture(unittest.TestCase):
         self.config = self.root / "topology.json"
         self.config.write_text(json.dumps({"groups": groups}))
         for node in self.raft:
-            self.start(node)
+            if node != self.new_controller:
+                self.start(node)
 
     def start(self, node):
+        voters = self.voters
+        if node == self.new_controller:
+            voters += f",{node}@{HOST}:{self.raft[node]}"
         flags = [
             f"--dir={self.root / str(node)}",
             f"--raft_node_id={node}",
             "--cluster_mode=raft",
             f"--raft_cluster_id={self.cluster_id}",
-            f"--raft_quorum_voters={self.voters}",
+            f"--raft_quorum_voters={voters}",
             "--force_epoll",
             "--proactor_threads=1",
             "--logtostderr",
@@ -462,6 +476,77 @@ class ControllerAdminTest(RaftDataGroupFixture):
             self.start(member)
         with redis.Redis(host=HOST, port=check_completed()) as target:
             self.assertEqual(target.get(new_key), b"new owner write")
+
+
+class DynamicControllerDiscoveryTest(RaftDataGroupFixture):
+    new_controller = 4
+    controller_admin = True
+
+    def test_data_nodes_follow_controller_outside_bootstrap_list(self):
+        slots = self.wait_for(self.slots)
+        key = b"{12561}:move"
+        with redis.Redis(host=HOST, port=slots[0][2][1]) as source:
+            self.assertTrue(source.set(key, b"from original controller"))
+
+        added = self.new_controller
+        self.start(added)
+
+        def caught_up_observer():
+            for node in (1, 2, 3):
+                view = describe(self.raft[node])
+                if view and view.hw > 0 and view.observers.get(added, -1) >= view.hw:
+                    return view
+
+        old = self.wait_for(caught_up_observer)
+        old_port = self.raft[old.leader]
+        self.assertEqual(
+            change_voter(
+                old_port,
+                80,
+                self.cluster_id,
+                added,
+                bytes([added]) * 16,
+                listener="CONTROLLER",
+                endpoint=self.raft[added],
+            ),
+            0,
+        )
+        # Each removal waits for its commit. Removing the old leader last elects C4 deterministically.
+        for node in sorted(old.voters, key=lambda n: n == old.leader):
+            self.assertEqual(
+                change_voter(old_port, 81, self.cluster_id, node, bytes([node]) * 16), 0
+            )
+        self.wait_for(
+            lambda: (v := describe(self.raft[added]))
+            and v.leader == added
+            and set(v.voters) == {added}
+            and v.hw > old.hw
+        )
+        with redis.Redis(host=HOST, port=self.admin[added], password=self.admin_password) as admin:
+            self.wait_for(lambda: admin.hmget("ctl:slot:42", "owner") == [b"10"])
+            request = '{"slot":42,"from":10,"to":20,"generation":1}'
+            self.assertTrue(admin.set("ctl:req:after-election", request, nx=True))
+            self.wait_for(
+                lambda: admin.hgetall("ctl:op:after-election").get(b"phase") == b"finished"
+            )
+            self.assertEqual(admin.hmget("ctl:slot:42", "owner", "generation"), [b"20", b"2"])
+
+        # The restarted follower must register a new incarnation on C4. All other brokers must
+        # keep heartbeating through the previous incarnation's session timeout.
+        follower = next(n for n in GROUPS[20] if self.resp[n] == slots[1][3][1])
+        self.stop(follower, crash=True)
+        self.start(follower)
+
+        def rediscovered_routes():
+            rows = [sorted(self.client(n).execute_command("CLUSTER", "SLOTS")) for n in self.resp]
+            if len(rows[0]) == 4 and all(r == rows[0] for r in rows):
+                return rows[0]
+
+        routes = self.wait_for(rediscovered_routes)
+        self.assertEqual(routes[1][:2], [42, 42])
+        with redis.Redis(host=HOST, port=routes[1][2][1]) as target:
+            self.assertEqual(target.get(key), b"from original controller")
+            self.assertTrue(target.set(key, b"after controller election"))
 
 
 class DynamicDataGroupTest(RaftDataGroupFixture):
