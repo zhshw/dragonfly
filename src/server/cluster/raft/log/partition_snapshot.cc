@@ -17,6 +17,12 @@ namespace dfly::cluster::raft {
 using namespace std;
 using namespace log_files;
 
+std::optional<LogPosition> PartitionLog::SnapshotAtOrBefore(int64_t end_offset) const {
+  auto it = std::upper_bound(snapshots_.begin(), snapshots_.end(), end_offset,
+                             [](int64_t offset, LogPosition id) { return offset < id.end_offset; });
+  return it == snapshots_.begin() ? std::nullopt : std::optional{*std::prev(it)};
+}
+
 optional<LogPosition> PartitionLog::LatestSnapshot() const {
   if (snapshots_.empty())
     return nullopt;

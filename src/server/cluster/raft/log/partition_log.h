@@ -41,6 +41,7 @@ class PartitionLog {
     return start_.end_offset;
   }
   std::optional<LogPosition> LatestSnapshot() const;
+  std::optional<LogPosition> SnapshotAtOrBefore(int64_t end_offset) const;
 
   // Kafka RaftLog's Fetch validation returns the common prefix or a snapshot to download.
   FetchPosition ValidateOffsetAndEpoch(int64_t offset, int32_t epoch) const;

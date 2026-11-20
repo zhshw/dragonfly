@@ -26,6 +26,11 @@ absl::Status Replay(const FeatureLevelRecord& record, MetadataImage* image) {
   // The pinned MetadataVersion enum supports 3.3-IV3 through 4.5-IV0.
   if (record.name == "metadata.version" && (record.feature_level < 7 || record.feature_level > 34))
     return absl::UnimplementedError("Unsupported metadata.version feature level");
+  if (record.name == "dragonfly.cluster" &&
+      (record.feature_level > 1 ||
+       (record.feature_level == 0 && !image->directory.nodes().empty())))
+    return absl::FailedPreconditionError(
+        "Unsupported dragonfly.cluster level or downgrade of a populated directory");
   if (record.feature_level < 0)
     return absl::DataLossError("Negative metadata feature level");
   if (record.feature_level == 0)
@@ -72,6 +77,23 @@ requires(std::is_same_v<T, FenceBrokerRecord> ||
     return broker.status();
   (*broker)->fenced = std::is_same_v<T, FenceBrokerRecord>;
   return absl::OkStatus();
+}
+
+template <typename T>
+requires(std::is_same_v<T, RedisNodeRecord> || std::is_same_v<T, DataGroupRecord> ||
+         std::is_same_v<T, GroupLeaderRecord> ||
+         std::is_same_v<T, SlotAssignmentRecord>) absl::Status
+    Replay(const T& record, MetadataImage* image, bool snapshot = false) {
+  auto level = image->features.find("dragonfly.cluster");
+  if (level == image->features.end() || level->second != 1)
+    return absl::FailedPreconditionError("Dragonfly cluster records require dragonfly.cluster=1");
+  if constexpr (std::is_same_v<T, RedisNodeRecord> || std::is_same_v<T, GroupLeaderRecord>) {
+    return image->directory.Replay(record, image->brokers, snapshot);
+  } else if constexpr (std::is_same_v<T, SlotAssignmentRecord>) {
+    return image->directory.Replay(record, snapshot);
+  } else {
+    return image->directory.Replay(record);
+  }
 }
 
 absl::Status Replay(const NoOpRecord&, MetadataImage*) {
@@ -122,7 +144,21 @@ absl::Status MetadataLoader::ApplyBatch(string_view bytes) {
                 *working = *stable;
               in_transaction = false;
             } else {
-              return Replay(message, working.get());
+              auto status = Replay(message, working.get());
+              if (!status.ok())
+                return status;
+              if constexpr (is_same_v<T, RegisterBrokerRecord>) {
+                working->registration_offsets[message.broker_id] = rec.offset;
+                if (!message.in_controlled_shutdown)
+                  working->shutdown_offsets.erase(message.broker_id);
+              } else if constexpr (is_same_v<T, UnregisterBrokerRecord>) {
+                working->registration_offsets.erase(message.broker_id);
+                working->shutdown_offsets.erase(message.broker_id);
+              } else if constexpr (is_same_v<T, BrokerRegistrationChangeRecord>) {
+                if (message.in_controlled_shutdown == 1)
+                  working->shutdown_offsets[message.broker_id] = rec.offset;
+              }
+              return status;
             }
             return absl::OkStatus();
           },
@@ -144,9 +180,78 @@ absl::Status MetadataLoader::ApplyBatch(string_view bytes) {
   return absl::OkStatus();
 }
 
+absl::Status MetadataLoader::RestoreSnapshot(const PartitionLog& log, LogPosition id) {
+  auto next = make_shared<MetadataImage>();
+  int64_t position = 0;
+  int64_t offset = 0;
+  int64_t total_size;
+  do {
+    auto prefix = log.ReadSnapshot(id, position, 12);
+    if (!prefix.ok())
+      return prefix.status();
+    total_size = prefix->total_size;
+    auto size = RecordBatchSize(prefix->bytes);
+    if (!size.ok())
+      return size.status();
+    auto chunk = log.ReadSnapshot(id, position, *size);
+    if (!chunk.ok())
+      return chunk.status();
+    vector<RecordView> values;
+    auto batch = DecodeRecordBatch(chunk->bytes, &values);
+    if (!batch.ok())
+      return batch.status();
+    if (batch->base_offset != offset || batch->end.epoch != id.epoch)
+      return absl::DataLossError("Discontinuous metadata snapshot");
+    offset = batch->end.end_offset;
+    position += chunk->bytes.size();
+    if (batch->control)
+      continue;
+    for (const auto& value : values) {
+      if (!value.value)
+        return absl::DataLossError("Null metadata snapshot record");
+      auto record = DecodeMetadataRecord(*value.value);
+      if (!record.ok())
+        return record.status();
+      auto status = visit(
+          [&](const auto& msg) -> absl::Status {
+            using T = decay_t<decltype(msg)>;
+            if constexpr (is_same_v<T, BeginTransactionRecord> ||
+                          is_same_v<T, AbortTransactionRecord> ||
+                          is_same_v<T, EndTransactionRecord>) {
+              return absl::DataLossError("Transaction marker in metadata snapshot");
+            } else if constexpr (is_same_v<T, RedisNodeRecord> || is_same_v<T, DataGroupRecord> ||
+                                 is_same_v<T, GroupLeaderRecord> ||
+                                 is_same_v<T, SlotAssignmentRecord>) {
+              return Replay(msg, next.get(), true);
+            } else {
+              return Replay(msg, next.get());
+            }
+          },
+          record->message);
+      if (!status.ok())
+        return status;
+    }
+  } while (position < total_size);
+  for (const auto& [broker_id, broker] : next->brokers) {
+    next->registration_offsets[broker_id] = id.end_offset - 1;
+    if (broker.in_controlled_shutdown)
+      next->shutdown_offsets[broker_id] = id.end_offset - 1;
+  }
+  next->stable_end_offset = id.end_offset;
+  consumed_end_offset_ = id.end_offset;
+  image_ = std::move(next);
+  transaction_.reset();
+  return absl::OkStatus();
+}
+
 absl::Status MetadataLoader::Advance(const PartitionLog& log, int64_t high_watermark) {
   if (high_watermark < 0 || high_watermark > log.End().end_offset)
     return absl::OutOfRangeError("Metadata HW is outside the local log");
+  if (auto id = log.SnapshotAtOrBefore(high_watermark);
+      id && id->end_offset > consumed_end_offset_) {
+    if (auto status = RestoreSnapshot(log, *id); !status.ok())
+      return status;
+  }
   if (consumed_end_offset_ < log.StartOffset())
     return absl::FailedPreconditionError(
         "Install the metadata snapshot before consuming its log suffix");

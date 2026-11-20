@@ -1,0 +1,21 @@
+{
+  "name": "DataGroupRecord",
+  "apiKey": 16385,
+  "type": "metadata",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "fields": [
+    {
+      "name": "GroupId",
+      "type": "int32",
+      "versions": "0+",
+      "about": "Partition ID in the internal Dragonfly data topic."
+    },
+    {
+      "name": "Members",
+      "type": "[]int32",
+      "versions": "0+",
+      "about": "Initial broker layout. The group's own KRaft log determines its active voters."
+    }
+  ]
+}

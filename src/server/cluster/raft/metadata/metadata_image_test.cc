@@ -48,6 +48,17 @@ class MetadataImageTest : public testing::Test {
   absl::Status CatchUp() {
     return loader_.Advance(*log_, log_->End().end_offset);
   }
+  void Install(LogPosition cut, initializer_list<MetadataRecord> records) {
+    vector<string> values;
+    for (const auto& record : records)
+      values.push_back(EncodeMetadataRecord(record).value());
+    auto bytes = MakeSnapshotHeaderBatch(cut.epoch, 123, 99).value();
+    bytes += MakeDataBatch(1, cut.epoch, 123, values).value();
+    bytes += MakeSnapshotFooterBatch(1 + values.size(), cut.epoch, 123).value();
+    auto writer = log_->BeginSnapshot(cut, bytes.size()).value();
+    ASSERT_TRUE(writer->Append(0, bytes).ok());
+    ASSERT_TRUE(log_->InstallSnapshot(writer.get(), loader_.consumed_end_offset()).ok());
+  }
 
   filesystem::path dir_;
   unique_ptr<PartitionLog> log_;
@@ -146,6 +157,48 @@ TEST_F(MetadataImageTest, RejectsMalformedTransactionsAndPartialCommitBoundaries
   Append({{Feature("metadata.version", 12)}, {BeginTransactionRecord{}}});
   EXPECT_FALSE(CatchUp().ok());
   EXPECT_TRUE(loader_.image()->features.empty());
+}
+
+TEST_F(MetadataImageTest, RecoversSnapshotDirectoryAndOnlyPublishesCommittedSuffix) {
+  Append({{BeginTransactionRecord{}}, {Feature("discarded", 1)}});
+  ASSERT_TRUE(CatchUp().ok());
+  ASSERT_TRUE(loader_.transaction_open());
+  RegisterBrokerRecord broker;
+  broker.broker_id = 7;
+  broker.broker_epoch = 55;
+  broker.in_controlled_shutdown = true;
+  Install({2, 100}, {{Feature("metadata.version", 33)},
+                     {Feature("dragonfly.cluster", 1)},
+                     {broker, 4},
+                     {RedisNodeRecord{7, "A", {}}},
+                     {DataGroupRecord{10, {7}, {}}},
+                     {GroupLeaderRecord{10, 7, 4, -1, 7, 47, {}}},
+                     {SlotAssignmentRecord{0, 16383, -1, 0, 10, 8, {}}}});
+  log_.reset();
+  log_ = PartitionLog::Open(dir_).value();
+  auto suffix = EncodeMetadataRecord({Feature("suffix", 1)}).value();
+  ASSERT_TRUE(log_->Append(MakeDataBatch(100, 2, 124, span(&suffix, 1)).value(), 2).ok());
+  ASSERT_TRUE(loader_.Advance(*log_, 100).ok());
+  auto snapshot = loader_.image();
+  EXPECT_FALSE(loader_.transaction_open());
+  EXPECT_EQ(snapshot->stable_end_offset, 100);
+  EXPECT_TRUE(snapshot->directory.HasCompleteCoverage());
+  EXPECT_EQ(snapshot->directory.Lookup(42), (SlotOwner{10, 8}));
+  EXPECT_FALSE(snapshot->directory.Route(42, snapshot->brokers));
+  EXPECT_EQ(snapshot->registration_offsets.at(7), 99);
+  EXPECT_EQ(snapshot->shutdown_offsets.at(7), 99);
+  EXPECT_FALSE(snapshot->features.contains("discarded"));
+  EXPECT_FALSE(snapshot->features.contains("suffix"));
+  ASSERT_TRUE(CatchUp().ok());
+  auto stable = loader_.image();
+  EXPECT_EQ(stable->features.at("suffix"), 1);
+  EXPECT_EQ(stable->stable_end_offset, 101);
+
+  // An intact Kafka envelope can still contain an invalid image. Never install a prefix.
+  Install({2, 120}, {{Feature("bad", 1)}, {BeginTransactionRecord{}}});
+  EXPECT_FALSE(CatchUp().ok());
+  EXPECT_EQ(loader_.image(), stable);
+  EXPECT_EQ(loader_.consumed_end_offset(), 101);
 }
 
 }  // namespace

@@ -1,0 +1,43 @@
+{
+  "name": "SlotAssignmentRecord",
+  "apiKey": 16387,
+  "type": "metadata",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "fields": [
+    {
+      "name": "FirstSlot",
+      "type": "uint16",
+      "versions": "0+"
+    },
+    {
+      "name": "LastSlot",
+      "type": "uint16",
+      "versions": "0+",
+      "about": "Inclusive upper bound."
+    },
+    {
+      "name": "ExpectedGroup",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "ExpectedGeneration",
+      "type": "int64",
+      "versions": "0+"
+    },
+    {
+      "name": "GroupId",
+      "type": "int32",
+      "versions": "0+"
+    },
+    {
+      "name": "Generation",
+      "type": "int64",
+      "versions": "0+",
+      "about":
+          "New generation; log assignments advance by one. A snapshot stores the current absolute generation."
+    }
+  ]
+}

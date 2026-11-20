@@ -8,6 +8,8 @@
 #include <memory>
 
 #include "server/cluster/raft/metadata/record_serde.h"
+#include "server/cluster/raft/metadata/slot_directory.h"
+#include "server/cluster/raft/quorum/election.h"
 
 namespace dfly::cluster::raft {
 
@@ -18,7 +20,10 @@ class PartitionLog;
 struct MetadataImage {
   int64_t stable_end_offset = 0;
   std::map<std::string, int16_t, std::less<>> features;
-  std::map<int32_t, protocol::RegisterBrokerRecord> brokers;
+  RegisteredBrokers brokers;
+  std::map<int32_t, int64_t> registration_offsets;
+  std::map<int32_t, int64_t> shutdown_offsets;
+  SlotDirectory directory;
 
   bool operator==(const MetadataImage&) const = default;
 };
@@ -31,12 +36,16 @@ class MetadataLoader {
   std::shared_ptr<const MetadataImage> image() const {
     return image_;
   }
+  bool transaction_open() const {
+    return transaction_ != nullptr;
+  }
   int64_t consumed_end_offset() const {
     return consumed_end_offset_;
   }
 
  private:
   absl::Status ApplyBatch(std::string_view bytes);
+  absl::Status RestoreSnapshot(const PartitionLog& log, LogPosition id);
 
   std::shared_ptr<const MetadataImage> image_ = std::make_shared<MetadataImage>();
   std::unique_ptr<MetadataImage> transaction_;

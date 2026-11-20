@@ -9,6 +9,7 @@
 #include <variant>
 
 #include "server/cluster/raft/protocol/metadata_records.h"
+#include "server/cluster/raft/protocol/slot_records.h"
 
 namespace dfly::cluster::raft {
 
@@ -17,7 +18,9 @@ using MetadataPayload =
                  protocol::FenceBrokerRecord, protocol::UnfenceBrokerRecord,
                  protocol::FeatureLevelRecord, protocol::BrokerRegistrationChangeRecord,
                  protocol::NoOpRecord, protocol::BeginTransactionRecord,
-                 protocol::EndTransactionRecord, protocol::AbortTransactionRecord>;
+                 protocol::EndTransactionRecord, protocol::AbortTransactionRecord,
+                 protocol::RedisNodeRecord, protocol::DataGroupRecord, protocol::GroupLeaderRecord,
+                 protocol::SlotAssignmentRecord>;
 
 struct MetadataRecord {
   MetadataPayload message;
