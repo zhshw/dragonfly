@@ -16,6 +16,7 @@ add_library(dfly_raft
             metadata/metadata_snapshot.cc
             metadata/record_serde.cc
             metadata/slot_directory.cc
+            metadata/slot_migration.cc
             protocol/add_voter.cc
             protocol/api_versions.cc
             protocol/begin_epoch.cc
@@ -65,6 +66,7 @@ helio_cxx_test(metadata/broker_control_test dfly_raft LABELS DFLY)
 helio_cxx_test(metadata/metadata_image_test dfly_raft LABELS DFLY)
 helio_cxx_test(metadata/record_serde_test dfly_raft LABELS DFLY)
 helio_cxx_test(metadata/slot_directory_test dfly_raft LABELS DFLY)
+helio_cxx_test(metadata/slot_migration_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/fetch_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/rpc_frame_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/vote_test dfly_raft LABELS DFLY)

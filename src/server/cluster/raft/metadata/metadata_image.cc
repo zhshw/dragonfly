@@ -81,8 +81,8 @@ requires(std::is_same_v<T, FenceBrokerRecord> ||
 
 template <typename T>
 requires(std::is_same_v<T, RedisNodeRecord> || std::is_same_v<T, DataGroupRecord> ||
-         std::is_same_v<T, GroupLeaderRecord> ||
-         std::is_same_v<T, SlotAssignmentRecord>) absl::Status
+         std::is_same_v<T, GroupLeaderRecord> || std::is_same_v<T, SlotAssignmentRecord> ||
+         std::is_same_v<T, SlotMigrationRecord>) absl::Status
     Replay(const T& record, MetadataImage* image, bool snapshot = false) {
   auto level = image->features.find("dragonfly.cluster");
   if (level == image->features.end() || level->second != 1)
@@ -90,7 +90,11 @@ requires(std::is_same_v<T, RedisNodeRecord> || std::is_same_v<T, DataGroupRecord
   if constexpr (std::is_same_v<T, RedisNodeRecord> || std::is_same_v<T, GroupLeaderRecord>) {
     return image->directory.Replay(record, image->brokers, snapshot);
   } else if constexpr (std::is_same_v<T, SlotAssignmentRecord>) {
+    if (image->migrations.BlocksAssignment(record.first_slot, record.last_slot))
+      return absl::FailedPreconditionError("A slot in the assignment has an active migration");
     return image->directory.Replay(record, snapshot);
+  } else if constexpr (std::is_same_v<T, SlotMigrationRecord>) {
+    return image->migrations.Replay(record, snapshot, &image->directory);
   } else {
     return image->directory.Replay(record);
   }
@@ -144,6 +148,14 @@ absl::Status MetadataLoader::ApplyBatch(string_view bytes) {
                 *working = *stable;
               in_transaction = false;
             } else {
+              if constexpr (is_same_v<T, SlotMigrationRecord>) {
+                auto previous = working->migrations.records().find(message.migration_id);
+                bool already_switched = previous != working->migrations.records().end() &&
+                                        previous->second.phase == message.phase;
+                if (!in_transaction && !already_switched &&
+                    message.phase == static_cast<int8_t>(MigrationPhase::kCutover))
+                  return absl::DataLossError("Slot cutover requires a metadata transaction");
+              }
               auto status = Replay(message, working.get());
               if (!status.ok())
                 return status;
@@ -221,7 +233,8 @@ absl::Status MetadataLoader::RestoreSnapshot(const PartitionLog& log, LogPositio
               return absl::DataLossError("Transaction marker in metadata snapshot");
             } else if constexpr (is_same_v<T, RedisNodeRecord> || is_same_v<T, DataGroupRecord> ||
                                  is_same_v<T, GroupLeaderRecord> ||
-                                 is_same_v<T, SlotAssignmentRecord>) {
+                                 is_same_v<T, SlotAssignmentRecord> ||
+                                 is_same_v<T, SlotMigrationRecord>) {
               return Replay(msg, next.get(), true);
             } else {
               return Replay(msg, next.get());

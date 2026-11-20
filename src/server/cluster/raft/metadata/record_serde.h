@@ -20,7 +20,7 @@ using MetadataPayload =
                  protocol::NoOpRecord, protocol::BeginTransactionRecord,
                  protocol::EndTransactionRecord, protocol::AbortTransactionRecord,
                  protocol::RedisNodeRecord, protocol::DataGroupRecord, protocol::GroupLeaderRecord,
-                 protocol::SlotAssignmentRecord>;
+                 protocol::SlotAssignmentRecord, protocol::SlotMigrationRecord>;
 
 struct MetadataRecord {
   MetadataPayload message;

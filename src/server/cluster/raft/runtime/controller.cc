@@ -116,6 +116,11 @@ class ActiveController {
         return brokers_.Heartbeat(image, NowMs(), req, res);
       });
     };
+    handlers.slot_migration = [this](int16_t, const auto& req, auto* res) {
+      return ApplyRequest(res, [&](const MetadataImage& image, int64_t) {
+        return ProposeSlotMigration(image, cluster_id_, req, res);
+      });
+    };
     return handlers;
   }
 

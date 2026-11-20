@@ -105,6 +105,22 @@ def register(port, cluster, incarnation, resp_port, raft_port):
     return error, epoch
 
 
+def migrate(port, cluster, action, migration_id, generation=1):
+    # Dragonfly SlotMigration v0. Admin actions carry no data group proof.
+    req = compact(cluster) + bytes([action]) + migration_id
+    req += struct.pack(
+        ">Hiiqiiqiiqqqbiq", 42, 10, 20, generation, -1, -1, -1, -1, -1, -1, -1, -1, 0, -1, -1
+    )
+    result = io.BytesIO(broker_rpc(port, 20000, 0, req + b"\x01\x00"))
+    (error,) = struct.unpack(">h", result.read(2))
+    length = result.read(1)[0] - 1
+    assert 0 <= length < 127
+    message = result.read(length).decode()
+    phase, source_finished, target_finished, tags = result.read(4)
+    assert not tags and not result.read() and not source_finished and not target_finished
+    return error, phase, message
+
+
 def heartbeat(port, epoch, applied_offset):
     req = struct.pack(">iqqBBB", 7, epoch, applied_offset, 0, 0, 0)
     _, error, caught, fenced, shutdown, tags = struct.unpack(
@@ -323,6 +339,74 @@ class ControllerProcessTest(unittest.TestCase):
             self.assertEqual(heartbeat(new_port, epoch, next_view.hw - 1), (0, True, False))
             self.assertEqual(heartbeat(new_port, epoch - 1, next_view.hw - 1), (77, False, True))
             self.assertEqual(register(new_port, self.cluster_id, 1, *ports), (0, epoch))
+
+    def test_migration_decision_and_retry_survive_controller_failover(self):
+        self.configure(3)
+        groups = [
+            dict(
+                group_id=g,
+                slot_ranges=[dict(start=start, end=end)],
+                members=[
+                    dict(
+                        id=name,
+                        ip="127.0.0.1",
+                        port=6000 + broker,
+                        broker_id=broker,
+                        raft_port=7000 + broker,
+                    )
+                ],
+            )
+            for g, start, end, name, broker in [(10, 0, 8191, "A", 7), (20, 8192, 16383, "B", 8)]
+        ]
+        path = self.root / "bootstrap.json"
+        self.bootstrap_flags = [f"--raft_bootstrap_topology={path}"]
+        old_bootstrap = json.dumps(
+            [
+                dict(
+                    group_id=g["group_id"],
+                    slot_ranges=g["slot_ranges"],
+                    master=g["members"][0],
+                    replicas=[],
+                )
+                for g in groups
+            ]
+        )
+
+        # A fresh controller can reject the old format before its other voters are online.
+        path.write_text(old_bootstrap)
+        rejected = subprocess.run(self.args(1), capture_output=True, timeout=10)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(b"Expected a Raft topology object with a groups array", rejected.stderr)
+
+        path.write_text(json.dumps({"groups": groups}))
+        for node in self.ports:
+            self.start(node)
+        first = self.committed(1)
+        port = self.ports[first.leader]
+        migration_id = bytes.fromhex("00112233445566778899aabbccddeeff")
+        self.assertEqual(migrate(port, self.cluster_id, 1, migration_id, generation=2)[0], 42)
+        self.assertEqual(migrate(port, self.cluster_id, 1, migration_id), (0, 1, ""))
+        self.assertEqual(migrate(port, self.cluster_id, 1, migration_id), (0, 1, ""))
+        stable = self.committed(first.hw)
+        self.stop(first.leader, crash=True)
+        second = self.committed(stable.hw)
+        port = self.ports[second.leader]
+        self.assertEqual(migrate(port, self.cluster_id, 6, migration_id), (0, 1, ""))
+        self.assertEqual(migrate(port, self.cluster_id, 4, migration_id), (0, 4, ""))
+        self.assertEqual(migrate(port, self.cluster_id, 4, migration_id), (0, 4, ""))
+        self.assertEqual(migrate(port, self.cluster_id, 1, bytes([2]) * 16)[0], 42)
+
+        # On restart the committed topology and the migration decision come from the quorum log.
+        for node in list(self.nodes):
+            self.stop(node, crash=True)
+        path.write_text(old_bootstrap)
+        for node in self.ports:
+            self.start(node)
+        recovered = self.committed(second.hw)
+        self.assertGreater(recovered.epoch, second.epoch)
+        self.assertEqual(
+            migrate(self.ports[recovered.leader], self.cluster_id, 6, migration_id), (0, 4, "")
+        )
 
     def test_recovers_broker_and_registration_barrier_from_offline_snapshot(self):
         self.configure(1)

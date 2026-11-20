@@ -9,6 +9,7 @@
 
 #include "server/cluster/raft/metadata/record_serde.h"
 #include "server/cluster/raft/metadata/slot_directory.h"
+#include "server/cluster/raft/metadata/slot_migration.h"
 #include "server/cluster/raft/quorum/election.h"
 
 namespace dfly::cluster::raft {
@@ -24,6 +25,7 @@ struct MetadataImage {
   std::map<int32_t, int64_t> registration_offsets;
   std::map<int32_t, int64_t> shutdown_offsets;
   SlotDirectory directory;
+  SlotMigrations migrations;
 
   bool operator==(const MetadataImage&) const = default;
 };

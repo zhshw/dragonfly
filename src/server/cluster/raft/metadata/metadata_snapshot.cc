@@ -22,21 +22,13 @@ class ImageWriter {
   }
 
   absl::Status Header(const MembershipHistory& membership, int64_t last_time) {
-    string version, voters;
-    vector<ControlRecordValue> controls;
-    auto kraft = membership.KraftVersionAt(cut_.end_offset - 1);
-    if (kraft == 1) {
-      if (Encode(KRaftVersionRecord{0, kraft, {}}, 0, &version) != CodecError::kOk)
-        return absl::InvalidArgumentError("Cannot encode snapshot KRaft version");
-      controls.push_back({5, version});
-    }
-    if (const auto* v = membership.VotersAt(cut_.end_offset - 1)) {
-      if (kraft != 1 || Encode(*v, 0, &voters) != CodecError::kOk)
-        return absl::InvalidArgumentError("Cannot encode snapshot voter configuration");
-      controls.push_back({6, voters});
-    }
-    return AddBatch(MakeSnapshotHeaderBatch(cut_.epoch, now_, last_time, controls),
-                    1 + controls.size());
+    auto header = membership.SnapshotHeader(cut_, now_, last_time);
+    if (!header.ok())
+      return header.status();
+    auto batch = DecodeRecordBatch(*header);
+    if (!batch.ok())
+      return batch.status();
+    return AddBatch(std::move(header), batch->end.end_offset);
   }
 
   absl::Status Record(MetadataRecord record) {
@@ -162,6 +154,10 @@ absl::Status WriteMetadataSnapshot(const MetadataImage& image, const MembershipH
   }
   if (auto s = WriteDirectory(image.directory, &writer); !s.ok())
     return s;
+  for (const auto& [id, migration] : image.migrations.records()) {
+    if (auto s = writer.Record({migration}); !s.ok())
+      return s;
+  }
   return writer.Finish(hw, log);
 }
 }  // namespace dfly::cluster::raft

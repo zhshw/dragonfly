@@ -60,6 +60,26 @@ int16_t MembershipHistory::KraftVersionAt(int64_t offset) const {
   return value ? *value : 0;
 }
 
+absl::StatusOr<string> MembershipHistory::SnapshotHeader(LogPosition cut, int64_t now_ms,
+                                                         int64_t last_record_ms) const {
+  if (cut.end_offset <= 0 || cut.end_offset > next_offset_)
+    return absl::InvalidArgumentError("Quorum membership has not reached the snapshot cut");
+  string version, voters;
+  vector<ControlRecordValue> controls;
+  auto kraft = KraftVersionAt(cut.end_offset - 1);
+  if (kraft == 1) {
+    if (Encode(KRaftVersionRecord{0, kraft, {}}, 0, &version) != CodecError::kOk)
+      return absl::InvalidArgumentError("Cannot encode snapshot KRaft version");
+    controls.push_back({5, version});
+  }
+  if (const auto* v = VotersAt(cut.end_offset - 1)) {
+    if (kraft != 1 || Encode(*v, 0, &voters) != CodecError::kOk)
+      return absl::InvalidArgumentError("Cannot encode snapshot voter configuration");
+    controls.push_back({6, voters});
+  }
+  return MakeSnapshotHeaderBatch(cut.epoch, now_ms, last_record_ms, controls);
+}
+
 void MembershipHistory::TruncateNewEntries(int64_t end_offset) {
   voters_.erase(voters_.lower_bound(end_offset), voters_.end());
   versions_.erase(versions_.lower_bound(end_offset), versions_.end());

@@ -30,6 +30,9 @@ class MembershipHistory {
     return next_offset_;
   }
   int16_t KraftVersionAt(int64_t offset) const;
+  // Snapshot header contains the feature and voter records effective at the last included offset.
+  absl::StatusOr<std::string> SnapshotHeader(LogPosition cut, int64_t now_ms,
+                                             int64_t last_record_ms) const;
   const protocol::VotersRecord* VotersAt(int64_t offset) const;
   std::optional<int64_t> LastVoterOffset() const;
   const protocol::VotersRecord* LatestVoters() const {
