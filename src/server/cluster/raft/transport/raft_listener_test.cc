@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "server/cluster/raft/transport/peer_connection.h"
 #include "util/accept_server.h"
 #include "util/fibers/pool.h"
 
@@ -21,14 +22,19 @@ class RaftListenerTest : public testing::Test {
     pool_.reset(util::fb2::Pool::Epoll(1));
     pool_->Run();
     server_ = std::make_unique<util::AcceptServer>(pool_.get(), false);
-    auto handler = [](int16_t, const protocol::VoteRequest&, protocol::VoteResponse*) {
+    auto handler = [](int16_t version, const protocol::VoteRequest& request,
+                      protocol::VoteResponse* response) {
+      if (request.voter_id == 7 && version >= 1) {
+        response->error_code = 125;
+        return std::error_code{};
+      }
       return std::make_error_code(std::errc::io_error);
     };
     protocol::RpcHandlers handlers;
     handlers.vote = handler;
     auto* listener = new RaftListener(4096, std::move(handlers));
     ASSERT_FALSE(server_->AddListener("127.0.0.1", 0, listener));
-    const uint16_t port = listener->socket()->LocalEndpoint().port();
+    port_ = listener->socket()->LocalEndpoint().port();
     server_->Run();
 
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -38,7 +44,7 @@ class RaftListenerTest : public testing::Test {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port);
+    addr.sin_port = htons(port_);
     ASSERT_EQ(connect(fd_, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
   }
 
@@ -49,6 +55,7 @@ class RaftListenerTest : public testing::Test {
     pool_->Stop();
   }
 
+  uint16_t port_ = 0;
   int fd_ = -1;
   std::unique_ptr<util::ProactorPool> pool_;
   std::unique_ptr<util::AcceptServer> server_;
@@ -83,6 +90,26 @@ TEST_F(RaftListenerTest, FragmentedAndPipelinedRequestsKeepCorrelationAndOrder) 
     EXPECT_EQ(response.error_code, 0);
     pending.erase(0, frame.consumed);
   }
+}
+
+TEST_F(RaftListenerTest, PeerNegotiatesAndReconnectsAfterUnacknowledgedRequest) {
+  pool_->GetNextProactor()->Await([&] {
+    PeerConnection peer({"127.0.0.1", port_}, 1000, 4096);
+    int16_t version = -1;
+    EXPECT_EQ(peer.Negotiate<protocol::FetchRequest>(13, &version),
+              std::errc::protocol_not_supported);
+    EXPECT_FALSE(peer.Negotiate<protocol::VoteRequest>(2, &version));
+    EXPECT_EQ(version, 2);
+    protocol::VoteRequest request;
+    protocol::VoteResponse response;
+    EXPECT_TRUE(peer.Call(request, 0, &response));
+    request.voter_id = 7;
+    for (int i = 0; i < 2; ++i) {
+      EXPECT_FALSE(peer.Call(request, 1, &response));
+      EXPECT_EQ(response.error_code, 125);
+    }
+    peer.Close();
+  });
 }
 
 TEST_F(RaftListenerTest, OversizedFrameClosedBeforeBodyArrives) {
