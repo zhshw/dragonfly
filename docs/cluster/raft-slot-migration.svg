@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 700" width="1060" height="700" role="img">
+  <title>slot 42 从组 10 迁到组 20</title>
+  <rect width="1060" height="700" fill="white" />
+  <g id="h-cp" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="18" text-anchor="middle" fill="#195b98">
+    <text x="119.0" y="32.0">KRaft controller</text>
+  </g>
+  <g id="h-src" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="18" text-anchor="middle" fill="#287640">
+    <text x="392.0" y="32.0">源组 10 · A</text>
+  </g>
+  <g id="h-tgt" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="18" text-anchor="middle" fill="#6741a5">
+    <text x="665.0" y="32.0">目标组 20 · B</text>
+  </g>
+  <g id="h-tgr" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="18" text-anchor="middle" fill="#6741a5">
+    <text x="938.0" y="32.0">目标副本 B-r1</text>
+  </g>
+  <polyline id="ln-cp" stroke="#b0b9c2" fill="none" stroke-width="1" stroke-dasharray="5 4" points="119,55 119,690" />
+  <polyline id="ln-src" stroke="#b0b9c2" fill="none" stroke-width="1" stroke-dasharray="5 4" points="392,55 392,690" />
+  <polyline id="ln-tgt" stroke="#b0b9c2" fill="none" stroke-width="1" stroke-dasharray="5 4" points="665,55 665,690" />
+  <polyline id="ln-tgr" stroke="#b0b9c2" fill="none" stroke-width="1" stroke-dasharray="5 4" points="938,55 938,690" />
+  <polyline id="a1" stroke="#195b98" fill="none" stroke-width="2" points="119,95 665,95" />
+  <polygon points="665.00,95.00 655.00,99.00 655.00,91.00" fill="#195b98" />
+  <g id="t1" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#195b98">
+    <text x="392.0" y="82.0">发布迁移意图：slot 42，10 → 20</text>
+  </g>
+  <polyline id="a1b" stroke="#195b98" fill="none" stroke-width="2" points="119,139 392,139" />
+  <polygon points="392.00,139.00 382.00,143.00 382.00,135.00" fill="#195b98" />
+  <g id="t1b" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#195b98">
+    <text x="255.5" y="126.0">源组收到迁移意图</text>
+  </g>
+  <polyline id="a2" stroke="#287640" fill="none" stroke-width="2" points="392,200 119,200" />
+  <polygon points="119.00,200.00 129.00,196.00 129.00,204.00" fill="#287640" />
+  <g id="t2" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#287640">
+    <text x="255.5" y="187.0">已排空写入，冻结标记已提交</text>
+  </g>
+  <polyline id="a2r" stroke="#287640" fill="none" stroke-width="2" points="392,252 665,252" />
+  <polygon points="665.00,252.00 655.00,256.00 655.00,248.00" fill="#287640" />
+  <g id="t2r" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#287640">
+    <text x="528.5" y="239.0">导出冻结位置的 slot 42 镜像</text>
+  </g>
+  <polyline id="a3" stroke="#287640" fill="none" stroke-width="2" points="392,298 665,298" />
+  <polygon points="665.00,298.00 655.00,302.00 655.00,294.00" fill="#287640" />
+  <g id="t3" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#287640">
+    <text x="528.5" y="285.0">传输分块、DB、绝对 TTL 和校验值</text>
+  </g>
+  <polyline id="a4" stroke="#6741a5" fill="none" stroke-width="3" points="938,348 665,348" />
+  <polygon points="665.00,348.00 675.00,344.00 675.00,352.00" fill="#6741a5" />
+  <g id="t4" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#6741a5">
+    <text x="801.5" y="335.0">Fetch 目标组日志</text>
+  </g>
+  <polyline id="a4r" stroke="#6741a5" fill="none" stroke-width="2" points="665,392 938,392" />
+  <polygon points="938.00,392.00 928.00,396.00 928.00,388.00" fill="#6741a5" />
+  <g id="t4r" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#6741a5">
+    <text x="801.5" y="379.0">导入批次与完成标记</text>
+  </g>
+  <rect id="pause-box" stroke="#287640" fill="#dcfce7" stroke-width="1" x="297" y="143" width="190" height="24" rx="6" />
+  <g id="pause-t" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="14" text-anchor="middle" fill="#287640">
+    <text x="392.0" y="160.0">仅冻结 slot 42</text>
+  </g>
+  <polyline id="a5" stroke="#6741a5" fill="none" stroke-width="2" points="665,448 119,448" />
+  <polygon points="119.00,448.00 129.00,444.00 129.00,452.00" fill="#6741a5" />
+  <g id="t5" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#6741a5">
+    <text x="392.0" y="435.0">目标组 HW 与 apply 已覆盖导入，报告就绪</text>
+  </g>
+  <polyline id="a6" stroke="#195b98" fill="none" stroke-width="2" points="119,505 665,505" />
+  <polygon points="665.00,505.00 655.00,509.00 655.00,501.00" fill="#195b98" />
+  <g id="t6" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#195b98">
+    <text x="392.0" y="492.0">KRaft 提交 owner = 20 与新 generation，目标观察到切换</text>
+  </g>
+  <polyline id="a6r" stroke="#195b98" fill="none" stroke-width="2" points="119,563 392,563" />
+  <polygon points="392.00,563.00 382.00,567.00 382.00,559.00" fill="#195b98" />
+  <g id="t6r" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#195b98">
+    <text x="255.5" y="550.0">源组观察到已提交的切换</text>
+  </g>
+  <g id="t7" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#ae490f">
+    <text x="392.0" y="621.0">源组回复 MOVED → B</text>
+  </g>
+  <g id="t8" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#287640">
+    <text x="397.0" y="671.0">按旧 generation 清理源数据</text>
+  </g>
+</svg>

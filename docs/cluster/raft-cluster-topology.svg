@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 603" width="960" height="603" role="img">
+  <title>沿用 Dragonfly 两主两副本的 slot 布局，显示三个独立的 Raft 组</title>
+  <rect width="960" height="603" fill="white" />
+  <rect id="group-a" stroke="#287640" fill="#f5fbf7" stroke-width="2" x="38" y="145" width="304" height="310" rx="6" />
+  <rect id="group-b" stroke="#287640" fill="#f5fbf7" stroke-width="2" x="618" y="145" width="304" height="310" rx="6" />
+  <rect id="cp" stroke="#1971c2" fill="#a5d8ff" stroke-width="2" x="338" y="32" width="284" height="69" rx="6" />
+  <g id="cp-t" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="16" text-anchor="middle" fill="#195b98">
+    <text x="480.0" y="56.0">元数据 Raft 组  ·  C1 / C2 / C3</text>
+    <text x="480.0" y="77.6">多数派 2 / 3  ·  管理 slot 归属</text>
+  </g>
+  <rect id="ma" stroke="#2f9e44" fill="#b2f2bb" stroke-width="2" x="80" y="200" width="220" height="90" rx="6" />
+  <g id="ma-t" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="16" text-anchor="middle" fill="#192533">
+    <text x="190.0" y="225.0">A  ·  当前 leader / voter</text>
+    <text x="190.0" y="246.6">slots 0–8191</text>
+    <text x="190.0" y="268.2">health: online</text>
+  </g>
+  <rect id="mb" stroke="#2f9e44" fill="#b2f2bb" stroke-width="2" x="660" y="200" width="220" height="90" rx="6" />
+  <g id="mb-t" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="16" text-anchor="middle" fill="#192533">
+    <text x="770.0" y="225.0">B  ·  当前 leader / voter</text>
+    <text x="770.0" y="246.6">slots 8192–16383</text>
+    <text x="770.0" y="268.2">health: online</text>
+  </g>
+  <rect id="ra" stroke="#1971c2" fill="#d0ebff" stroke-width="2" stroke-dasharray="5 4" x="80" y="360" width="220" height="70" rx="6" />
+  <g id="ra-t" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="16" text-anchor="middle" fill="#192533">
+    <text x="190.0" y="387.0">A-r1  ·  follower / voter</text>
+    <text x="190.0" y="408.6">health: online</text>
+  </g>
+  <rect id="rb" stroke="#1971c2" fill="#d0ebff" stroke-width="2" stroke-dasharray="5 4" x="660" y="360" width="220" height="70" rx="6" />
+  <g id="rb-t" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="16" text-anchor="middle" fill="#192533">
+    <text x="770.0" y="387.0">B-r1  ·  follower / voter</text>
+    <text x="770.0" y="408.6">health: loading</text>
+  </g>
+  <rect id="cli" stroke="#e8590c" fill="#ffd8a8" stroke-width="2" x="380" y="500" width="200" height="60" rx="6" />
+  <g id="cli-t" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="17" text-anchor="middle" fill="#ae490f">
+    <text x="480.0" y="535.0">Redis Cluster 客户端</text>
+  </g>
+  <polyline id="cp-ma" stroke="#195b98" fill="none" stroke-width="2" points="361,101 287,145" />
+  <polygon points="287.00,145.00 293.55,136.45 297.64,143.33" fill="#195b98" />
+  <polyline id="cp-mb" stroke="#195b98" fill="none" stroke-width="2" points="599,101 673,145" />
+  <polygon points="673.00,145.00 662.36,143.33 666.45,136.45" fill="#195b98" />
+  <polyline id="cp-ra" stroke="#195b98" fill="none" stroke-width="2" stroke-dasharray="5 4" points="312,145 382,101" />
+  <polygon points="382.00,101.00 375.66,109.71 371.40,102.94" fill="#195b98" />
+  <polyline id="cp-rb" stroke="#195b98" fill="none" stroke-width="2" stroke-dasharray="5 4" points="648,145 578,101" />
+  <polygon points="578.00,101.00 588.60,102.94 584.34,109.71" fill="#195b98" />
+  <polyline id="ma-ra" stroke="#287640" fill="none" stroke-width="2" points="121,290 121,360" />
+  <polygon points="121.00,360.00 117.00,350.00 125.00,350.00" fill="#287640" />
+  <polyline id="mb-rb" stroke="#287640" fill="none" stroke-width="2" points="701,290 701,360" />
+  <polygon points="701.00,360.00 697.00,350.00 705.00,350.00" fill="#287640" />
+  <polyline id="cli-ma" stroke="#ae490f" fill="none" stroke-width="2" points="421,500 342,400 300,275" />
+  <polygon points="300.00,275.00 306.98,283.21 299.39,285.75" fill="#ae490f" />
+  <polyline id="cli-mb" stroke="#ae490f" fill="none" stroke-width="2" points="539,500 618,400 660,275" />
+  <polygon points="660.00,275.00 660.61,285.75 653.02,283.21" fill="#ae490f" />
+  <g id="lbl-cfg" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#195b98">
+    <text x="480.0" y="127.0">↓ slot 归属     ↑ 已选 leader / term</text>
+  </g>
+  <g id="lbl-moved" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#ae490f">
+    <text x="480.0" y="414.0">按 slot 访问当前 leader</text>
+    <text x="480.0" y="434.25">MOVED 返回客户端</text>
+  </g>
+  <g id="group-name-a" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="16" text-anchor="middle" fill="#287640">
+    <text x="190.0" y="168.0">数据 Raft 组 10   ·   多数派 2 / 2</text>
+  </g>
+  <g id="group-name-b" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="16" text-anchor="middle" fill="#287640">
+    <text x="770.0" y="168.0">数据 Raft 组 20   ·   多数派 2 / 2</text>
+  </g>
+  <polyline id="return-a" stroke="#287640" fill="none" stroke-width="2" points="133,360 133,290" />
+  <polygon points="133.00,290.00 137.00,300.00 129.00,300.00" fill="#287640" />
+  <g id="rpc-a" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#287640">
+    <text x="221.0" y="313.0">选举：Vote ↔</text>
+    <text x="221.0" y="333.25">复制：Fetch ↔</text>
+  </g>
+  <polyline id="return-b" stroke="#287640" fill="none" stroke-width="2" points="713,360 713,290" />
+  <polygon points="713.00,290.00 717.00,300.00 709.00,300.00" fill="#287640" />
+  <g id="rpc-b" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#287640">
+    <text x="801.0" y="313.0">选举：Vote ↔</text>
+    <text x="801.0" y="333.25">复制：Fetch ↔</text>
+  </g>
+  <g id="quorum-note" font-family="Arial, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="15" text-anchor="middle" fill="#192533">
+    <text x="480.0" y="581.0">每个数据组独立计票。两个 voter 中任一离线，该组停止提交；另一个组可继续。</text>
+  </g>
+</svg>
