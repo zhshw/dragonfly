@@ -19,6 +19,7 @@
 
 - [ ] 01.1 增加启动值 `raft`。区分“启用真实集群路由”和“允许旧 manager 改拓扑”，核对直接判断 `kRealCluster` 的入口。覆盖空值、`emulated`、`yes`、`raft` 和非法值。
 - [ ] 01.2 定义 Raft 启动配置，包括 cluster ID、节点及目录身份、角色、内部监听和 quorum 发现地址。区分新建、加入和重启恢复，错误身份或目录组合在开放业务端口前报错。
+  - [x] 独立 controller 使用格式化目录、静态 voter 地址和内部 listener 启动。重启时验证 cluster/node ID 和原有 voter ID 集合。
 - [ ] 01.3 按启动模式选择管理与复制入口。对旧全量 CONFIG、REPLICAOF、REPLTAKEOVER 和迁移写命令逐项定义 Raft 模式的处理；未适配的操作明确报错。覆盖 CONFIG SET 尝试热切模式。
 - [ ] 01.4 用同一份旧配置回归新旧二进制的 `yes` 模式。比对配置下发、主从握手、普通写回复、拓扑和 MOVED；同时回归单机和 emulated 模式。Raft 初始化未完成时不得接收业务写。[集群命令测试](../../src/server/cluster/cluster_family_test.cc) · [旧主从测试](../../tests/dragonfly/cluster_replication_test.py)
 
@@ -29,6 +30,7 @@
 - [ ] 02.1 建立逐 API 版本表，列出 header、flexible 版本、nullable 字段、tagged fields、错误码与默认值。实现 ApiVersions，只通告已实现的版本。
 - [ ] 02.2 分批实现 Vote、Begin/EndQuorumEpoch、Fetch、FetchSnapshot、DescribeQuorum，再接入动态 voter、BrokerRegistration 和 BrokerHeartbeat 消息。为每批保留请求、成功响应和错误响应样本。
   - [x] 完成 Vote v0–2 请求与响应体的 schema 生成与编解码，对照 Java 产物核验目录 ID、预投票、错误回包及嵌套 tagged fields。[字节级用例](../../src/server/cluster/raft/protocol/vote_test.cc)
+  - [x] Begin/EndQuorumEpoch、Fetch、FetchSnapshot、DescribeQuorum 已通过 Kafka Java 请求和响应字节对照。只有挂载 handler 的内部端口才通告对应 API。
 - [ ] 02.3 实现 record batch 头、CRC、控制批次、快照头尾和元数据记录。为 slot 归属、迁移阶段与 KV 效果定义独立记录版本及启用条件。
 - [ ] 02.4 双向核对 Java 和 C++ 产物的字节与解码结果。覆盖未知 tagged field、未知元数据记录、截断消息、坏 CRC，以及 RPC 版本可用但 kraft.version 或 metadata.version 不满足的组合。
 
@@ -42,18 +44,24 @@
   - [x] 实现 quorum-state v0/v1 持久化和恢复，文件与目录同步完成后返回。覆盖重启、临时文件、写失败、损坏文件，以及和 Kafka 的双向读取。[存储测试](../../src/server/cluster/raft/storage/file_quorum_state_store_test.cc)
 - [ ] 03.3 实现批量追加、持久化、按 offset 读取、按 epoch 查找共同前缀、尾部截断和 segment 回收。区分日志末端 LEO、已持久化位置、HW 和已应用位置。
   - [x] 恢复并校验初始 segment，按组持久追加 Kafka 批次、读取、查询 epoch 和截断；用真实 LeaderChange 批次及故障恢复验证 LEO。[分区日志用例](../../src/server/cluster/raft/log/partition_log_test.cc)
+  - [x] 支持多段滚动、跨段读写和尾部截断，兼容已有单段恢复标记。回收日志前校验 snapshot cut 和 HW。[分段与恢复](../../src/server/cluster/raft/log/partition_log_test.cc)
 - [ ] 03.4 实现有校验的快照文件、临时文件安装和续读起点。重启时检查日志连续性；测试半个尾批、损坏批次、未完成快照和快照后的日志缺口，验证恢复结果或明确的失败原因。
+  - [x] 分块接收 Kafka 元数据快照，校验 CRC 和头尾后持久安装。覆盖半个临时文件、缺少必需快照、回收和重启。[快照存储用例](../../src/server/cluster/raft/log/partition_snapshot_test.cc)
 
 ## 04 共享 KRaft 共识引擎
 
 依赖 02、03。此模块移植一次，供元数据和数据组实例化。应能在不启动 KV 服务的情况下驱动时钟、磁盘和消息。[KafkaRaftClient](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java) · [QuorumState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/QuorumState.java) · [上游测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft)
 
 - [ ] 04.1 在 proactor/fiber 上实现事件循环、请求超时及重试。给测试注入时钟、退避随机数、消息到达顺序和写盘完成事件。
+  - [x] 内部网络按 peer 独立运行 fiber，使用 ApiVersions 协商、correlation ID 和超时重连。组内选票和日志由串行磁盘队列处理。
 - [ ] 04.2 移植 pre-vote、正式投票、leader 通告和退位。按日志末端 epoch、offset 及 voter 身份检查候选者。覆盖重复请求、过期响应、重启后重投、observer 不计票。
   - [x] 移植各角色的授票条件与单轮多数计票，覆盖目录身份、预投票变更、正式投票重传与偶数 voter 平票。[角色和计票用例](../../src/server/cluster/raft/quorum/election_test.cc)
+  - [x] 真实 controller 进程通过 Vote、Begin/EndQuorumEpoch 选主，丢失多数 Fetch 联系后退位。[单进程与三进程测试](../../tests/integration/raft_controller_test.py)
 - [ ] 04.3 实现 follower 主动 Fetch、分歧检测和追赶。voter 持久化后在后续 Fetch 报告新 LEO；leader 按有效 voter 多数和当前任期记录推进 HW。覆盖仅复制旧任期记录、重复 Fetch 和失去多数后的退位。
   - [x] 移植 LeaderState 的排他 HW 计算。覆盖当前 term 首条记录、1/2/3 个 voter、多数门槛变化和同 offset 的 segment 位置更新。[实现与测试](../../src/server/cluster/raft/replication/high_watermark_test.cc)
+  - [x] follower 按本组 LEO 和 epoch 主动拉取、持久化、上报，leader 从有效 voter 进度计算当前任期 HW。[按组复制用例](../../src/server/cluster/raft/quorum/fetch_replication_test.cc)
 - [ ] 04.4 实现元数据 FetchSnapshot 分块、校验、原子安装及从排他 endOffset 续拉。模拟传输中换主与重启，检查快照身份和保留前缀。
+  - [x] FetchSnapshot 请求按 leader、epoch、快照 ID 和位置校验，过期应答不能安装。完成后从排他 offset 继续拉取。[传输用例](../../src/server/cluster/raft/quorum/snapshot_transfer_test.cc)
 - [ ] 04.5 实现 Add/Remove/UpdateRaftVoter。observer 追平后一次增删一个 voter，按 VotersRecord 的生效、提交、截断规则更新成员；覆盖未提交变更时换主、删除当前 leader 和 ackWhenCommitted。
 - [ ] 04.6 给 Java 和 C++ 输入同一事件序列，逐步比较角色、已投选票、输出 RPC、HW 和保留前缀。先移植 KafkaRaftClientPreVoteTest、LeaderStateTest，再移植 KafkaRaftClientReconfigTest 与 RaftEventSimulationTest。
 
@@ -62,6 +70,7 @@
 依赖 04 的静态 quorum；动态成员变更可随后接入。元数据组管理 slot 归属、节点身份和路由发现。[QuorumController](../../../kafka/metadata/src/main/java/org/apache/kafka/controller/QuorumController.java) · [MetadataLoader](../../../kafka/metadata/src/main/java/org/apache/kafka/image/loader/MetadataLoader.java) · [现有拓扑校验](../../src/server/cluster/cluster_config.cc)
 
 - [ ] 05.1 建立单写事件队列，按稳定 offset 完成管理请求。回放 Begin/End/Abort 元数据事务，原子发布已提交 image。controller 在追加后退出时，恢复后应看不到半个事务。
+  - [x] 实现标准元数据记录编码和 committed image 回放。跨批事务在 End 后可见，Abort 保留旧 image。[元数据回放用例](../../src/server/cluster/raft/metadata/metadata_image_test.cc)
 - [ ] 05.2 实现节点注册、心跳、追平后解除 fencing 和受控退出。保存 Redis node ID 与 broker ID、RESP 地址的映射；以 incarnation 和 broker epoch 拒绝旧进程请求。
 - [ ] 05.3 实现组登记与 SlotAssignmentRecord。校验目标组、旧 owner 和 generation，支持一个组多个不连续区间；服务前检查 16,384 个 slots 的完整覆盖、无重叠和有效引用。
 - [ ] 05.4 接收数据组报告的 leader、term 和成员配置位置，校验来源并处理迟到通告。元数据更新只发布路由提示；向旧 leader 发写仍须由数据组检查任期与归属。
@@ -83,6 +92,7 @@
 
 - [ ] 07.1 接入事务求值，生成带 DB、slot、generation 及确定性效果的批次。在暂存状态中求 Redis 回复；排队时保持同 slot 的操作顺序，等待网络时释放 shard 锁。
 - [ ] 07.2 建立 append → 多数持久化 → HW → 按序 apply → RESP 的完成路径。测试跨线程完成顺序颠倒；读请求看不到未提交值，同一记录重复回放不会再次执行 INCR。
+  - [x] 普通无选项 SET 的效果记录支持二进制 KV 和有序 apply 游标。事务回放返回 OK 后才推进该组的已应用位置。[真实事务测试](../../src/server/cluster/raft/data/set_executor_test.cc)
 - [ ] 07.3 建立新 leader 对外服务前的恢复条件。继承的日志在当前 term 确认且本地 KV 应用到恢复边界后再接受条件写。用“旧主 INCR 已复制、未回复即宕机，随后新主再次 INCR”验证结果。
 - [ ] 07.4 覆盖同 slot 的 MULTI/EXEC、脚本、阻塞命令、跨 DB 操作和节点范围的 FLUSHDB/FLUSHALL。记录随机结果、绝对过期时间与淘汰效果；逐项核对客户端回复、原子可见性和重放后的 KV。
 - [ ] 07.5 分别在追加前、追加后、提交后、apply 后回复前注入失败。区分确定未写和结果未知；检查超时、断连和换主后的 waiter 清理，以及非幂等请求重试的可观察结果。

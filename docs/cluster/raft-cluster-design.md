@@ -1,6 +1,6 @@
 # Dragonfly 集群设计：KRaft 元数据与按复制组运行的 Raft
 
-设计提案。Kafka 基线为同级仓库的 `5b648ca9cbeed3cebe553fba86c516b08bcaeb40`，Dragonfly 基线为 `fbc5370234e38bd983ffdd6238b4512ba47182c6`。文中的 Kafka 行为以这两个 checkout 中可核对的源码和测试为准；Dragonfly 新模式尚待实现。链接按两仓库同级放置。
+设计提案。Kafka 基线为同级仓库的 `5b648ca9cbeed3cebe553fba86c516b08bcaeb40`，Dragonfly 基线为 `fbc5370234e38bd983ffdd6238b4512ba47182c6`。文中的 Kafka 行为以这两个 checkout 中可核对的源码和测试为准；当前分支已运行静态元数据 quorum。数据组与 Redis 客户端的验收进度见[模块任务](todos.md)。链接按两仓库同级放置。
 
 ## 1. 两层 Raft 管什么
 
@@ -58,16 +58,26 @@
 
 ### 用启动配置选择集群模式
 
-建议沿用现有启动参数，只新增一个取值 `--cluster_mode=raft`。该值同时选择 KRaft 元数据管理和按组 Raft 数据复制。当前版本只识别空值、`emulated`、`yes`，传入 `raft` 会在启动时退出。以下是新版要实现的配置契约。[启动参数及解析](../../src/server/cluster_support.cc)
+在原有 `cluster_mode` 取值中增加 `raft`。角色通过单独的启动参数指定。[启动参数及解析](../../src/server/cluster_support.cc)
 
 | 启动配置 | 节点行为 |
 | --- | --- |
 | 省略或空值 | 保持单机模式。 |
 | `--cluster_mode=emulated` | 保持现有单节点模拟拓扑。 |
 | `--cluster_mode=yes` | 保持现有真实集群。外部 manager 下发 `DFLYCLUSTER CONFIG`，副本通过 `REPLICAOF` 跟随主节点。仅升级二进制时继续走这条路径。 |
-| `--cluster_mode=raft`（提案） | 启动时按已配置的集群身份和元数据 quorum 地址加入或恢复 Raft 集群。新建集群先初始化 quorum 和初始 slot 分配；已有 Raft 集群从自己的持久状态恢复。 |
+| `--cluster_mode=raft` | 启动时按已配置的集群身份和元数据 quorum 地址加入或恢复 Raft 集群。新建集群先初始化 quorum 和初始 slot 分配；已有 Raft 集群从自己的持久状态恢复。 |
 
 分支现有的离线工具可用 `ninja -C build-dbg raft_storage` 构建。运行 `build-dbg/raft_storage format <新目录> <cluster-id> <整数节点ID>` 初始化一个空目录，再用相同参数将 `format` 换成 `verify` 核对身份。元数据文件与 Kafka v1 的 `meta.properties` 兼容；Dragonfly 另持有模式标记，启动旧模式时据此识别误用目录。该步骤只初始化节点身份。
+
+在 C1、C2、C3 分别格式化目录，使用相同 cluster ID 和不同 node ID。下面是 C1 的启动方式。在另外两台机器上替换本机目录和 node ID，三台使用相同 voter 列表。独立 controller 只绑定本机的内部端口。
+
+```sh
+build-dbg/dragonfly --cluster_mode=raft --raft_role=controller \
+  --dir=/var/lib/dragonfly/c1 --raft_cluster_id=HIJ1rG6XThu4T7D5Jg8xIg --raft_node_id=1 \
+  --raft_quorum_voters=1@c1:9093,2@c2:9093,3@c3:9093
+```
+
+在 Linux 构建目录包含 `dragonfly` 和 `raft_storage` 后，从仓库根目录运行 `DRAGONFLY_PATH=build-dbg/dragonfly python3 tests/integration/raft_controller_test.py -v`。用例通过内部 DescribeQuorum 检查 leader、epoch、HW 和各 voter 日志位置，覆盖单 voter 重启、三进程换主、单票退位和多数恢复后的已提交前缀。[多进程验收](../../tests/integration/raft_controller_test.py)
 
 实现时把“是否启用真实集群路由”和“由谁管理拓扑及复制”分开判断。`yes` 和 `raft` 共用 key → slot、拓扑响应编码和 `MOVED`；只有 `yes` 允许旧 manager 直接改 slot 或指定复制源。`raft` 从已提交元数据生成拓扑，由数据组确认普通写。模式在启动时确定，`CONFIG SET` 不提供在线切换；恢复时校验持久化的集群身份和模式，配置不符时拒绝对外服务。[现有模式判断](../../src/server/cluster_support.h) · [现有管理入口](../../src/server/cluster/cluster_family.cc)
 
