@@ -191,8 +191,8 @@ class RaftDataGroupFixture(unittest.TestCase):
     def client(self, node):
         return redis.Redis(host=HOST, port=self.resp[node], socket_timeout=7)
 
-    def wait_for(self, check):
-        deadline = time.monotonic() + 35
+    def wait_for(self, check, *, timeout=35, poll_interval=0.1):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for node, proc in self.proc.items():
                 if proc.poll() is not None:
@@ -207,7 +207,7 @@ class RaftDataGroupFixture(unittest.TestCase):
                 redis.exceptions.RedisClusterException,
             ):
                 pass
-            time.sleep(0.1)
+            time.sleep(poll_interval)
         tail = "\n".join((self.root / f"{node}.log").read_text()[-1500:] for node in self.proc)
         self.fail(f"timed out waiting for cluster: {tail}")
 
@@ -610,6 +610,20 @@ class DynamicControllerDiscoveryTest(RaftDataGroupFixture):
 class DynamicDataGroupFixture(RaftDataGroupFixture):
     learner = 13
 
+    def elect_recovered_learner(self, leader):
+        # Remove the old leader last so each change goes to the active leader. Direct GET
+        # requests after this election inspect the recovered voter's own engine.
+        for member in sorted(GROUPS[10], key=lambda n: n == leader):
+            self.assertEqual(
+                change_voter(self.raft[leader], 81, self.cluster_id, member, bytes([member]) * 16),
+                0,
+            )
+        self.wait_for(
+            lambda: (v := describe(self.raft[self.learner], b"__dragonfly_data", 10))
+            and v.leader == self.learner
+            and set(v.voters) == {self.learner}
+        )
+
     def promote_learner(self, leader):
         view = lambda n: describe(self.raft[n], b"__dragonfly_data", 10)
         self.wait_for(
@@ -707,17 +721,7 @@ class DataSnapshotRecoveryTest(DynamicDataGroupFixture):
         self.assertEqual(installed.name, checkpoint.name)
         self.assertEqual(installed.read_bytes(), expected_image)
 
-        # Make the recovered voter the only eligible leader so client reads inspect its own engine.
-        for member in sorted(GROUPS[10], key=lambda n: n == leader):
-            self.assertEqual(
-                change_voter(self.raft[leader], 81, self.cluster_id, member, bytes([member]) * 16),
-                0,
-            )
-        self.wait_for(
-            lambda: (v := describe(self.raft[self.learner], b"__dragonfly_data", 10))
-            and v.leader == self.learner
-            and set(v.voters) == {self.learner}
-        )
+        self.elect_recovered_learner(leader)
         with self.client(self.learner) as client:
             self.assertEqual(self.wait_for(lambda: client.get(tail_key)), b"from incremental fetch")
             for key, value in values.items():

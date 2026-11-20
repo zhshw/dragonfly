@@ -236,6 +236,40 @@ TEST_F(FetchReplicationTest, SmallFetchReturnsCompleteFirstBatchAndDiscardsParti
   EXPECT_EQ(b.log->End(), (LogPosition{5, 2}));
 }
 
+TEST_F(FetchReplicationTest, FetchMaxBytesWithTwoBatchesResumesAtThirdBatch) {
+  auto a = Make(kA), b = Make(kB);
+  Elect(&a, &b);
+  auto control = b.fetch.PrepareFetch(kA.id, 18, 0, 1024).value();
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, control.sequence, Handle(&a, control)).ok());
+
+  const auto first = MakeDataBatch(1, 5, 124, array<string, 3>{"a", "a", "a"}).value();
+  const auto second = MakeDataBatch(4, 5, 124, array<string, 3>{"b", "b", "b"}).value();
+  const auto third = MakeDataBatch(7, 5, 124, array<string, 3>{"c", "c", "c"}).value();
+  const auto prefix = first + second;
+  ASSERT_TRUE(a.fetch.Append(prefix + third, 5).ok());
+
+  // The budget covers two complete batches and one byte of the third.
+  const int32_t max_bytes = prefix.size() + 1;
+  auto fetch = b.fetch.PrepareFetch(kA.id, 18, 0, max_bytes).value();
+  ASSERT_EQ(fetch.request.topics[0].partitions[0].fetch_offset, 1);
+  auto response = Handle(&a, fetch);
+  const auto& records = response.responses[0].partitions[0].records.data;
+  ASSERT_TRUE(records);
+  EXPECT_LE(records->size(), static_cast<size_t>(max_bytes));
+  EXPECT_EQ(records->substr(0, prefix.size()), prefix);
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, fetch.sequence, response).ok());
+  ASSERT_EQ(b.log->End(), (LogPosition{5, 7}));
+  EXPECT_EQ(b.log->Read(1, 7, SIZE_MAX).value(), prefix);
+
+  auto next = b.fetch.PrepareFetch(kA.id, 18, 0, max_bytes).value();
+  ASSERT_EQ(next.request.topics[0].partitions[0].fetch_offset, 7);
+  auto suffix = Handle(&a, next);
+  EXPECT_EQ(suffix.responses[0].partitions[0].records.data.value(), third);
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, next.sequence, suffix).ok());
+  EXPECT_EQ(b.log->End(), (LogPosition{5, 10}));
+  EXPECT_EQ(b.log->Read(7, 10, SIZE_MAX).value(), third);
+}
+
 TEST_F(FetchReplicationTest, FollowerTruncatesOnlyUncommittedDivergence) {
   auto a = Make(kA), b = Make(kB);
   ASSERT_TRUE(a.log->Append(Batch(0, 1), 1).ok());
