@@ -12,9 +12,16 @@
 #include <string>
 #include <vector>
 
+#include "server/cluster/raft/log/snapshot_file.h"
 #include "server/cluster/raft/quorum/election.h"
 
 namespace dfly::cluster::raft {
+
+struct FetchPosition {
+  enum class Kind { kValid, kDiverging, kSnapshot };
+  Kind kind;
+  LogPosition position;
+};
 
 // One writer per partition. Open and mutation are synchronous disk-worker operations.
 // Each successful append is durable before its resulting LEO can be reported to a peer.
@@ -30,6 +37,13 @@ class PartitionLog {
     return io_failure_;
   }
 
+  int64_t StartOffset() const {
+    return start_.end_offset;
+  }
+  std::optional<LogPosition> LatestSnapshot() const;
+
+  // Kafka RaftLog's Fetch validation returns the common prefix or a snapshot to download.
+  FetchPosition ValidateOffsetAndEpoch(int64_t offset, int32_t epoch) const;
   LogPosition End() const;
   LogPosition EndForEpoch(int32_t requested_epoch) const;
 
@@ -43,10 +57,20 @@ class PartitionLog {
                                   std::span<const int32_t> granting_voters);
 
   // Bound a read by LEO (uncommitted Fetch) or by the exclusive HW (committed replay).
-  absl::StatusOr<std::string> Read(int64_t offset, int64_t max_offset, size_t max_bytes) const;
+  absl::StatusOr<std::string> Read(int64_t offset, int64_t max_offset, size_t max_bytes,
+                                   int64_t* batch_start = nullptr) const;
 
   // Truncation is permitted only at complete batch boundaries at or above the group HW.
   absl::Status TruncateTo(int64_t offset, int64_t high_watermark);
+
+  // Install a received leader snapshot ahead of the local log, or freeze an image at a
+  // locally committed batch boundary. Only DeleteBeforeSnapshot discards a matching prefix.
+  absl::StatusOr<std::unique_ptr<SnapshotWriter>> BeginSnapshot(LogPosition id, int64_t size) const;
+  absl::Status InstallSnapshot(SnapshotWriter* writer, int64_t high_watermark);
+  absl::StatusOr<SnapshotChunk> ReadSnapshot(LogPosition id, int64_t position,
+                                             size_t max_bytes) const;
+  // The caller has applied the snapshot and supplies the group's exclusive high watermark.
+  absl::Status DeleteBeforeSnapshot(LogPosition id, int64_t high_watermark);
 
  private:
   struct Batch {
@@ -60,7 +84,10 @@ class PartitionLog {
       : dir_(std::move(dir)), segment_bytes_(segment_bytes) {
   }
   absl::Status Recover();
-  absl::Status RecoverSegment(std::optional<int64_t> durable_bytes);
+  absl::Status RecoverSegment(std::optional<int64_t> durable_bytes, LogPosition* physical_end);
+  absl::Status ResetToSnapshot(LogPosition id);
+  absl::Status RemovePrefix(int64_t first_base);
+  bool IsLocalBoundary(LogPosition id) const;
   absl::Status SetActive(int64_t base, int flags);
   absl::Status RemoveSuffixSegments();
   absl::Status AppendBatches(std::string_view batches, int32_t epoch, bool follower);
@@ -72,6 +99,8 @@ class PartitionLog {
   size_t segment_bytes_;
   int64_t active_base_ = 0;
   int64_t active_bytes_ = 0;
+  LogPosition start_{0, 0};
+  std::vector<LogPosition> snapshots_;
   std::vector<int64_t> segment_bases_;
   std::vector<Batch> batches_;
   absl::Status io_failure_;

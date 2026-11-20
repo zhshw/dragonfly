@@ -85,15 +85,16 @@ absl::Status PartitionLog::Recover() {
   if (!stored.ok())
     return stored.status();
   auto marker = *stored;
-  if (marker && marker->start != LogPosition{0, 0})
-    return absl::FailedPreconditionError("A nonzero log start requires a recovered snapshot");
+  if (marker)
+    start_ = marker->start;
+  auto snapshots = RecoverSnapshots(dir_, start_);
+  if (!snapshots.ok())
+    return snapshots.status();
+  snapshots_ = *std::move(snapshots);
   error_code ec;
   fs::directory_iterator files(dir_, ec);
   for (; !ec && files != fs::directory_iterator(); files.increment(ec)) {
     const fs::path& path = files->path();
-    if (path.extension() == ".checkpoint")
-      return absl::FailedPreconditionError(
-          "Snapshot must be recovered before opening the quorum log");
     if (path.extension() != ".log")
       continue;
     string stem = path.stem().string();
@@ -106,27 +107,51 @@ absl::Status PartitionLog::Recover() {
   if (ec)
     return absl::ErrnoToStatus(ec.value(), "Listing quorum log segments");
   sort(segment_bases_.begin(), segment_bases_.end());
+  // The reset marker precedes segment replacement. Redo it after an interrupted reset.
+  if (marker && marker->file_end == 0 && marker->segment_base == StartOffset() &&
+      marker->offset == StartOffset() && start_ != LogPosition{0, 0}) {
+    if (auto s = ResetToSnapshot(start_); !s.ok())
+      return s;
+  }
   if (segment_bases_.empty()) {
     if (marker)
       return absl::DataLossError("Missing durable quorum log segment");
+    if (!snapshots_.empty())
+      return ResetToSnapshot(snapshots_.back());
     if (auto s = SetActive(0, O_CREAT | O_EXCL); !s.ok())
       return s;
     segment_bases_.push_back(0);
   }
-  if (segment_bases_.front() != 0 ||
+  if (!marker && segment_bases_.front() > 0) {
+    // A native Kafka partition can retain a first segment that straddles its snapshot cut.
+    auto id = find_if(snapshots_.begin(), snapshots_.end(), [&](LogPosition candidate) {
+      return candidate.end_offset >= segment_bases_.front();
+    });
+    if (id == snapshots_.end())
+      return absl::DataLossError("Missing snapshot covering the first Kafka segment");
+    start_ = *id;
+  }
+  auto upper = upper_bound(segment_bases_.begin(), segment_bases_.end(), StartOffset());
+  if (upper == segment_bases_.begin() ||
       (marker &&
        !binary_search(segment_bases_.begin(), segment_bases_.end(), marker->segment_base)))
     return absl::DataLossError("Missing first or active quorum segment");
+  int64_t first = *prev(upper);
+  LogPosition physical_end{first == StartOffset() ? start_.epoch : 0, first};
   bool found_end = false;
   for (int64_t base : segment_bases_) {
     if (found_end)
       break;
-    if (End().end_offset != base)
+    if (base < first)
+      continue;
+    if (physical_end.end_offset != base)
       return absl::DataLossError("Gap between quorum log segments");
     if (auto s = SetActive(base, 0); !s.ok())
       return s;
     found_end = marker && marker->segment_base == base;
-    if (auto s = RecoverSegment(found_end ? optional<int64_t>(marker->file_end) : nullopt); !s.ok())
+    if (auto s = RecoverSegment(found_end ? optional<int64_t>(marker->file_end) : nullopt,
+                                &physical_end);
+        !s.ok())
       return s;
 
     // Raw Kafka segments may predate our first recovery marker.
@@ -135,9 +160,20 @@ absl::Status PartitionLog::Recover() {
   }
   if (marker && marker->offset != End().end_offset)
     return absl::DataLossError("Quorum log durable offset disagrees with batches");
-  if (!marker)
-    return PublishEnd(active_bytes_, End().end_offset);
-  return RemoveSuffixSegments();
+  if (physical_end.end_offset < StartOffset()) {
+    if (!marker && snapshots_.back() > physical_end)
+      return ResetToSnapshot(snapshots_.back());
+    return absl::DataLossError("Snapshot cut beyond the end of the retained Kafka segment");
+  }
+  if (!marker) {
+    if (auto s = PublishEnd(active_bytes_, End().end_offset); !s.ok())
+      return s;
+  }
+  if (!snapshots_.empty() && snapshots_.back() > End())
+    return ResetToSnapshot(snapshots_.back());
+  if (auto s = RemoveSuffixSegments(); !s.ok())
+    return s;
+  return RemovePrefix(first);
 }
 
 absl::Status PartitionLog::RemoveSuffixSegments() {
@@ -151,7 +187,8 @@ absl::Status PartitionLog::RemoveSuffixSegments() {
   return absl::OkStatus();
 }
 
-absl::Status PartitionLog::RecoverSegment(optional<int64_t> durable_bytes) {
+absl::Status PartitionLog::RecoverSegment(optional<int64_t> durable_bytes,
+                                          LogPosition* physical_end) {
   struct stat st;
   if (fstat(log_fd_, &st) != 0)
     return DiskError("Stat quorum log segment");
@@ -176,9 +213,17 @@ absl::Status PartitionLog::RecoverSegment(optional<int64_t> durable_bytes) {
     auto info = DecodeRecordBatch(batch);
     if (!info.ok())
       return info.status();
-    if (info->base_offset != End().end_offset || info->end.epoch < End().epoch)
+    if (info->base_offset != physical_end->end_offset || info->end.epoch < physical_end->epoch)
       return absl::DataLossError("Quorum log has an offset gap or regressing epoch");
     pos += *size;
+    *physical_end = info->end;
+    if (info->end.end_offset <= StartOffset()) {
+      if (info->end.end_offset == StartOffset() && info->end.epoch != start_.epoch)
+        return absl::DataLossError("Snapshot epoch disagrees with retained segment");
+      continue;
+    }
+    if (info->base_offset < StartOffset() || info->end.epoch < start_.epoch)
+      return absl::DataLossError("Snapshot cut splits a batch or has a newer epoch than its tail");
     batches_.push_back({info->end, active_base_, pos - static_cast<int64_t>(*size), pos});
   }
   if (st.st_size != file_end) {
@@ -190,11 +235,11 @@ absl::Status PartitionLog::RecoverSegment(optional<int64_t> durable_bytes) {
 }
 
 absl::Status PartitionLog::PublishEnd(int64_t file_end, int64_t offset) {
-  return PublishMarker(dir_fd_, {{0, 0}, active_base_, file_end, offset});
+  return PublishMarker(dir_fd_, {start_, active_base_, file_end, offset});
 }
 
 LogPosition PartitionLog::End() const {
-  return batches_.empty() ? LogPosition{0, 0} : batches_.back().end;
+  return batches_.empty() ? start_ : batches_.back().end;
 }
 
 LogPosition PartitionLog::EndForEpoch(int32_t epoch) const {
@@ -204,7 +249,11 @@ LogPosition PartitionLog::EndForEpoch(int32_t epoch) const {
                           [](int32_t term, const Batch& b) { return term < b.end.epoch; });
   if (next == batches_.end())
     return End();
-  return next == batches_.begin() ? LogPosition{epoch, 0} : prev(next)->end;
+  if (next != batches_.begin())
+    return prev(next)->end;
+  if (!snapshots_.empty() && snapshots_.front().end_offset == StartOffset())
+    return snapshots_.front();
+  return {epoch, StartOffset()};
 }
 
 absl::Status PartitionLog::Append(string_view batches, int32_t epoch) {
@@ -278,19 +327,22 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
 absl::Status PartitionLog::AppendLeaderChange(int32_t epoch, int64_t timestamp_ms, int32_t leader,
                                               span<const int32_t> voters,
                                               span<const int32_t> granting_voters) {
-  if (!batches_.empty() && epoch <= End().epoch)
+  if (End().end_offset > 0 && epoch <= End().epoch)
     return absl::InvalidArgumentError("LeaderChange must begin a new epoch");
   auto bytes =
       MakeLeaderChangeBatch(End().end_offset, epoch, timestamp_ms, leader, voters, granting_voters);
   return bytes.ok() ? Append(*bytes, epoch) : bytes.status();
 }
 
-absl::StatusOr<string> PartitionLog::Read(int64_t offset, int64_t max_offset,
-                                          size_t max_bytes) const {
+absl::StatusOr<string> PartitionLog::Read(int64_t offset, int64_t max_offset, size_t max_bytes,
+                                          int64_t* batch_start) const {
   if (!io_failure_.ok())
     return io_failure_;
-  if (offset < 0 || offset > End().end_offset || max_offset < 0 || max_offset > End().end_offset)
+  if (offset < StartOffset() || offset > End().end_offset || max_offset < StartOffset() ||
+      max_offset > End().end_offset)
     return absl::OutOfRangeError("Read offset outside quorum log");
+  if (batch_start)
+    *batch_start = offset;
   if (offset >= max_offset)
     return string{};
   auto first = upper_bound(batches_.begin(), batches_.end(), offset,
@@ -303,6 +355,8 @@ absl::StatusOr<string> PartitionLog::Read(int64_t offset, int64_t max_offset,
   // Kafka serves one segment per Fetch, even when the byte budget spans two.
   limit = upper_bound(first, limit, first->segment_base,
                       [](int64_t key, const Batch& b) { return key < b.segment_base; });
+  if (batch_start)
+    *batch_start = first == batches_.begin() ? StartOffset() : prev(first)->end.end_offset;
   int64_t start = first->file_start;
   size_t size =
       min<size_t>(prev(limit)->file_end - start, max<size_t>(max_bytes, first->file_end - start));
@@ -326,16 +380,17 @@ absl::StatusOr<string> PartitionLog::Read(int64_t offset, int64_t max_offset,
 absl::Status PartitionLog::TruncateTo(int64_t offset, int64_t hw) {
   if (!io_failure_.ok())
     return io_failure_;
-  if (hw < 0 || offset < hw || offset > End().end_offset)
+  if (hw < 0 || offset < hw || (!snapshots_.empty() && offset < snapshots_.back().end_offset) ||
+      offset < StartOffset() || offset > End().end_offset)
     return absl::InvalidArgumentError("Truncation outside uncommitted quorum log suffix");
   if (offset == End().end_offset)
     return absl::OkStatus();
   auto cut = upper_bound(batches_.begin(), batches_.end(), offset,
                          [](int64_t key, const Batch& b) { return key < b.end.end_offset; });
-  if (offset != 0 && (cut == batches_.begin() || prev(cut)->end.end_offset != offset))
+  if (offset != StartOffset() && (cut == batches_.begin() || prev(cut)->end.end_offset != offset))
     return absl::InvalidArgumentError("Truncation splits a quorum log batch");
-  int64_t pos = cut == batches_.begin() ? 0 : prev(cut)->file_end;
-  int64_t base = cut == batches_.begin() ? 0 : prev(cut)->segment_base;
+  int64_t pos = cut == batches_.begin() ? cut->file_start : prev(cut)->file_end;
+  int64_t base = cut == batches_.begin() ? cut->segment_base : prev(cut)->segment_base;
   if (active_base_ != base) {
     io_failure_ = SetActive(base, 0);
     if (!io_failure_.ok())
