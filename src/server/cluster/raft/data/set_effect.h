@@ -9,6 +9,7 @@
 
 #include <string>
 
+#include "server/cluster/raft/data/kv_snapshot.h"
 #include "server/cluster/raft/data/slot_transfer_state.h"
 #include "server/cluster/raft/log/partition_log.h"
 #include "server/common_types.h"
@@ -41,18 +42,30 @@ absl::StatusOr<std::string> MakeSetEffectBatch(int64_t offset, int32_t epoch, in
 // the exclusive applied offset of an already restored KV image with the same group identity.
 class CommittedEffects {
  public:
-  explicit CommittedEffects(int32_t group_id, int64_t applied_offset = 0)
-      : group_id_(group_id), applied_(applied_offset) {
-  }
+  explicit CommittedEffects(int32_t group_id, int64_t applied_offset = 0);
 
   int64_t applied_offset() const {
+    return applied_.end_offset;
+  }
+  LogPosition applied_position() const {
     return applied_;
+  }
+  uint64_t applied_bytes() const {
+    return applied_bytes_;
   }
   using ApplySet = absl::FunctionRef<absl::Status(const SetEffect&)>;
 
   const SlotTransferState& transfers() const {
     return transfers_;
   }
+
+  // Capture at the same applied boundary as the RDB. Validate the restored cursor and
+  // migration state before installing the RDB and replacing the running state machine.
+  std::vector<SnapshotSlotRange> SnapshotSlots() const;
+  absl::StatusOr<std::string> SnapshotMigrations(LogPosition cut) const;
+  static absl::StatusOr<CommittedEffects> FromSnapshot(int32_t group_id, LogPosition cut,
+                                                       std::string_view migrations,
+                                                       std::span<const SnapshotSlotRange> slots);
 
   // Apply complete, committed batches in order. The callback checks historical slot ownership
   // and returns OK only after the replacement is visible on its engine shard.
@@ -65,8 +78,13 @@ class CommittedEffects {
                            ApplySlotImage apply_image);
 
   int32_t group_id_;
-  int64_t applied_;
+  LogPosition applied_;
+  uint64_t applied_bytes_ = 0;
   bool applying_ = false;
+
+  // Generation of the materialized KV for each slot, or -1 after removal. Routing metadata
+  // advances independently of group apply and cannot determine which slots to snapshot.
+  std::vector<int64_t> slot_generations_;
   SlotTransferState transfers_;
 };
 

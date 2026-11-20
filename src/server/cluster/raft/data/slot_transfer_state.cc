@@ -6,10 +6,12 @@
 
 #include <openssl/sha.h>
 
+#include <algorithm>
 #include <limits>
 
 #include "server/cluster/raft/data/kv_rdb.h"
 #include "server/cluster/raft/log/record_batch.h"
+#include "server/cluster/raft/protocol/flexible_message.h"
 #include "server/cluster_support.h"
 
 namespace dfly::cluster::raft {
@@ -18,11 +20,17 @@ using namespace std;
 using protocol::SlotTransferRecord;
 using protocol::Uuid;
 using Kind = TransferKind;
+constexpr string_view kSnapshotMagic = "DFTM\x01";
+
+bool ValidIdentity(const Uuid& id, SlotId slot, int32_t source, int32_t target,
+                   int64_t generation) {
+  return id != Uuid{} && slot <= kMaxSlotNum && source >= 0 && target >= 0 && source != target &&
+         generation > 0 && generation < numeric_limits<int64_t>::max();
+}
 
 bool Valid(const SlotTransferRecord& r) {
-  if (r.version != 0 || r.migration_id == Uuid{} || r.slot > kMaxSlotNum || r.source_group < 0 ||
-      r.target_group < 0 || r.source_group == r.target_group || r.generation < 1 ||
-      r.generation == numeric_limits<int64_t>::max() || r.position < 0)
+  if (r.version != 0 || r.position < 0 ||
+      !ValidIdentity(r.migration_id, r.slot, r.source_group, r.target_group, r.generation))
     return false;
   const auto kind = static_cast<Kind>(r.kind);
   if (kind < Kind::kFreeze || kind > Kind::kCancel)
@@ -41,6 +49,53 @@ bool Valid(const SlotTransferRecord& r) {
 bool SameSlot(const TransferProgress& p, const SlotTransferRecord& r) {
   return p.slot == r.slot && p.source_group == r.source_group && p.target_group == r.target_group &&
          p.generation == r.generation;
+}
+
+template <typename Stream, typename Position> bool PositionFields(Stream& wire, Position& pos) {
+  return wire.Field(pos.epoch) && wire.Field(pos.end_offset);
+}
+
+template <typename Stream, typename Id, typename Progress>
+bool ProgressFields(Stream& wire, Id& id, Progress& p) {
+  return wire.Field(id) && wire.Field(p.slot) && wire.Field(p.source_group) &&
+         wire.Field(p.target_group) && wire.Field(p.generation) && PositionFields(wire, p.freeze) &&
+         PositionFields(wire, p.seal) && PositionFields(wire, p.install) &&
+         PositionFields(wire, p.finish) && PositionFields(wire, p.source) &&
+         wire.Field(p.cancelled) && wire.Field(p.digest);
+}
+
+bool ValidProgress(const Uuid& id, const TransferProgress& p, int32_t group, LogPosition cut) {
+  if (!ValidIdentity(id, p.slot, p.source_group, p.target_group, p.generation))
+    return false;
+  for (auto pos : {p.freeze, p.seal, p.install, p.finish}) {
+    if (pos != LogPosition{} && (pos.end_offset <= 0 || pos.end_offset > cut.end_offset ||
+                                 pos.epoch < 0 || pos.epoch > cut.epoch))
+      return false;
+  }
+  const bool source = group == p.source_group;
+  if (source ? p.source != LogPosition{} || p.install.end_offset
+             : group != p.target_group || p.freeze.end_offset || p.seal.end_offset)
+    return false;
+
+  // The source seal in a target chunk is an offset in a different quorum.
+  if (p.source != LogPosition{} && (p.source.epoch < 0 || p.source.end_offset <= 0))
+    return false;
+  const bool started = source ? p.freeze.end_offset != 0 : p.source.end_offset != 0;
+  const auto verified = source ? p.seal : p.install;
+  if ((!started && (!p.cancelled || verified.end_offset)) || (p.cancelled && !p.finish.end_offset))
+    return false;
+  if (source && p.seal.end_offset &&
+      (p.seal.end_offset <= p.freeze.end_offset || p.seal.epoch < p.freeze.epoch))
+    return false;
+  if (p.finish.end_offset) {
+    auto last = verified.end_offset ? verified : p.freeze;
+    if (!p.bytes.empty() || (!p.cancelled && !verified.end_offset) ||
+        last.end_offset >= p.finish.end_offset || last.epoch > p.finish.epoch)
+      return false;
+  } else if ((!source || verified.end_offset) && p.bytes.empty()) {
+    return false;
+  }
+  return verified.end_offset ? p.digest.size() == SHA256_DIGEST_LENGTH : p.digest.empty();
 }
 }  // namespace
 
@@ -76,6 +131,78 @@ bool SlotTransferState::BlocksAccess(SlotId slot, int64_t generation) const {
     return false;
   const auto& p = transfers_.at(active->second);
   return p.install.end_offset == 0 || generation != p.generation + 1;
+}
+
+absl::StatusOr<string> SlotTransferState::Snapshot(int32_t group, LogPosition cut) const {
+  if (group < 0 || cut.epoch < 0 || cut.end_offset <= 0)
+    return absl::InvalidArgumentError("Invalid slot transfer snapshot cut");
+  if (transfers_.empty())
+    return string{};
+  string bytes(kSnapshotMagic);
+  protocol::detail::Writer wire(0, &bytes);
+  wire.Field(group);
+  PositionFields(wire, cut);
+  wire.Field(static_cast<uint64_t>(transfers_.size()));
+  for (const auto& [id, p] : transfers_) {
+    if (!ValidProgress(id, p, group, cut) || !ProgressFields(wire, id, p))
+      return absl::FailedPreconditionError("Slot transfer state does not match the snapshot cut");
+    wire.Field(static_cast<uint64_t>(p.bytes.size()));
+    bytes.append(p.bytes);
+  }
+  return bytes;
+}
+
+absl::StatusOr<SlotTransferState> SlotTransferState::FromSnapshot(int32_t group, LogPosition cut,
+                                                                  string_view bytes) {
+  if (group < 0 || cut.epoch < 0 || cut.end_offset <= 0)
+    return absl::InvalidArgumentError("Invalid slot transfer snapshot cut");
+  SlotTransferState state;
+  if (bytes.empty())
+    return state;
+  if (!bytes.starts_with(kSnapshotMagic))
+    return absl::DataLossError("Unknown slot transfer snapshot format");
+  protocol::detail::Reader header(0, bytes.substr(kSnapshotMagic.size()));
+  int32_t saved_group;
+  LogPosition saved_cut;
+  uint64_t count;
+  if (!header.Field(saved_group) || !PositionFields(header, saved_cut) || !header.Field(count) ||
+      saved_group != group || saved_cut != cut || count > static_cast<uint64_t>(cut.end_offset))
+    return absl::DataLossError("Invalid slot transfer snapshot header");
+  bytes = header.remaining();
+  for (uint64_t i = 0; i < count; ++i) {
+    Uuid id;
+    TransferProgress p;
+    uint64_t length;
+    protocol::detail::Reader wire(0, bytes);
+    if (!ProgressFields(wire, id, p) || !wire.Field(length) || length > wire.remaining().size())
+      return absl::DataLossError("Truncated slot transfer snapshot");
+    bytes = wire.remaining();
+    p.bytes.assign(bytes.substr(0, length));
+    bytes.remove_prefix(length);
+    if (!ValidProgress(id, p, group, cut))
+      return absl::DataLossError("Invalid slot transfer snapshot progress");
+    if (!p.finish.end_offset) {
+      if (!p.digest.empty() &&
+          KvRdbDigest(p.bytes) !=
+              string_view(reinterpret_cast<const char*>(p.digest.data()), p.digest.size()))
+        return absl::DataLossError("Sealed slot transfer snapshot digest mismatch");
+      if (!state.active_.emplace(p.slot, id).second)
+        return absl::DataLossError("Two active transfers for a snapshot slot");
+    } else if (!p.cancelled && group == p.source_group) {
+      auto& retired = state.retired_generations_[p.slot];
+      retired = max(retired, p.generation);
+    }
+    if (!state.transfers_.emplace(id, std::move(p)).second)
+      return absl::DataLossError("Duplicate slot transfer ID in snapshot");
+  }
+  if (!bytes.empty())
+    return absl::DataLossError("Trailing bytes in slot transfer snapshot");
+  for (const auto& [slot, id] : state.active_) {
+    auto fence = state.retired_generations_.find(slot);
+    if (fence != state.retired_generations_.end() && state.Find(id)->generation <= fence->second)
+      return absl::DataLossError("Active snapshot transfer belongs to a retired slot generation");
+  }
+  return state;
 }
 
 absl::Status SlotTransferState::Replay(int32_t group, const SlotTransferRecord& r, LogPosition end,

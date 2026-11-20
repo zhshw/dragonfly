@@ -53,6 +53,12 @@ class SlotTransferState {
   absl::Status Replay(int32_t group, const protocol::SlotTransferRecord& record, LogPosition end,
                       ApplySlotImage apply_image);
 
+  // The snapshot stores each migration once. Restore derives active slots and retired
+  // generation fences from those records before accepting more log entries.
+  absl::StatusOr<std::string> Snapshot(int32_t group, LogPosition cut) const;
+  static absl::StatusOr<SlotTransferState> FromSnapshot(int32_t group, LogPosition cut,
+                                                        std::string_view bytes);
+
  private:
   std::map<protocol::Uuid, TransferProgress> transfers_;
   std::map<SlotId, protocol::Uuid> active_;

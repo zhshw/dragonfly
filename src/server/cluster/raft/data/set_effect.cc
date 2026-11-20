@@ -7,6 +7,8 @@
 #include <absl/base/internal/endian.h>
 #include <absl/cleanup/cleanup.h>
 
+#include <algorithm>
+
 #include "server/cluster/raft/log/record_batch.h"
 #include "server/cluster_support.h"
 
@@ -78,10 +80,56 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
   return MakeDataBatch(offset, epoch, timestamp_ms, records);
 }
 
+CommittedEffects::CommittedEffects(int32_t group_id, int64_t applied_offset)
+    : group_id_(group_id),
+      applied_{applied_offset ? -1 : 0, applied_offset},
+      slot_generations_(kMaxSlotNum + 1, -1) {
+}
+
 absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, ApplySet apply) {
   return ApplyTo(log, hw, apply, [](SlotId, optional<string_view>, string_view) {
     return absl::FailedPreconditionError("No slot image installer is attached");
   });
+}
+
+vector<SnapshotSlotRange> CommittedEffects::SnapshotSlots() const {
+  vector<SnapshotSlotRange> slots;
+  for (SlotId slot = 0; slot <= kMaxSlotNum; ++slot) {
+    int64_t gen = slot_generations_[slot];
+    if (gen < 0)
+      continue;
+    if (!slots.empty() && slots.back().last + 1 == slot && slots.back().generation == gen)
+      slots.back().last = slot;
+    else
+      slots.push_back({slot, slot, gen});
+  }
+  return slots;
+}
+
+absl::StatusOr<string> CommittedEffects::SnapshotMigrations(LogPosition cut) const {
+  if (applying_ || applied_ != cut)
+    return absl::FailedPreconditionError("KV snapshot cut is not the applied group offset");
+  return transfers_.Snapshot(group_id_, cut);
+}
+
+absl::StatusOr<CommittedEffects> CommittedEffects::FromSnapshot(
+    int32_t group_id, LogPosition cut, string_view migrations,
+    span<const SnapshotSlotRange> slots) {
+  auto transfers = SlotTransferState::FromSnapshot(group_id, cut, migrations);
+  if (!transfers.ok())
+    return transfers.status();
+  CommittedEffects restored(group_id);
+  int previous = -1;
+  for (const auto& r : slots) {
+    if (r.first <= previous || r.last < r.first || r.last > kMaxSlotNum || r.generation < 0)
+      return absl::DataLossError("Invalid materialized slots in group snapshot");
+    fill(restored.slot_generations_.begin() + r.first,
+         restored.slot_generations_.begin() + r.last + 1, r.generation);
+    previous = r.last;
+  }
+  restored.transfers_ = *std::move(transfers);
+  restored.applied_ = cut;
+  return restored;
 }
 
 absl::Status CommittedEffects::ApplyRecord(string_view payload, LogPosition end, ApplySet apply,
@@ -91,7 +139,13 @@ absl::Status CommittedEffects::ApplyRecord(string_view payload, LogPosition end,
     if (protocol::Decode(payload.substr(kSlotTransferMagic.size()), 0, &record) !=
         protocol::CodecError::kOk)
       return absl::DataLossError("Invalid Dragonfly slot transfer payload");
-    return transfers_.Replay(group_id_, record, end, apply_image);
+    return transfers_.Replay(group_id_, record, end,
+                             [&](SlotId slot, optional<string_view> image, string_view digest) {
+                               auto status = apply_image(slot, image, digest);
+                               if (status.ok())
+                                 slot_generations_[slot] = image ? record.generation + 1 : -1;
+                               return status;
+                             });
   }
   auto effect = DecodeSetEffect(payload);
   if (!effect.ok())
@@ -100,12 +154,17 @@ absl::Status CommittedEffects::ApplyRecord(string_view payload, LogPosition end,
     return absl::FailedPreconditionError("SET effect belongs to another replication group");
   if (transfers_.BlocksAccess(effect->slot, effect->generation))
     return absl::FailedPreconditionError("SET effect addresses a fenced slot generation");
-  return effect->action == SetEffect::Action::kReplace ? apply(*effect) : absl::OkStatus();
+  if (effect->action == SetEffect::Action::kReplace) {
+    if (auto s = apply(*effect); !s.ok())
+      return s;
+    slot_generations_[effect->slot] = effect->generation;
+  }
+  return absl::OkStatus();
 }
 
 absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, ApplySet apply,
                                        ApplySlotImage apply_image) {
-  if (applied_ < log.StartOffset() || applied_ > log.End().end_offset)
+  if (applied_offset() < log.StartOffset() || applied_offset() > log.End().end_offset)
     return absl::FailedPreconditionError(
         "KV image applied offset is outside the retained group log");
   if (hw < 0 || hw > log.End().end_offset)
@@ -114,15 +173,15 @@ absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, Appl
     return absl::FailedPreconditionError("Group apply is already in progress");
   applying_ = true;
   absl::Cleanup reset = [this] { applying_ = false; };
-  while (applied_ < hw) {
+  while (applied_offset() < hw) {
     // A one-byte budget returns just the first complete batch, even across a segment boundary.
     int64_t base;
-    auto bytes = log.Read(applied_, hw, 1, &base);
+    auto bytes = log.Read(applied_offset(), hw, 1, &base);
     if (!bytes.ok())
       return bytes.status();
     if (bytes->empty())
       break;
-    if (base != applied_)
+    if (base != applied_offset())
       return absl::DataLossError("KV image applied offset splits a group log batch");
     vector<RecordView> records;
     auto batch = DecodeRecordBatch(*bytes, &records);
@@ -134,7 +193,8 @@ absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, Appl
       if (auto s = ApplyRecord(*records.front().value, batch->end, apply, apply_image); !s.ok())
         return s;
     }
-    applied_ = batch->end.end_offset;
+    applied_ = batch->end;
+    applied_bytes_ += bytes->size();
   }
   return absl::OkStatus();
 }

@@ -202,6 +202,37 @@ TEST_F(SetEffectTest, EntryBoundariesAndReentrantApply) {
   EXPECT_FALSE(split.ApplyTo(*log_, 3, noop).ok());
 }
 
+TEST_F(SetEffectTest, SnapshotTracksTheMaterializedSlotsAtTheAppliedBatchBoundary) {
+  auto set = first_;
+  for (SlotId slot : {42, 43, 45}) {
+    set.slot = slot;
+    ASSERT_TRUE(Append(set).ok());
+  }
+  set.slot = 44;
+  set.action = SetEffect::Action::kNoop;
+  set.value.clear();
+  ASSERT_TRUE(Append(set).ok());
+  auto ok = [](const SetEffect&) { return absl::OkStatus(); };
+  CommittedEffects state(10);
+  ASSERT_TRUE(state.ApplyTo(*log_, 4, ok).ok());
+  LogPosition cut{3, 4};
+  EXPECT_EQ(state.applied_position(), cut);
+  EXPECT_GT(state.applied_bytes(), 0u);
+  EXPECT_FALSE(state.SnapshotMigrations({2, 4}).ok());
+  EXPECT_FALSE(state.SnapshotMigrations({3, 3}).ok());
+  auto slots = state.SnapshotSlots();
+  EXPECT_EQ(slots, (vector<SnapshotSlotRange>{{42, 43, 7}, {45, 45, 7}}));
+  EXPECT_EQ(state.SnapshotMigrations(cut).value(), "");
+  auto restored = CommittedEffects::FromSnapshot(10, cut, {}, slots);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->SnapshotSlots(), slots);
+  EXPECT_EQ(restored->applied_position(), cut);
+  EXPECT_EQ(restored->applied_bytes(), 0u);
+  EXPECT_TRUE(CommittedEffects::FromSnapshot(10, cut, {}, {}).ok());
+  slots.back().first = 43;
+  EXPECT_FALSE(CommittedEffects::FromSnapshot(10, cut, {}, slots).ok());
+}
+
 TEST_F(SetEffectTest, FrozenSourceReplaysItsSealedImageAndRetiresTheOldGeneration) {
   auto record = Migration();
   ASSERT_TRUE(Append(first_).ok());
@@ -251,6 +282,22 @@ TEST_F(SetEffectTest, FrozenSourceReplaysItsSealedImageAndRetiresTheOldGeneratio
   EXPECT_TRUE(transfers.BlocksAccess(record.slot, record.generation));
   EXPECT_TRUE(transfers.BlocksAccess(record.slot, record.generation + 1));
   EXPECT_EQ(clears, 0);
+  const auto cut = state.applied_position();
+  auto sealed = state.SnapshotMigrations(cut);
+  ASSERT_TRUE(sealed.ok()) << sealed.status();
+  auto slots = state.SnapshotSlots();
+  EXPECT_EQ(slots, (vector<SnapshotSlotRange>{{42, 42, 7}}));
+  auto copy = CommittedEffects::FromSnapshot(10, cut, *sealed, slots);
+  ASSERT_TRUE(copy.ok()) << copy.status();
+  EXPECT_EQ(copy->transfers().Find(record.migration_id)->bytes, image);
+  EXPECT_EQ(copy->SnapshotMigrations(cut).value(), *sealed);
+  EXPECT_FALSE(CommittedEffects::FromSnapshot(20, cut, *sealed, slots).ok());
+  EXPECT_FALSE(CommittedEffects::FromSnapshot(10, {3, 5}, *sealed, slots).ok());
+  EXPECT_FALSE(CommittedEffects::FromSnapshot(10, cut, *sealed + "extra", slots).ok());
+  sealed->back() ^= 1;
+  EXPECT_FALSE(CommittedEffects::FromSnapshot(10, cut, *sealed, slots).ok());
+  sealed->pop_back();
+  EXPECT_FALSE(CommittedEffects::FromSnapshot(10, cut, *sealed, slots).ok());
   ASSERT_TRUE(state.ApplyTo(*log_, 8, apply, clear).ok());
   EXPECT_EQ(progress->finish, (LogPosition{3, 7}));
   EXPECT_TRUE(progress->bytes.empty());
@@ -260,6 +307,17 @@ TEST_F(SetEffectTest, FrozenSourceReplaysItsSealedImageAndRetiresTheOldGeneratio
   EXPECT_EQ(state.applied_offset(), 8);
   EXPECT_EQ(writes, 1);
   EXPECT_EQ(clears, 1);
+
+  // The retired generation must survive prefix deletion even though its image has been freed.
+  auto retired = state.SnapshotMigrations(state.applied_position());
+  ASSERT_TRUE(retired.ok());
+  EXPECT_TRUE(state.SnapshotSlots().empty());
+  auto restored = CommittedEffects::FromSnapshot(10, {3, 8}, *retired, {});
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_TRUE(restored->transfers().BlocksAccess(record.slot, record.generation));
+  EXPECT_FALSE(restored->ApplyTo(*log_, 9, apply, clear).ok());
+  EXPECT_EQ(clears, 1);
+  EXPECT_EQ(writes, 1);
 }
 
 TEST_F(SetEffectTest, TargetOnlyExposesGenerationAfterSuccessfulInstall) {
@@ -302,6 +360,12 @@ TEST_F(SetEffectTest, TargetOnlyExposesGenerationAfterSuccessfulInstall) {
   };
   EXPECT_FALSE(state.ApplyTo(*log_, 5, apply, load).ok());
   EXPECT_EQ(state.applied_offset(), 1);
+  auto staged = state.SnapshotMigrations(state.applied_position());
+  ASSERT_TRUE(staged.ok());
+  EXPECT_TRUE(state.SnapshotSlots().empty());
+  auto restored = CommittedEffects::FromSnapshot(record.target_group, {3, 1}, *staged, {});
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  state = *std::move(restored);
   const auto* p = state.transfers().Find(record.migration_id);
   ASSERT_NE(p, nullptr);
   EXPECT_EQ(p->install.end_offset, 0);
@@ -311,6 +375,13 @@ TEST_F(SetEffectTest, TargetOnlyExposesGenerationAfterSuccessfulInstall) {
   EXPECT_EQ(p->source, (LogPosition{2, 17}));
   EXPECT_FALSE(state.transfers().BlocksAccess(record.slot, incoming.generation));
   EXPECT_TRUE(state.transfers().BlocksAccess(record.slot, record.generation));
+  auto slots = state.SnapshotSlots();
+  EXPECT_EQ(slots, (vector<SnapshotSlotRange>{{42, 42, incoming.generation}}));
+  auto installed = state.SnapshotMigrations(state.applied_position());
+  ASSERT_TRUE(installed.ok());
+  restored = CommittedEffects::FromSnapshot(record.target_group, {3, 3}, *installed, slots);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  state = *std::move(restored);
   ASSERT_TRUE(state.ApplyTo(*log_, 5, apply, load).ok());
   EXPECT_EQ(installs, 2);
   EXPECT_EQ(value, incoming.value);
@@ -327,6 +398,12 @@ TEST_F(SetEffectTest, CancelUnfreezesSourceAndDoesNotClearAnotherTransfer) {
   CommittedEffects state(record.source_group);
   auto apply = [](const SetEffect&) { return absl::OkStatus(); };
   ASSERT_TRUE(state.ApplyTo(*log_, 2, apply).ok());
+  auto saved = state.SnapshotMigrations(state.applied_position());
+  ASSERT_TRUE(saved.ok());
+  auto restored = CommittedEffects::FromSnapshot(record.source_group, {3, 2}, *saved, {});
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_TRUE(restored->transfers().Find(cancelled.migration_id)->cancelled);
+  state = *std::move(restored);
   EXPECT_TRUE(state.transfers().BlocksAccess(record.slot, record.generation));
   ASSERT_TRUE(state.ApplyTo(*log_, 4, apply).ok());
   EXPECT_FALSE(state.transfers().BlocksAccess(record.slot, record.generation));
