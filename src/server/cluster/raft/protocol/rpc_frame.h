@@ -10,6 +10,7 @@
 #include "server/cluster/raft/protocol/api_versions.h"
 #include "server/cluster/raft/protocol/begin_epoch.h"
 #include "server/cluster/raft/protocol/end_epoch.h"
+#include "server/cluster/raft/protocol/fetch.h"
 #include "server/cluster/raft/protocol/vote.h"
 
 namespace dfly::cluster::raft::protocol {
@@ -34,10 +35,14 @@ using RpcHandler = std::function<std::error_code(int16_t, const Request&, Respon
 
 using VoteHandler = RpcHandler<VoteRequest, VoteResponse>;
 
+// KRaft locates the replicated log by topic UUID, available starting with Fetch v13.
+inline constexpr int16_t kMinRaftFetchVersion = 13;
+
 struct RpcHandlers {
   VoteHandler vote;
   RpcHandler<BeginQuorumEpochRequest, BeginQuorumEpochResponse> begin_epoch;
   RpcHandler<EndQuorumEpochRequest, EndQuorumEpochResponse> end_epoch;
+  RpcHandler<FetchRequest, FetchResponse> fetch;
 };
 
 // Reads one size-prefixed request from the accumulated receive buffer. Only kComplete consumes
@@ -89,5 +94,14 @@ struct RequestMetadata {
 [[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
                                               int16_t version, int32_t correlation_id,
                                               EndQuorumEpochResponse* response);
+
+// Fetches built from a follower's replica_state are adapted to the v13/v14 replica_id
+// representation on the wire, as in Kafka FetchRequest.SimpleBuilder.
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const FetchRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              FetchResponse* response);
 
 }  // namespace dfly::cluster::raft::protocol

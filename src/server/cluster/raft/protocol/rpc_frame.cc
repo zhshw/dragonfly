@@ -90,10 +90,11 @@ bool IsValid(const ApiVersionsRequest& request, int16_t version) {
                          ValidSoftwareId(request.client_software_version));
 }
 
-template <typename Request> void Advertise(ApiVersionsResponse* response) {
+template <typename Request>
+void Advertise(ApiVersionsResponse* response, int16_t min_version = Request::kMinVersion) {
   auto& api = response->api_keys.emplace_back();
   api.api_key = Request::kApiKey;
-  api.min_version = Request::kMinVersion;
+  api.min_version = min_version;
   api.max_version = Request::kMaxVersion;
 }
 
@@ -111,6 +112,8 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
   if (Decode(body, version, &request) != CodecError::kOk)
     return FrameStatus::kInvalidFrame;
   if (IsValid(request, version)) {
+    if (handlers.fetch)
+      Advertise<FetchRequest>(&response, kMinRaftFetchVersion);
     Advertise<ApiVersionsRequest>(&response);
     if (handlers.vote)
       Advertise<VoteRequest>(&response);
@@ -181,7 +184,7 @@ FrameResult Dispatch(int16_t version, int32_t correlation_id, Reader* reader,
 
 FrameResult DispatchRequestFrame(std::string_view input, size_t max_payload_size,
                                  const VoteHandler& vote_handler, std::string* response) {
-  return DispatchRpcFrame(input, max_payload_size, {vote_handler, {}, {}}, response);
+  return DispatchRpcFrame(input, max_payload_size, {vote_handler, {}, {}, {}}, response);
 }
 
 FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
@@ -207,6 +210,11 @@ FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
         return {FrameStatus::kInvalidFrame};
       dispatched = {
           HandleApiVersions(reader.remaining(), version, correlation_id, handlers, response)};
+      break;
+    case FetchRequest::kApiKey:
+      if (handlers.fetch && version < kMinRaftFetchVersion)
+        return {FrameStatus::kUnsupportedVersion};
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.fetch, response);
       break;
     case VoteRequest::kApiKey:
       dispatched = Dispatch(version, correlation_id, &reader, handlers.vote, response);
@@ -266,6 +274,26 @@ CodecError EncodeRequestFrame(const RequestMetadata& metadata, const EndQuorumEp
 
 FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
                                 int32_t correlation_id, EndQuorumEpochResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata, const FetchRequest& request,
+                              int16_t version, std::string* output) {
+  if (version < kMinRaftFetchVersion)
+    return CodecError::kUnsupportedVersion;
+  if (version < 15 && request.replica_state != FetchRequest::ReplicaState{}) {
+    if (request.replica_id != -1)
+      return CodecError::kInvalidData;
+    FetchRequest legacy = request;
+    legacy.replica_id = request.replica_state.replica_id;
+    legacy.replica_state = {};
+    return WriteRequest(metadata, legacy, version, FetchRequest::HeaderVersion(version), output);
+  }
+  return WriteRequest(metadata, request, version, FetchRequest::HeaderVersion(version), output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, FetchResponse* response) {
   return ReadResponse(input, max_payload_size, version, correlation_id, response);
 }
 

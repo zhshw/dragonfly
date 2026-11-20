@@ -120,7 +120,8 @@ template <> struct Schema<VoteResponse> {
       return false;
     if (!io.Field(m.topics))
       return false;
-    return io.Tags(m.unknown_tags, Tagged{0, 1, m.node_endpoints, !m.node_endpoints.empty()});
+    return io.Tags(m.unknown_tags,
+                   Tagged{0, 1, m.node_endpoints, !m.node_endpoints.empty(), false});
   }
 };
 

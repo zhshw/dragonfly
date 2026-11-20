@@ -22,8 +22,6 @@ template <> struct Schema<BeginQuorumEpochRequest::TopicData::PartitionData> {
       return false;
     if (!io.Field(m.leader_epoch))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -34,8 +32,6 @@ template <> struct Schema<BeginQuorumEpochRequest::TopicData> {
       return false;
     if (!io.Field(m.partitions))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -60,8 +56,6 @@ template <> struct Schema<BeginQuorumEpochRequest::LeaderEndpoint> {
     } else if (!io.Absent(m.port)) {
       return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -80,8 +74,6 @@ template <> struct Schema<BeginQuorumEpochRequest> {
       if (!io.Field(m.leader_endpoints))
         return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -96,8 +88,6 @@ template <> struct Schema<BeginQuorumEpochResponse::TopicData::PartitionData> {
       return false;
     if (!io.Field(m.leader_epoch))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -108,8 +98,6 @@ template <> struct Schema<BeginQuorumEpochResponse::TopicData> {
       return false;
     if (!io.Field(m.partitions))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -134,8 +122,6 @@ template <> struct Schema<BeginQuorumEpochResponse::NodeEndpoint> {
     } else if (!io.Absent(m.port)) {
       return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -146,9 +132,8 @@ template <> struct Schema<BeginQuorumEpochResponse> {
       return false;
     if (!io.Field(m.topics))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
-    return io.Tags(m.unknown_tags, Tagged{0, 1, m.node_endpoints, !m.node_endpoints.empty()});
+    return io.Tags(m.unknown_tags,
+                   Tagged{0, 1, m.node_endpoints, !m.node_endpoints.empty(), false});
   }
 };
 

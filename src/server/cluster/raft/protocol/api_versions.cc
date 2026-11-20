@@ -28,8 +28,6 @@ template <> struct Schema<ApiVersionsRequest> {
       if (!io.Field(m.node_id))
         return false;
     }
-    if (io.version < 3)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -42,8 +40,6 @@ template <> struct Schema<ApiVersionsResponse::ApiVersion> {
       return false;
     if (!io.Field(m.max_version))
       return false;
-    if (io.version < 3)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -68,8 +64,6 @@ template <> struct Schema<ApiVersionsResponse::SupportedFeatureKey> {
     } else if (!io.Absent(m.max_version)) {
       return false;
     }
-    if (io.version < 3)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -94,8 +88,6 @@ template <> struct Schema<ApiVersionsResponse::FinalizedFeatureKey> {
     } else if (!io.Absent(m.min_version_level)) {
       return false;
     }
-    if (io.version < 3)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -110,13 +102,11 @@ template <> struct Schema<ApiVersionsResponse> {
       if (!io.Field(m.throttle_time_ms))
         return false;
     }
-    if (io.version < 3)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags,
-                   Tagged{0, 3, m.supported_features, !m.supported_features.empty()},
-                   Tagged{1, 3, m.finalized_features_epoch, m.finalized_features_epoch != -1},
-                   Tagged{2, 3, m.finalized_features, !m.finalized_features.empty()},
-                   Tagged{3, 3, m.zk_migration_ready, m.zk_migration_ready});
+                   Tagged{0, 3, m.supported_features, !m.supported_features.empty(), true},
+                   Tagged{1, 3, m.finalized_features_epoch, m.finalized_features_epoch != -1, true},
+                   Tagged{2, 3, m.finalized_features, !m.finalized_features.empty(), true},
+                   Tagged{3, 3, m.zk_migration_ready, m.zk_migration_ready, true});
   }
 };
 

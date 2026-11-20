@@ -7,6 +7,7 @@ add_library(dfly_raft
             protocol/api_versions.cc
             protocol/begin_epoch.cc
             protocol/end_epoch.cc
+            protocol/fetch.cc
             protocol/rpc_frame.cc
             protocol/vote.cc
             quorum/campaign.cc
@@ -24,6 +25,7 @@ helio_cxx_test(bootstrap/raft_directory_test dfly_raft LABELS DFLY)
 helio_cxx_test(config/quorum_config_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/partition_log_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/record_batch_test dfly_raft LABELS DFLY)
+helio_cxx_test(protocol/fetch_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/rpc_frame_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/vote_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/campaign_test dfly_raft LABELS DFLY)

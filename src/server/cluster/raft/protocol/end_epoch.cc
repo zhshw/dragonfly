@@ -24,8 +24,6 @@ template <> struct Schema<EndQuorumEpochRequest::TopicData::PartitionData::Repli
     } else if (!io.Absent(m.candidate_directory_id)) {
       return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -46,8 +44,6 @@ template <> struct Schema<EndQuorumEpochRequest::TopicData::PartitionData> {
       if (!io.Field(m.preferred_candidates))
         return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -58,8 +54,6 @@ template <> struct Schema<EndQuorumEpochRequest::TopicData> {
       return false;
     if (!io.Field(m.partitions))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -84,8 +78,6 @@ template <> struct Schema<EndQuorumEpochRequest::LeaderEndpoint> {
     } else if (!io.Absent(m.port)) {
       return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -100,8 +92,6 @@ template <> struct Schema<EndQuorumEpochRequest> {
       if (!io.Field(m.leader_endpoints))
         return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -116,8 +106,6 @@ template <> struct Schema<EndQuorumEpochResponse::TopicData::PartitionData> {
       return false;
     if (!io.Field(m.leader_epoch))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -128,8 +116,6 @@ template <> struct Schema<EndQuorumEpochResponse::TopicData> {
       return false;
     if (!io.Field(m.partitions))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -154,8 +140,6 @@ template <> struct Schema<EndQuorumEpochResponse::NodeEndpoint> {
     } else if (!io.Absent(m.port)) {
       return false;
     }
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
     return io.Tags(m.unknown_tags);
   }
 };
@@ -166,9 +150,8 @@ template <> struct Schema<EndQuorumEpochResponse> {
       return false;
     if (!io.Field(m.topics))
       return false;
-    if (io.version < 1)
-      return io.Absent(m.unknown_tags);
-    return io.Tags(m.unknown_tags, Tagged{0, 1, m.node_endpoints, !m.node_endpoints.empty()});
+    return io.Tags(m.unknown_tags,
+                   Tagged{0, 1, m.node_endpoints, !m.node_endpoints.empty(), false});
   }
 };
 

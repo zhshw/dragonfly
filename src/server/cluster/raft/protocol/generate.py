@@ -17,6 +17,8 @@ NOTICE = """// Copyright 2026, DragonflyDB authors. All rights reserved.
 NAMESPACE = "dfly::cluster::raft::protocol"
 TYPES = {
     "bool": "bool",
+    "int8": "int8_t",
+    "records": "RecordBytes",
     "int16": "int16_t",
     "int32": "int32_t",
     "int64": "int64_t",
@@ -51,12 +53,19 @@ def cpp_field(field):
     raw = field["type"]
     if raw.startswith("[]"):
         element = raw[2:] if field.get("fields") else TYPES[raw[2:]]
-        return f"std::vector<{element}>"
+        typ = f"std::vector<{element}>"
+    elif field.get("fields"):
+        typ = raw
+    else:
+        typ = TYPES[raw]
     if "nullableVersions" in field:
-        if raw != "string" or field["nullableVersions"] != field["versions"]:
-            raise ValueError(f"Unsupported nullability: {field}")
-        return "std::optional<std::string>"
-    return TYPES[raw]
+        if field["nullableVersions"] != field["versions"]:
+            raise ValueError(f"Version-dependent nullability requires an explicit codec: {field}")
+        if raw == "string" or raw.startswith("[]"):
+            typ = f"std::optional<{typ}>"
+        elif raw != "records":
+            raise ValueError(f"Unsupported nullable field: {field}")
+    return typ
 
 
 def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
@@ -69,12 +78,27 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
         member = "m." + field_name(field)
         if "fields" in field:
             emit_struct(
-                field["type"][2:], field["fields"], [], header, impl, flexible, (*parents, name)
+                field["type"].removeprefix("[]"),
+                field["fields"],
+                [],
+                header,
+                impl,
+                flexible,
+                (*parents, name),
             )
         default = field.get("default", "null")
         if field.get("flexibleVersions"):
             raise ValueError(f"Per-field flexible versions require an explicit codec: {field}")
-        initializer = "{}" if default in ("null", "false") else f" = {int(default)}"
+        number = None
+        if default not in ("null", "false", ""):
+            number = int(str(default), 0)
+        initializer = f" = {number}" if number is not None else "{}"
+        if (
+            field["type"].startswith("[]")
+            and "nullableVersions" in field
+            and field.get("default") != "null"
+        ):
+            initializer = "{std::in_place}"
         header.append(f"{cpp_field(field)} {field_name(field)}{initializer};")
         if "tag" in field:
             since = first_version(field["taggedVersions"])
@@ -84,18 +108,22 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
                 present = f"!{member}.empty()"
             elif field["type"] == "bool":
                 present = member
+            elif "fields" in field or field["type"] == "uuid":
+                present = f"{member} != decltype({member}){{}}"
+            elif "nullableVersions" in field:
+                present = f"{member}.has_value()"
             elif field["type"] in ("int16", "int32", "int64"):
                 present = f"{member} != {int(default)}"
             else:
                 raise ValueError(f"Unsupported tagged field type: {field}")
-            tags.append(f"Tagged{{{field['tag']}, {since}, {member}, {present}}}")
+            ignorable = str(field.get("ignorable", False)).lower()
+            tags.append(f"Tagged{{{field['tag']}, {since}, {member}, {present}, {ignorable}}}")
         elif condition:
             visitor.append(f"if ({condition}) {{")
             visitor.append(f"if (!io.Field({member})) return false;")
             if not field.get("ignorable", False):
-                if default not in ("null", "0", "false"):
-                    raise ValueError(f"Unsupported versioned default: {field}")
-                visitor.append(f"}} else if (!io.Absent({member})) {{ return false;")
+                fallback = f", {number}" if number else ""
+                visitor.append(f"}} else if (!io.Absent({member}{fallback})) {{ return false;")
             visitor.append("}")
         else:
             visitor.append(f"if (!io.Field({member})) return false;")
@@ -108,11 +136,6 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
             f"template <> struct Schema<{qualified}> {{",
             "template <typename IO, typename T> static bool Visit(IO& io, T& m) {",
             *visitor,
-            *(
-                [f"if (io.version < {flexible}) return io.Absent(m.unknown_tags);"]
-                if flexible
-                else []
-            ),
             f"return io.Tags({', '.join(tags)});",
             "}",
             "};",
@@ -212,3 +235,4 @@ if __name__ == "__main__":
     generate(schema_dir, "ApiVersions", "api_versions")
     generate(schema_dir, "BeginQuorumEpoch", "begin_epoch")
     generate(schema_dir, "EndQuorumEpoch", "end_epoch")
+    generate(schema_dir, "Fetch", "fetch")

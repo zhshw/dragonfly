@@ -29,8 +29,9 @@ template <typename T> struct Tagged {
   int16_t first_version;
   T& value;
   bool present;
+  bool ignorable;
 };
-template <typename T> Tagged(uint32_t, int16_t, T&, bool) -> Tagged<T>;
+template <typename T> Tagged(uint32_t, int16_t, T&, bool, bool) -> Tagged<T>;
 
 class Reader {
  public:
@@ -108,23 +109,35 @@ class Reader {
     return String(length - 1, &value.emplace());
   }
 
-  template <typename T> bool Field(std::vector<T>& values) {
-    uint32_t length;
-    if (flexible_) {
-      if (!Varint(&length) || length == 0)
-        return false;
-      --length;
-    } else if (!Field(length)) {
+  bool Field(RecordBytes& value) {
+    int32_t length;
+    if (!Length(&length))
       return false;
+    if (length < 0) {
+      value.data.reset();
+      return true;
     }
-    const auto count = length;
-    if (count > bytes_.size() || count > kMaxArrayLength)
+    if (static_cast<size_t>(length) > bytes_.size())
       return false;
-    for (uint32_t i = 0; i < count; ++i) {
-      if (!Field(values.emplace_back()))
-        return false;
-    }
+    value.data.emplace(bytes_.substr(0, length));
+    bytes_.remove_prefix(length);
     return true;
+  }
+
+  template <typename T> bool Field(std::vector<T>& values) {
+    int32_t count;
+    return Length(&count) && count >= 0 && Array(count, &values);
+  }
+
+  template <typename T> bool Field(std::optional<std::vector<T>>& values) {
+    int32_t count;
+    if (!Length(&count))
+      return false;
+    if (count < 0) {
+      values.reset();
+      return true;
+    }
+    return Array(count, &values.emplace());
   }
 
   template <typename T>
@@ -159,7 +172,7 @@ class Reader {
     return true;
   }
 
-  template <typename T> bool Absent(const T&) const {
+  template <typename T> bool Absent(const T&, const std::type_identity_t<T>& = T{}) const {
     // The destination is constructed with the schema defaults before decoding.
     return true;
   }
@@ -167,6 +180,26 @@ class Reader {
   const int16_t version;
 
  private:
+  bool Length(int32_t* length) {
+    if (!flexible_)
+      return Field(*length);
+    uint32_t compact;
+    if (!Varint(&compact) || compact > uint32_t{1} + std::numeric_limits<int32_t>::max())
+      return false;
+    *length = compact ? static_cast<int32_t>(compact - 1) : -1;
+    return true;
+  }
+
+  template <typename T> bool Array(uint32_t count, std::vector<T>* values) {
+    if (count > bytes_.size() || count > kMaxArrayLength)
+      return false;
+    for (uint32_t i = 0; i < count; ++i) {
+      if (!Field(values->emplace_back()))
+        return false;
+    }
+    return true;
+  }
+
   bool Varint(uint32_t* result) {
     *result = 0;
     for (int shift = 0; shift <= 28; shift += 7) {
@@ -250,13 +283,24 @@ class Writer {
     return true;
   }
 
+  bool Field(const RecordBytes& value) {
+    if (!value.data)
+      return Length(-1);
+    if (value.data->size() > std::numeric_limits<int32_t>::max())
+      return false;
+    Length(static_cast<int32_t>(value.data->size()));
+    bytes_->append(*value.data);
+    return true;
+  }
+
+  template <typename T> bool Field(const std::optional<std::vector<T>>& values) {
+    return values ? Field(*values) : Length(-1);
+  }
+
   template <typename T> bool Field(const std::vector<T>& values) {
     if (values.size() > kMaxArrayLength)
       return false;
-    if (flexible_)
-      Varint(values.size() + 1);
-    else
-      Field(static_cast<int32_t>(values.size()));
+    Length(static_cast<int32_t>(values.size()));
     for (const auto& value : values) {
       if (!Field(value))
         return false;
@@ -294,8 +338,8 @@ class Writer {
     return (AddTag(known, &fields) && ...) && Tags(fields);
   }
 
-  template <typename T> bool Absent(const T& value) {
-    if (value != T{}) {
+  template <typename T> bool Absent(const T& value, const std::type_identity_t<T>& fallback = T{}) {
+    if (value != fallback) {
       error = CodecError::kUnsupportedField;
       return false;
     }
@@ -306,6 +350,14 @@ class Writer {
   CodecError error = CodecError::kInvalidData;
 
  private:
+  bool Length(int32_t size) {
+    if (flexible_)
+      Varint(static_cast<uint32_t>(size) + 1);
+    else
+      Field(size);
+    return true;
+  }
+
   void Varint(uint32_t value) {
     while (value >= 128) {
       bytes_->push_back(static_cast<char>((value & 127) | 128));
@@ -317,10 +369,14 @@ class Writer {
   template <typename T> bool AddTag(Tagged<T> tag, TaggedFields* fields) {
     if (fields->contains(tag.id))
       return false;
-    if (version < tag.first_version)
-      return Absent(tag.value);
     if (!tag.present)
       return true;
+    if (version < tag.first_version) {
+      if (tag.ignorable)
+        return true;
+      error = CodecError::kUnsupportedField;
+      return false;
+    }
     Writer field(version, &(*fields)[tag.id]);
     if (field.Field(tag.value))
       return true;
