@@ -97,6 +97,7 @@ ABSL_DECLARE_FLAG(int32_t, port);
 ABSL_DECLARE_FLAG(uint32_t, memcached_port);
 ABSL_DECLARE_FLAG(uint16_t, admin_port);
 ABSL_DECLARE_FLAG(std::string, admin_bind);
+ABSL_DECLARE_FLAG(bool, admin_nopass);
 ABSL_DECLARE_FLAG(strings::MemoryBytesFlag, maxmemory);
 ABSL_DECLARE_FLAG(uint32_t, proactor_threads);
 ABSL_DECLARE_FLAG(std::string, dbfilename);
@@ -363,9 +364,19 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
     if (!user.empty() && !DropPrivilegesToUser(user, dir))
       exit(1);
 #endif
-    auto status = cluster::raft::RunController(
-        dir.empty() ? "." : dir, GetFlag(FLAGS_raft_cluster_id), GetFlag(FLAGS_raft_node_id),
-        GetFlag(FLAGS_raft_quorum_voters), pool, acceptor, GetFlag(FLAGS_raft_bootstrap_topology));
+    cluster::raft::ControllerAdminConfig admin{GetFlag(FLAGS_admin_port), GetFlag(FLAGS_admin_bind),
+                                               GetFlag(FLAGS_admin_nopass) ? "" : GetPassword()};
+    if (admin.bind_address.empty()) {
+      if (admin.password.empty()) {
+        admin.bind_address = "127.0.0.1";
+      } else if (const char* address = DefaultBindAddress()) {
+        admin.bind_address = address;
+      }
+    }
+    auto status =
+        cluster::raft::RunController(dir.empty() ? "." : dir, GetFlag(FLAGS_raft_cluster_id),
+                                     GetFlag(FLAGS_raft_node_id), GetFlag(FLAGS_raft_quorum_voters),
+                                     pool, acceptor, GetFlag(FLAGS_raft_bootstrap_topology), admin);
     if (!status.ok()) {
       LOG(ERROR) << status;
       exit(1);
@@ -1135,8 +1146,9 @@ void ParseFlagsFromEnv() {
       pair<string_view, string_view> environ_pair =
           absl::StrSplit(absl::StripPrefix(environ_var, kPrefix), absl::MaxSplits('=', 1));
       const auto& [flag_name, flag_value] = environ_pair;
-      if (flag_name == "DEV_ENV") {
-        continue;  // DFLY_DEV_ENV is used to skip version check.
+      if (flag_name == "DEV_ENV" || flag_name == "PASSWORD") {
+        // The version checker and password lookup read these variables directly.
+        continue;
       }
 
       auto entry = flags.find(flag_name);

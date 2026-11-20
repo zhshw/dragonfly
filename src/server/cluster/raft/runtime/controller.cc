@@ -16,6 +16,8 @@
 #include "server/cluster/raft/metadata/broker_control.h"
 #include "server/cluster/raft/metadata/metadata_snapshot.h"
 #include "server/cluster/raft/quorum/fetch_replication.h"
+#include "server/cluster/raft/runtime/admin_command.h"
+#include "server/cluster/raft/runtime/admin_listener.h"
 #include "server/cluster/raft/runtime/group.h"
 #include "server/cluster/raft/transport/peer_connection.h"
 #include "server/cluster/raft/transport/raft_listener.h"
@@ -122,6 +124,23 @@ class ActiveController {
       });
     };
     return handlers;
+  }
+
+  AdminReply ExecuteAdmin(span<const string_view> args) {
+    struct {
+      int16_t error_code = 0;
+      AdminReply reply;
+    } result;
+    auto ec = ApplyRequest(&result, [&](const MetadataImage& image, int64_t) {
+      return PlanAdminCommand(image, cluster_id_, args, &result.reply);
+    });
+    if (ec)
+      return {AdminReply::Kind::kError, "TRYAGAIN Controller unavailable", {}};
+    if (result.error_code == 41)
+      return {AdminReply::Kind::kError, "TRYAGAIN Contact the active controller", {}};
+    if (result.error_code)
+      return {AdminReply::Kind::kError, "TRYAGAIN Request timed out; check its operation ID", {}};
+    return std::move(result.reply);
   }
 
   absl::Status Run(fb2::ProactorBase* owner) {
@@ -337,7 +356,8 @@ class ActiveController {
 
 absl::Status RunController(const filesystem::path& dir, const string& cluster_id, int32_t node_id,
                            const string& voters, util::ProactorPool* pool,
-                           util::AcceptServer* acceptor, const string& bootstrap_file) {
+                           util::AcceptServer* acceptor, const string& bootstrap_file,
+                           const ControllerAdminConfig& admin) {
   auto identity = ReadRaftDirectory(dir);
   if (!identity.ok())
     return identity.status();
@@ -376,6 +396,9 @@ absl::Status RunController(const filesystem::path& dir, const string& cluster_id
   if (auto ec = acceptor->AddListener(local.host.c_str(), local.port, listener.get()); ec)
     return absl::ErrnoToStatus(ec.value(), "Binding controller listener");
   listener.release();
+  auto handle_admin = [&](span<const string_view> args) { return controller.ExecuteAdmin(args); };
+  if (auto status = AddControllerAdminListener(admin, handle_admin, pool, acceptor); !status.ok())
+    return status;
   acceptor->TriggerOnBreakSignal([&] {
     controller.Stop();
     group.RequestStop();

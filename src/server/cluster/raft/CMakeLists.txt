@@ -49,6 +49,7 @@ add_library(dfly_raft
             quorum/voter_changes.cc
             quorum/vote_handler.cc
             replication/high_watermark.cc
+            runtime/admin_command.cc
             storage/file_quorum_state_store.cc)
 target_compile_features(dfly_raft PUBLIC cxx_std_20)
 cxx_link(dfly_raft absl::crc32c absl::statusor absl::str_format absl::strings absl::cleanup
@@ -84,8 +85,13 @@ helio_cxx_test(quorum/snapshot_transfer_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/voter_changes_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/vote_handler_test dfly_raft LABELS DFLY)
 helio_cxx_test(replication/high_watermark_test dfly_raft LABELS DFLY)
+helio_cxx_test(runtime/admin_command_test dfly_raft LABELS DFLY)
 helio_cxx_test(storage/file_quorum_state_store_test dfly_raft LABELS DFLY)
 
-add_library(dfly_raft_transport runtime/controller.cc runtime/group.cc transport/peer_connection.cc transport/raft_listener.cc)
-cxx_link(dfly_raft_transport dfly_raft fibers2 absl::random_random)
+add_library(dfly_raft_transport runtime/admin_listener.cc runtime/controller.cc runtime/group.cc
+            transport/peer_connection.cc transport/raft_listener.cc)
+cxx_link(dfly_raft_transport dfly_raft dfly_facade fibers2 absl::random_random)
+if (DF_USE_SSL)
+  target_compile_definitions(dfly_raft_transport PRIVATE DFLY_USE_SSL)
+endif()
 helio_cxx_test(transport/raft_listener_test dfly_raft_transport LABELS DFLY)

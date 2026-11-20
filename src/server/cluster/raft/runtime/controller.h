@@ -4,21 +4,17 @@
 
 #pragma once
 
-#include <absl/status/status.h>
-
 #include <filesystem>
 #include <string>
 
-namespace util {
-class AcceptServer;
-class ProactorPool;
-}  // namespace util
+#include "server/cluster/raft/runtime/admin_listener.h"
 
 namespace dfly::cluster::raft {
 
-// Run a controller-only static metadata quorum until the internal listener shuts down.
+// Run the metadata quorum and its optional RESP management listener until shutdown.
 absl::Status RunController(const std::filesystem::path& dir, const std::string& cluster_id,
                            int32_t node_id, const std::string& voters, util::ProactorPool* pool,
-                           util::AcceptServer* acceptor, const std::string& bootstrap_file = {});
+                           util::AcceptServer* acceptor, const std::string& bootstrap_file,
+                           const ControllerAdminConfig& admin);
 
 }  // namespace dfly::cluster::raft
