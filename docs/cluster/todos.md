@@ -41,6 +41,7 @@
 - [ ] 03.2 为每个 quorum 独立保存 epoch 和投票。原子更新后才应答正式 Vote；模拟更新前后断电，检查同一 term 不会投给两个候选者。
   - [x] 实现 quorum-state v0/v1 持久化和恢复，文件与目录同步完成后返回。覆盖重启、临时文件、写失败、损坏文件，以及和 Kafka 的双向读取。[存储测试](../../src/server/cluster/raft/storage/file_quorum_state_store_test.cc)
 - [ ] 03.3 实现批量追加、持久化、按 offset 读取、按 epoch 查找共同前缀、尾部截断和 segment 回收。区分日志末端 LEO、已持久化位置、HW 和已应用位置。
+  - [x] 恢复并校验初始 segment，按组持久追加 Kafka 批次、读取、查询 epoch 和截断；用真实 LeaderChange 批次及故障恢复验证 LEO。[分区日志用例](../../src/server/cluster/raft/log/partition_log_test.cc)
 - [ ] 03.4 实现有校验的快照文件、临时文件安装和续读起点。重启时检查日志连续性；测试半个尾批、损坏批次、未完成快照和快照后的日志缺口，验证恢复结果或明确的失败原因。
 
 ## 04 共享 KRaft 共识引擎
