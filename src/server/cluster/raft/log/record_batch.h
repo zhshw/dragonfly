@@ -32,6 +32,11 @@ struct RecordView {
   std::optional<std::string_view> value;
 };
 
+struct ControlRecordValue {
+  int16_t type;
+  std::string_view value;
+};
+
 // Reads the size from the first 12 bytes, including the base offset and length fields.
 absl::StatusOr<size_t> RecordBatchSize(std::string_view prefix);
 
@@ -42,9 +47,16 @@ absl::StatusOr<BatchInfo> DecodeRecordBatch(std::string_view batch,
 
 absl::StatusOr<std::string> MakeDataBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
                                           std::span<const std::string> values);
-absl::StatusOr<std::string> MakeLeaderChangeBatch(int64_t offset, int32_t epoch,
-                                                  int64_t timestamp_ms, int32_t leader,
-                                                  std::span<const int32_t> voters,
-                                                  std::span<const int32_t> granting_voters);
+absl::StatusOr<std::string> MakeControlBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                             std::span<const ControlRecordValue> controls);
+absl::StatusOr<std::string> MakeLeaderChangeBatch(
+    int64_t offset, int32_t epoch, int64_t timestamp_ms, int32_t leader,
+    std::span<const int32_t> voters, std::span<const int32_t> granting_voters,
+    std::span<const ControlRecordValue> trailing = {});
+
+absl::StatusOr<std::string> MakeSnapshotHeaderBatch(int32_t epoch, int64_t timestamp_ms,
+                                                    int64_t last_contained_log_timestamp);
+absl::StatusOr<std::string> MakeSnapshotFooterBatch(int64_t offset, int32_t epoch,
+                                                    int64_t timestamp_ms);
 
 }  // namespace dfly::cluster::raft

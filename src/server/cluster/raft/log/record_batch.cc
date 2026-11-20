@@ -215,10 +215,28 @@ absl::StatusOr<std::string> MakeDataBatch(int64_t offset, int32_t epoch, int64_t
   return BuildBatch(offset, epoch, timestamp_ms, values.size(), false, std::move(records));
 }
 
+absl::StatusOr<std::string> MakeControlBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                             span<const ControlRecordValue> controls) {
+  string records;
+  for (size_t i = 0; i < controls.size(); ++i) {
+    if (controls[i].type < 0)
+      return absl::InvalidArgumentError("Negative KRaft control record type");
+    if (controls[i].value.size() > kMaxBatchSize - records.size())
+      return absl::ResourceExhaustedError("KRaft control batch exceeds maximum size");
+    char key[4] = {};
+    be::Store16(key + 2, controls[i].type);
+    PutRecord(i, string_view(key, sizeof(key)), controls[i].value, &records);
+    if (records.size() > kMaxBatchSize - kBatchHeaderSize)
+      return absl::ResourceExhaustedError("KRaft control batch exceeds maximum size");
+  }
+  return BuildBatch(offset, epoch, timestamp_ms, controls.size(), true, std::move(records));
+}
+
 absl::StatusOr<std::string> MakeLeaderChangeBatch(int64_t offset, int32_t epoch,
                                                   int64_t timestamp_ms, int32_t leader,
                                                   span<const int32_t> voters,
-                                                  span<const int32_t> granting_voters) {
+                                                  span<const int32_t> granting_voters,
+                                                  span<const ControlRecordValue> trailing) {
   set<int32_t> members(voters.begin(), voters.end());
   set<int32_t> grants(granting_voters.begin(), granting_voters.end());
   if (members.empty() || members.size() != voters.size() || *members.begin() < 0 ||
@@ -240,9 +258,27 @@ absl::StatusOr<std::string> MakeLeaderChangeBatch(int64_t offset, int32_t epoch,
       return absl::ResourceExhaustedError("Too many voters in LeaderChangeMessage");
   }
   writer.Tags({});
-  string records;
-  PutRecord(0, string_view(kLeaderChangeKey, 4), value, &records);
-  return BuildBatch(offset, epoch, timestamp_ms, 1, true, std::move(records));
+  vector<ControlRecordValue> controls{{2, value}};
+  controls.insert(controls.end(), trailing.begin(), trailing.end());
+  return MakeControlBatch(offset, epoch, timestamp_ms, controls);
+}
+
+absl::StatusOr<std::string> MakeSnapshotHeaderBatch(int32_t epoch, int64_t timestamp_ms,
+                                                    int64_t last_contained_log_timestamp) {
+  string value;
+  protocol::detail::Writer writer(0, &value);
+  writer.Field(int16_t{0});
+  writer.Field(last_contained_log_timestamp);
+  writer.Tags({});
+  const ControlRecordValue header{3, value};
+  return MakeControlBatch(0, epoch, timestamp_ms, span(&header, 1));
+}
+
+absl::StatusOr<std::string> MakeSnapshotFooterBatch(int64_t offset, int32_t epoch,
+                                                    int64_t timestamp_ms) {
+  // SnapshotFooterRecord v0 contains its version and an empty tagged-field array.
+  const ControlRecordValue footer{4, string_view("\0\0\0", 3)};
+  return MakeControlBatch(offset, epoch, timestamp_ms, span(&footer, 1));
 }
 
 }  // namespace dfly::cluster::raft

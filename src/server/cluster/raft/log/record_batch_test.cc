@@ -9,6 +9,8 @@
 #include <absl/strings/escaping.h>
 #include <gtest/gtest.h>
 
+#include "server/cluster/raft/log/testdata/snapshot_fixture.h"
+
 namespace dfly::cluster::raft {
 namespace {
 using namespace std;
@@ -64,6 +66,30 @@ TEST(RecordBatchTest, RejectsBadCrcAndMalformedRecordsEvenWithValidCrc) {
   absl::big_endian::Store32(
       bad.data() + 17, static_cast<uint32_t>(absl::ComputeCrc32c(string_view(bad).substr(21))));
   EXPECT_FALSE(DecodeRecordBatch(bad).ok());
+}
+
+TEST(RecordBatchTest, SnapshotEnvelopeMatchesJavaAndControlRecordsRetainOrder) {
+  auto header = MakeSnapshotHeaderBatch(2, 123, 99);
+  auto footer = MakeSnapshotFooterBatch(2, 2, 123);
+  ASSERT_TRUE(header.ok());
+  ASSERT_TRUE(footer.ok());
+  const array<string, 1> value{"metadata"};
+  EXPECT_EQ(*header + MakeDataBatch(1, 2, 123, value).value() + *footer, test::SnapshotBytes(2));
+
+  const array<ControlRecordValue, 2> extra{{{5, "version"}, {6, "voters"}}};
+  const array<int32_t, 1> voters{1};
+  auto batch = MakeLeaderChangeBatch(7, 2, 123, 1, voters, voters, extra);
+  ASSERT_TRUE(batch.ok()) << batch.status();
+  vector<RecordView> records;
+  auto info = DecodeRecordBatch(*batch, &records);
+  ASSERT_TRUE(info.ok()) << info.status();
+  ASSERT_EQ(records.size(), 3u);
+  EXPECT_TRUE(info->control);
+  EXPECT_EQ(info->end.end_offset, 10);
+  for (size_t i = 0; i < extra.size(); ++i) {
+    EXPECT_EQ(absl::big_endian::Load16(records[i + 1].key->data() + 2), extra[i].type);
+    EXPECT_EQ(records[i + 1].value, extra[i].value);
+  }
 }
 
 TEST(RecordBatchTest, LeaderChangeRequiresActualMajority) {
