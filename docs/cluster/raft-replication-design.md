@@ -4,7 +4,7 @@
 
 ## 1. 复制状态机
 
-原图跟踪主节点上的复制会话。Raft 图跟踪组 10 的一个 follower。组内换主时，follower 根据新 leader 的 epoch 和本地日志末端查找共同前缀。
+原图跟踪主节点上的复制会话。Raft 图跟踪组 10 的一个 follower。组内换主时，follower 根据新 leader 的 epoch 和本地日志末端查找共同前缀。当前数据节点沿图中的日志路径恢复，图中的整组 KV 快照安装路径属于后续设计。
 
 ![副本加载分配、恢复共同前缀或安装快照后进入 Fetch](figures/replica-states.svg)
 
@@ -42,7 +42,7 @@ flowchart LR
 
 ## 2. 握手、全量恢复与增量拉取
 
-`yes` 的副本与主节点协商每线程的 flow，完成同步后接收主节点推送的 journal。`raft` 的副本从元数据发现数据组的入口，由本组协议确认 leader 和 term，按日志位置拉取。两端历史一致时直接进入 Fetch 循环。图中 KV 镜像属于 Dragonfly 扩展，KRaft 元数据快照有独立身份和传输路径。
+`yes` 的副本与主节点协商每线程的 flow，完成同步后接收主节点推送的 journal。`raft` 的副本从元数据发现数据组的入口，由本组协议确认 leader 和 term，按日志位置拉取。两端历史一致时直接进入 Fetch 循环。图中“所需前缀已清理”分支描述接入整组 KV 快照后的追赶流程。
 
 ![按组 Fetch、截断分歧与安装 KV 快照](figures/replica-fetch.svg)
 
@@ -106,7 +106,13 @@ sequenceDiagram
 
 ## 3. 快照与并发写入
 
-沿用原图的遍历 fiber、bucket 和写 fiber。建议复用写前保存 bucket 的方法，在同一组所有执行线程的连续 apply 边界建立 cut。组快照还需保存该边界的 slot generation、冻结状态和暂存迁移数据；过滤数据时使用 cut 对应的归属。只有组内所有参与线程完成，才能发布可供恢复的快照。
+| 对象 | 当前怎样生成和恢复 |
+| --- | --- |
+| 控制组元数据 | controller 按大小或时间阈值在稳定 offset 生成快照，恢复时从快照和后续已提交记录重建元数据。[控制器](../../src/server/cluster/raft/runtime/controller.cc) · [元数据快照](../../src/server/cluster/raft/metadata/metadata_snapshot.cc) |
+| 迁槽中的单槽 RDB | 源组冻结该槽后生成 RDB，将分块和摘要写入源组日志。目标组按块拉取、在本组日志中提交并应用安装记录。恢复时重放迁槽记录即可接续。[迁槽驱动](../../src/server/cluster/raft/runtime/slot_migration_driver.cc) · [单槽 RDB](../../src/server/cluster/raft/data/kv_rdb.cc) |
+| 整个数据组的 KV | 已有快照格式与分块安装的单元测试。运行中的数据节点尚未接入整组快照生成、装载及据此截断旧日志前缀的流程。当前重启依靠本组持久日志，按 offset 重放已提交的 SET 效果和迁槽记录。因此磁盘要容纳保留的日志，重启回放量随日志增长。[数据组回放](../../src/server/cluster/raft/data/set_effect.cc) · [整组快照格式测试](../../src/server/cluster/raft/data/kv_snapshot_test.cc) |
+
+下图是整组快照的设计，沿用原图的遍历 fiber、bucket 和写 fiber。各执行线程须在同一个已应用位置建立快照，保存对应的 slot generation、冻结状态及暂存迁移数据。所有线程捕获完成后，才可发布该位置的镜像。
 
 ![组快照与并发 apply 的 bucket 保存顺序](figures/replica-snapshot.svg)
 
@@ -195,11 +201,11 @@ sequenceDiagram
 
 若 A 只能联系自己，仍可能短暂认为自己是 leader，但无法为新的写入凑齐多数并返回成功。失联期间已追加但未确认的请求结果可能未知。恢复后按共同的 term/offset 截断冲突尾部，已提交前缀受 Raft 选举与日志规则保护。元数据 quorum 不可用时，健康且已配置的数据组仍能在本组选举和提交；新 slot 归属的发布需要元数据 quorum 恢复。
 
-**成员调整。** 每个数据组独立运行 KRaft 动态 voter 协议。新节点先以 observer 追平，再按上游的 VotersRecord 生效、提交和截断规则一次增删一个 voter。多数门槛基于协议有效的 voter 配置，不能随在线节点数量下调。更换组副本复制整组日志；迁移单个 slot 使用[跨组所有权切换](raft-cluster-design.md#4-单个-slot-跨组迁移)。
+**成员调整。** 按动态 voter 模式格式化的数据组可以独立增删成员。新节点先以 observer 追平，再按上游的 VotersRecord 生效、提交和截断规则一次增删一个 voter。多数门槛基于协议有效的 voter 配置。更换组副本复制整组日志，迁移单个 slot 则在两个组之间切换归属。[跨组所有权切换](raft-cluster-design.md#4-单个-slot-跨组迁移)
 
 ## 5. 失主、选主与重新追赶
 
-现有计划内 takeover 需要旧主配合排空。下图的 A 已不可用，A-r1 和 A-r2 在组 10 内交换选票。候选者的日志必须至少与投票者一样新；投票者在同一 term 只投一个候选，先持久化选票再应答。controller 收到结果后发布路由，组内多数独立确立领导权。
+现有计划内 takeover 需要旧主配合排空。下图的 A 已不可用，A-r1 和 A-r2 在组 10 内交换选票。候选者的日志必须至少与投票者一样新。投票者在同一 term 只投一个候选，先持久化选票再应答。控制器用 `DescribeQuorum` 向数据组轮询选举结果，确认新 leader 和 epoch 后提交路由变更。[controller 探测数据组](../../src/server/cluster/raft/runtime/controller.cc)
 
 ![组三 voter 中剩余两票选出 A-r1，控制面随后更新路由](figures/leader-change.svg)
 
@@ -221,7 +227,8 @@ sequenceDiagram
     R-->>S: 本任期批次
     S->>R: 持久化后报告新 LEO
     R->>R: 建立本任期 HW，恢复 KV
-    R->>Q: 报告组 10 的 leader 与 term
+    Q->>R: DescribeQuorum，查询组 10
+    R-->>Q: 返回组 10 的 leader 与 term
     Note over Q: 发布已观察到的路由
     A->>R: 重连，按新 term 对齐并追赶
 ```
@@ -254,14 +261,15 @@ sequenceDiagram
 
 `yes` 通过 `Transaction::LogAutoJournalOnShard` 记录已执行的变更，各引擎线程独立分配 LSN，副本跟随指定的主节点。`raft` 的数据组 leader 将 SET 的效果追加到本组日志。各副本按组内 offset 应用已提交前缀，leader 在本地 KV 应用后回复客户端。[Journal 格式](../../src/server/journal/types.h) · [主从复制管理](../../src/server/replica_manager.cc) · [Raft 数据节点](../../src/server/cluster/raft/runtime/data_node.cc)
 
-| 接入点 | 建议实现 |
+| 接入点 | 当前数据路径 |
 | --- | --- |
-| 分区日志 | 按 topic ID、group ID 和 offset 定位日志记录，用 leader epoch 验证历史；从记录中的 slot 和 DB ID 定位 KV。实现批量 append、offset/epoch 查询、截断、恢复和保留。现有 per-shard LSN 不能跨线程比较。可复用 AOF 的异步 I/O 和原子落盘做法，需要补充分区索引、HW checkpoint 和 epoch 历史。逻辑数据日志数随复制组数增长；16,384 项 slot 路由表可按范围持久化。[AOF segment writer](../../src/server/journal/aof_segment_writer.h) · [现有复制设计](../replication.md) |
-| 写入、可见性和读 | 建议首版采用多数提交后回复、由 leader 提供读服务。对应执行线程在私有暂存状态上求出 Redis 回复和确定性变更，以 slot generation 和组 leader epoch 校验后向组日志追加一笔批次。达到该组 HW 后按组 offset 顺序发布给读者，再回原始结果。首版可限制每 slot 一笔在途逻辑写；网络等待时释放 CPU 和 shard 锁。后续流水化须让条件写看到前序待提交效果，同时隔离读者。新 leader 恢复本地 KV，并追上请求所需的提交前缀后开放服务。 |
-| 确定性重放 | 保存变更、DB ID、绝对过期时间及必要的类型信息。相对 TTL、淘汰、脚本中的时间或随机结果，需要记录已决定的效果。副本不得自行淘汰出不同结果。换主时丢弃旧 epoch 暂存视图；已追加的尾巴按 epoch 对齐结果保留或截断。快照中记录已 apply 的排他 offset，只把其后连续且已提交的完整批次应用一次。[现有回放入口](../../src/server/journal/journal_applier.h) |
-| 事务、后台变更与管理命令 | 同 slot 的 `MULTI/EXEC`、脚本及跨 DB 操作生成一个原子效果批次，保留 Redis 的逐命令返回和运行时错误语义；跨 slot 执行遵循现有 `CROSSSLOT`。审计直接改 DB 和自写 journal 的路径，覆盖 TTL、eviction、阻塞命令和脚本。默认布局下，节点本地 `FLUSHDB/FLUSHALL` 按原作用域清理本组对应 DB；同进程多组时仍按请求进入的逻辑节点确定作用域。`WAIT` 按该连接所属组及副本 apply 进度计算，单独验收超时和角色变化。[现有集群命令范围](../cluster-mode.md) |
-| 快照重建 | 以 topic ID、group ID、leader epoch、组已 apply 的排他 offset 和校验值标记组快照，覆盖该前缀对应的所有 slots、DB、类型与绝对 TTL，以及迁移的冻结标记、暂存数据和 generation。保留 cut 之后的连续日志；接收端构建临时镜像，校验完整后原子安装，从 cut 续拉。源 leader 改变须验证 cut 属于新历史。日志清理前须能从现存镜像和后续日志重建该分区。[现有快照实现](../../src/server/snapshot.cc) |
+| 分区日志 | 每个数据组在自己的分区目录保存批次。leader 和 follower 在持久化后推进各自的 LEO，用 epoch 和 offset 查找共同前缀，发现分歧时截断未提交的冲突尾部。[分区日志](../../src/server/cluster/raft/log/partition_log.h) |
+| 写入与条件求值 | leader 在追加前检查 slot 归属、generation 和本组角色。普通 SET 产生替换记录。NX/XX 等待此前追加的记录全部应用，再求值并记录替换或空操作。条件不满足时也等这次决定提交和应用后才返回 nil。[写入入口](../../src/server/cluster/raft/runtime/data_node.cc) |
+| 确定性重放 | 数据批次携带 group ID、DB ID、slot、generation、键和值。副本按提交顺序应用相同效果。迁槽也以本组记录保存冻结、分块、安装和完成进度，切主或重启后可继续执行。[效果回放](../../src/server/cluster/raft/data/set_effect.cc) · [迁槽记录](../../src/server/cluster/raft/data/slot_transfer_state.cc) |
+| 读取与 WAIT | GET 由已追上本组 HW 的当前 leader 提供。WAIT 按该连接记录的写入位置，统计本组副本在当前 epoch 报告的已应用位置。[副本应用进度](../../src/server/cluster/raft/data/apply_progress.cc) · [集成测试](../../tests/integration/raft_data_group_test.py) |
 
-**换主时的条件写。** 例如 A 领写时已把一条 INCR 复制给 A-r1，回复客户端前 A 宕机；A-r1 的日志可能包含这条记录，而本地 KV 镜像只应用到了上一个 HW。A-r1 经选举成为 leader 后，先冻结新写，记下继承日志的 LEO。完成 epoch 校验，在新任期确认保留前缀，等数据 HW 和本地 apply 均到达该 LEO，再对外执行依赖旧值的命令。若无法取得本组多数，导致 HW 停滞，保持恢复状态并对请求返回可重试错误。否则第二次 INCR 可能从错误的旧值计算，即使两条日志最终都复制成功。这个开放服务的屏障是 Dragonfly 为 KV 求值引入的适配。
+**换主后的条件写。** 假设 A 已将一次 `SET k v NX` 复制给 A-r1，客户端收到回复前 A 宕机。A-r1 当选时，继承的日志可能领先于本地 KV。新 leader 在前序记录按新任期的 HW 提交并应用后，才对下一次 NX/XX 求值。失去本组多数时，节点不能确认新的条件写。[条件写实现](../../src/server/cluster/raft/runtime/data_node.cc)
 
-**客户端故障语义。** append 前被拒可以确定未写入；append 后超时、换主或响应丢失，客户端看到的是结果未知。自动重试 `INCR` 可能执行两次。Raft 的写提交规则本身也不保证一个与新元数据隔离的旧 leader 提供线性一致 KV 读。若新模式要求这种读保证，需要额外定义读协议，并以隔离旧主的读写序列验收。
+**客户端故障语义。** 追加前被拒的请求尚未写入。追加成功后遇到超时、换主或丢失回复，客户端看到的结果未知。重试 NX 可能返回 nil，此时客户端无法仅凭该回复判断是哪次请求写入了值。GET 检查本地归属、角色及已应用的 HW，尚无逐请求的 quorum 读屏障。[命令分派](../../src/server/main_service.cc) · [数据组读写](../../src/server/cluster/raft/runtime/data_node.cc)
+
+后续若扩展 TTL、淘汰、事务和脚本，日志还需记录绝对过期时间、已决定的变更和原子批次边界，使副本重放得到相同结果。这些命令不在当前数据组的读写验收范围内。

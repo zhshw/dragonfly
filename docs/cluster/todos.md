@@ -21,21 +21,29 @@
 
 ## 换主与重启
 
-- [x] 请求已受理且迁移未完成时终止 active controller。新 active 可以查到相同操作 ID 和原文，并接续完成迁移。[管理请求恢复测试](../../tests/integration/raft_data_group_test.py)
+- [x] 请求已受理且迁移未完成时终止 active controller。新 active 可以查到相同操作 ID 和原文，并接续完成迁移。另以八个进程验证动态加入的 C4 当选，原数据节点发现 C4 后完成迁槽，重启的数据副本能向 C4 重新注册。[换主与 C4 发现测试](../../tests/integration/raft_data_group_test.py)
 - [x] 终止全部进程，保留七个节点的磁盘，删除引导文件后重新启动。检查槽 42 的归属、`finished` 状态和迁移后的新写入，确认槽 43 的数据仍由组 10 提供。[整群重启测试](../../tests/integration/raft_data_group_test.py)
 
-本轮用原生引导格式在 Linux Debug 上跑完了 controller 和数据组两个集成测试文件，共 12 项通过。
+Dragonfly 在 Linux Debug 上通过 controller 集成测试 6/6、数据组集成测试 7/7。数据组套件中的 Java 客户端真实连接元数据组和两个数据组的 leader，调用 `ApiVersions` v4 和 `DescribeQuorum` v2，检查 leader、HW 和 voter 数量。[控制组用例](../../tests/integration/raft_controller_test.py) · [数据组用例](../../tests/integration/raft_data_group_test.py) · [Java 探针](../../src/server/cluster/raft/protocol/testdata/LiveQuorum.java)
+
+同级 Kafka 仓库 `5b648ca9` 的上游对照测试通过 704 项。raft 模块的 593 项覆盖选举、Fetch、快照和 voter 变更，对应 Dragonfly 的组内协议。metadata 模块的 111 项覆盖 controller 激活、broker 心跳和元数据回放，对应 Dragonfly 的控制面。[上游 Raft 测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft) · [上游元数据测试](../../../kafka/metadata/src/test/java/org/apache/kafka) · [Dragonfly quorum 测试](../../src/server/cluster/raft/quorum) · [Dragonfly 元数据测试](../../src/server/cluster/raft/metadata)
 
 ## 复现命令
 
-在 Linux 的仓库根目录执行。测试需要 `redis-cli` 和 Python 的 `redis` 包，支持的包版本见[测试依赖](../../tests/dragonfly/requirements.txt)。多进程用例自行分配本地端口，并用与 `dragonfly` 同目录的 `raft_storage` 格式化临时节点目录。
+在 Linux 的仓库根目录执行。测试需要 `redis-cli` 和 Python 的 `redis` 包。多进程用例自行分配本地端口，并用与 `dragonfly` 同目录的 `raft_storage` 格式化临时节点目录。运行完整的 7 项数据组用例时，需设置 `KAFKA_TEST_CLASSPATH`，包含编译后的 `LiveQuorum.class` 所在目录、Kafka 客户端及其运行依赖。省略这个变量会跳过 Java 联调用例。[Python 依赖](../../tests/dragonfly/requirements.txt) · [Java 探针源码](../../src/server/cluster/raft/protocol/testdata/LiveQuorum.java)
 
 ```sh
 ./helio/blaze.sh -DWITH_GCP=OFF
 ninja -C build-dbg dragonfly raft_storage bootstrap_topology_test admin_command_test slot_migration_test
 ctest --test-dir build-dbg --output-on-failure -R '^(bootstrap_topology|admin_command|slot_migration)_test$'
+export DRAGONFLY_PATH=build-dbg/dragonfly
+python3 tests/integration/raft_controller_test.py -v
+python3 tests/integration/raft_data_group_test.py -v
+```
+
+单独复现 C4 当选后的迁槽和重新注册，可运行
+
+```sh
 DRAGONFLY_PATH=build-dbg/dragonfly python3 tests/integration/raft_data_group_test.py -v \
-  RaftDataGroupTest.test_two_voters_per_group \
-  RaftDataGroupTest.test_recover_confirmed_values_without_bootstrap_after_cluster_crash \
-  ControllerAdminTest.test_submit_query_and_recover_management_request
+  DynamicControllerDiscoveryTest.test_data_nodes_follow_controller_outside_bootstrap_list
 ```

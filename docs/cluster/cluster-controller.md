@@ -27,7 +27,7 @@ Kafka 对照同级仓库提交 `5b648ca9`。原生 Redis 先将本地超时标�
 
 ## 控制器与数据组的职责
 
-active controller 校验管理请求，在三名 voter 中取得两票后提交拓扑变更。数据组自行选主、确认业务写入，并向控制器提供迁移进度。增加 controller 只改变控制组的成员和多数门槛。[集群拓扑与组映射](raft-cluster-design.md#集群拓扑)
+active controller 校验管理请求，取得控制组多数后提交拓扑变更。原图中的三名 voter 需要两票。数据组自行选主、确认业务写入，并向控制器提供迁移进度。增加 controller 只改变控制组的成员和多数门槛。[集群拓扑与组映射](raft-cluster-design.md#集群拓扑)
 
 **部署建议。** C1、C2、C3 分布在三个故障域，先采用独立 controller 进程，便于单独滚动升级、扩缩容，也能隔离数据节点的内存压力和磁盘负载。代价是额外的进程、持久卷和内部监听端口。若将来支持同一进程兼任 controller 和数据节点，可减少小集群的部署成本，但一次停机会同时拿走两个组的票。部署前应按故障域计算每组剩余的票数。[Kafka 对独立和混合角色的取舍](../../../kafka/docs/operations/kraft.md)
 
@@ -76,20 +76,20 @@ manager 管理的集群把完整槽表下发给节点。Raft 集群在独立目�
 | --- | --- |
 | 版本 18 已提交，A 已应用，B 仍在 17，C1 此时宕机 | 新 active controller 从已提交记录恢复。B 向新 leader 继续 Fetch，回放到 18 后更新本地路由。路由版本取元数据稳定日志位置，每个 slot 的 generation 单独校验 |
 | 组 10 已冻结，controller 还没记下回执就宕机 | 组 10 的 leader 根据本组日志向新 active controller 重报同一操作的冻结位置，再继续导入。若归属已切换，则从清理阶段继续。恢复所需状态包括操作进度、两组标记及最终归属 |
-| 控制组只剩一票 | 无法提交新归属、注册或迁移。原 leader、路由仍有效且保有多数的数据组可继续服务。数据组若在此时换主，新路由的发布要等控制组恢复。组 10 丢掉 A-r1 时只有一票，即使三台 controller 健康也无法确认新的组 10 写入 |
+| 三票控制组只剩一票在线 | 无法提交新归属、注册或迁移。原 leader、路由仍有效且保有多数的数据组可继续服务。数据组若在此时换主，新路由的发布要等控制组恢复。组 10 丢掉 A-r1 时只有一票，即使三台 controller 健康也无法确认新的组 10 写入 |
 | 增加 C4 | 在动态 voter 模式下，以原 cluster ID、新 node ID 和独立格式化目录启动 C4，使其作为 observer 追平，再向控制组提交 AddRaftVoter 并确认成员记录已提交。3→4 后多数从 2 变成 3，仍容忍 1 台故障；若要容忍 2 台，逐台扩至 5 台。数据组及 slot 分配无需变更 |
-| 全部进程退出或持久卷损坏 | 保留节点目录时，从快照和已提交日志重建状态。多数 controller 卷永久丢失属于灾难恢复，需要独立备份和恢复流程；初始 topology JSON 只能描述引导时的布局 |
+| 全部进程退出或持久卷损坏 | 保留节点目录时，控制器从元数据快照及后续已提交记录恢复，数据组重放本组持久日志。多数 controller 卷永久丢失属于灾难恢复，需要独立备份和恢复流程。初始 topology JSON 只描述引导时的布局 |
 
 [Kafka 动态 controller 成员管理](../../../kafka/docs/operations/kraft.md) · [controller 恢复与成员变更用例](../../tests/integration/raft_controller_test.py)
 
-## 当前分支与待验证项
+## 进程验收与运行约束
 
 七节点用例运行三个 controller 和两个各有两票的数据组。目标组失去一票时，请求仍可受理，归属保持在源组。杀掉 active controller 后，新 controller 按同一操作 ID 继续处理。恢复目标组后，槽 42 的多 DB 二进制值迁入组 20，槽 43 继续由组 10 读写。移除引导文件并重启全部进程后，新的归属、操作结果和迁移完成后的新写入均能恢复。[七节点集成测试](../../tests/integration/raft_data_group_test.py)
+
+八进程用例先启动同一套七节点集群，再让 C4 追平并加入控制组。为使 C4 确定当选，测试逐一提交移除 C1–C3 的成员变更。四个数据节点继续使用原来的启动参数，从元数据 quorum 获得 C4 的地址，无需重启就能向 C4 上报迁槽进度。槽 42 到达 `finished` 后，重启一名数据副本，它向 C4 注册新进程身份。跨过原会话的超时后，四个节点仍能返回一致的槽表，目标组可以读回原值并接受新写。[C4 发现与心跳测试](../../tests/integration/raft_data_group_test.py) · [数据节点的 controller 连接](../../src/server/cluster/raft/runtime/data_node.cc)
 
 另一次故障注入把两个数据组都扩为三票，在源端分块尚未封存、目标端分块尚未装完时分别终止各自的 leader。新主接续迁移，目标读回的 4 MiB 随机数据与源数据逐字节一致。回迁演练把同一槽从 generation 2 迁回到 generation 3，原操作 ID 仍可查询，携带旧 generation 的新请求被拒绝。
 
 首次启用在线迁槽前，应将所有 controller 和数据节点升级到能回放迁移记录的版本。首次建群使用正整数数据组 ID。已有 Raft 集群从原盘恢复已提交的组编号和槽表。[新建拓扑校验](../../src/server/cluster/raft/metadata/bootstrap_topology.cc) · [目录格式化与恢复](../../src/server/cluster/raft/bootstrap/raft_directory_test.cc)
 
 迁槽会额外占用内存和日志空间。源 leader 在内存中生成整槽 RDB，源和目标副本分别暂存镜像，日志按 256 KiB 分块复制。大槽的冻结时长和额外内存需求取决于槽内数据量、磁盘和组内复制进度。[数据组迁槽驱动](../../src/server/cluster/raft/runtime/slot_migration_driver.cc)
-
-在线扩容还要验证地址发现。当前进程用例覆盖预配地址的 observer 晋升；数据节点向 controller 注册和发送心跳时，仍从启动地址表查找 leader。若原节点只配置了 C1–C3，C4 当选后应能根据动态成员记录找到 C4，并在原数据节点无需重启的情况下恢复心跳。这个场景是将新增 controller 视为完整支持前的验收项。[成员变更用例](../../tests/integration/raft_controller_test.py) · [broker 注册与心跳](../../src/server/cluster/raft/runtime/data_node.cc)

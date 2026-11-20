@@ -49,7 +49,7 @@
 | 0–8191 | 10 | (T, 10) | A (node-A) | A-r1 |
 | 8192–16383 | 20 | (T, 20) | B (node-B) | B-r1 |
 
-例如，业务键命中 slot 0 时，数据节点在本地已提交的 metadata image 里查 `slot_owner[0] → 10`、`partition[T,10].leader → A`、`broker[A] → RESP 地址`。写入携带 DB ID 和 slot，追加到 (T,10) 的下一个 offset。slot 43 的下一笔写可以紧接在同一条日志中。数据节点从组 0 拉取已提交元数据，业务客户端通过 `CLUSTER SLOTS/SHARDS` 发现对应数据组的地址。节点内负责执行 key 操作的线程 shard 由本地分片函数确定，与集群的 group ID 独立。
+例如，迁槽前命中 slot 42 的业务键由组 10 处理。数据节点在本地已提交的 metadata image 里查 `slot_owner[42] → 10`、`partition[T,10].leader → A`、`broker[A] → RESP 地址`。写入携带 DB ID 和 slot，追加到 (T,10) 的下一个 offset。slot 43 的下一笔写可以紧接在同一条日志中。数据节点从组 0 拉取已提交元数据，业务客户端通过 `CLUSTER SLOTS/SHARDS` 发现对应数据组的地址。节点内负责执行 key 操作的线程 shard 由本地分片函数确定，与集群的 group ID 独立。
 
 **组编号与恢复。** 首次建群为每个数据组分配正整数 ID，成员换主时组 ID 保持稳定。已初始化的 Raft 集群从自己的控制组日志和快照恢复组编号及其全部槽范围。[组日志目录](../../src/server/cluster/raft/runtime/group.cc) · [首次引导校验](../../src/server/cluster/raft/metadata/bootstrap_topology.cc)
 
