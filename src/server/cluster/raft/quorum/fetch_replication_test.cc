@@ -94,6 +94,20 @@ class FetchReplicationTest : public testing::Test {
     return MakeDataBatch(offset, epoch, 1, values).value();
   }
 
+  string VoterValue(span<const CampaignVoter> voters) {
+    VotersRecord record;
+    for (const auto& peer : voters) {
+      auto& node = record.voters.emplace_back();
+      node.voter_id = peer.key.id;
+      node.voter_directory_id = peer.key.directory_id;
+      node.k_raft_version_feature.max_supported_version = 1;
+      node.endpoints.push_back({"RAFT", peer.endpoint.host, peer.endpoint.port, {}});
+    }
+    string bytes;
+    EXPECT_EQ(Encode(record, 0, &bytes), CodecError::kOk);
+    return bytes;
+  }
+
   fs::path dir_;
   int64_t now_ = 1000;
 };
@@ -350,6 +364,65 @@ TEST_F(FetchReplicationTest, SingleVoterCommittedLocallyAndDiskFailureFencesCamp
   EXPECT_FALSE(a.fetch.HighWatermark());
   EXPECT_FALSE(a.fetch.SyncRole(now_).ok());
   EXPECT_EQ(a.log->End().end_offset, 2);
+}
+
+TEST_F(FetchReplicationTest, NewMajorityGovernsUncommittedRemovalAndLeaderResignsAtCommit) {
+  auto a = Make(kA), b = Make(kB), c = Make(kC);
+  Elect(&a, &b);
+  ASSERT_FALSE(c.campaign.Recover({5, kA.id, {}, {}}, c.log->End()));
+  auto exchange = [&](Node* follower) {
+    auto out = follower->fetch.PrepareFetch(kA.id, 18, 0, 12000).value();
+    ASSERT_TRUE(follower->fetch.ReceiveFetchResponse(1, out.sequence, Handle(&a, out)).ok());
+  };
+  exchange(&b);
+  exchange(&b);
+  ASSERT_EQ(a.fetch.HighWatermark(), 1);
+  string value = VoterValue(span(kVoters).subspan(1));
+  array<ControlRecordValue, 1> control{{{6, value}}};
+  ASSERT_TRUE(a.fetch.Append(MakeControlBatch(1, 5, 100, control).value(), 5).ok());
+  EXPECT_EQ(a.campaign.voters().size(), 2u);
+  EXPECT_EQ(a.fetch.membership().LastVoterOffset(), 1);
+  exchange(&b);
+  exchange(&b);
+  EXPECT_EQ(a.fetch.HighWatermark(), 1);
+  EXPECT_EQ(a.campaign.state().role, QuorumRole::kLeader);
+  exchange(&c);
+  exchange(&c);
+  EXPECT_EQ(a.fetch.HighWatermark(), 2);
+  EXPECT_EQ(a.campaign.state().role, QuorumRole::kResigned);
+  EXPECT_FALSE(a.fetch.Append(Batch(2, 5), 5).ok());
+}
+
+TEST_F(FetchReplicationTest, FirstDynamicLeaderPublishesBootstrapVotersInInitialBatch) {
+  vector<CampaignVoter> one{kVoters.front()};
+  auto a = Make(kA, 10, one);
+  auto envelope = test::SnapshotBytes(0);
+  auto prefix = RecordBatchSize(envelope).value();
+  auto data = RecordBatchSize(string_view(envelope).substr(prefix)).value();
+  auto footer = envelope.substr(prefix + data);
+  absl::big_endian::Store64(footer.data(), 3);
+  KRaftVersionRecord version;
+  version.k_raft_version = 1;
+  string version_bytes, members = VoterValue(one);
+  ASSERT_EQ(Encode(version, 0, &version_bytes), CodecError::kOk);
+  array<ControlRecordValue, 2> controls{{{5, version_bytes}, {6, members}}};
+  auto snapshot = envelope.substr(0, prefix) + MakeControlBatch(1, 0, 0, controls).value() + footer;
+  auto writer = a.log->BeginSnapshot({0, 0}, snapshot.size()).value();
+  ASSERT_TRUE(writer->Append(0, snapshot).ok());
+  ASSERT_TRUE(a.log->InstallSnapshot(writer.get(), 0).ok());
+  ASSERT_TRUE(a.fetch.RefreshMembership().ok());
+  EXPECT_EQ(a.fetch.membership().LastVoterOffset(), -1);
+  ASSERT_FALSE(a.campaign.Recover({}, a.log->End()));
+  ASSERT_TRUE(a.fetch.SyncRole(100).ok());
+  vector<RecordView> records;
+  auto bytes = a.log->Read(0, 3, 1).value();
+  ASSERT_TRUE(DecodeRecordBatch(bytes, &records).ok());
+  ASSERT_EQ(records.size(), 3u);
+  EXPECT_EQ(absl::big_endian::Load16(records[0].key->data() + 2), 2);
+  EXPECT_EQ(*records[1].value, version_bytes);
+  EXPECT_EQ(*records[2].value, members);
+  EXPECT_EQ(a.fetch.membership().LastVoterOffset(), 2);
+  EXPECT_EQ(a.fetch.HighWatermark(), 3);
 }
 
 }  // namespace

@@ -4,7 +4,11 @@
 
 #include "server/cluster/raft/quorum/fetch_replication.h"
 
+#include <absl/strings/match.h>
+
 #include <algorithm>
+
+#include "server/cluster/raft/log/record_batch.h"
 
 namespace dfly::cluster::raft {
 namespace {
@@ -38,6 +42,7 @@ FetchReplication::FetchReplication(ElectionCampaign& campaign, EpochControl& epo
       log_(log),
       topic_id_(topic_id),
       replica_progress_(campaign),
+      static_voters_(campaign.voters()),
       committed_(recovered_hw) {
   if (committed_ && (*committed_ < 0 || *committed_ > log_.End().end_offset)) {
     DurableFailure(absl::DataLossError("Recovered quorum high watermark outside durable log"))
@@ -45,6 +50,37 @@ FetchReplication::FetchReplication(ElectionCampaign& campaign, EpochControl& epo
   } else if (log_.StartOffset() > committed_.value_or(0)) {
     committed_ = log_.StartOffset();
   }
+}
+
+absl::Status FetchReplication::RefreshMembership(bool force) {
+  if (auto s = membership_.Update(log_); !s.ok())
+    return DurableFailure(s);
+  const bool dynamic_seed = membership_.KraftVersion() == 1 && !membership_.LastVoterOffset();
+  if (!force && active_voter_offset_ == membership_.LastVoterOffset() &&
+      active_kraft_version_ == membership_.KraftVersion())
+    return absl::OkStatus();
+  vector<CampaignVoter> next;
+  if (const auto* record = membership_.LatestVoters()) {
+    for (const auto& voter : record->voters) {
+      auto endpoint = find_if(voter.endpoints.begin(), voter.endpoints.end(), [&](const auto& ep) {
+        return absl::EqualsIgnoreCase(ep.name, ListenerName());
+      });
+      if (endpoint == voter.endpoints.end())
+        return DurableFailure(absl::DataLossError("Voter has no endpoint for the quorum listener"));
+      next.push_back(
+          {{voter.voter_id, voter.voter_directory_id}, {endpoint->host, endpoint->port}});
+    }
+  } else if (!dynamic_seed) {
+    next = static_voters_;
+  }
+  const auto prior = campaign_.voters();
+  if (auto ec = campaign_.InstallVoters(std::move(next)); ec)
+    return DurableFailure(absl::FailedPreconditionError(ec.message()));
+  active_voter_offset_ = membership_.LastVoterOffset();
+  active_kraft_version_ = membership_.KraftVersion();
+  replica_progress_.Reconfigure(prior);
+  epochs_.VotersChanged(prior);
+  return absl::OkStatus();
 }
 
 absl::Status FetchReplication::DurableFailure(absl::Status failure) {
@@ -58,6 +94,8 @@ absl::Status FetchReplication::SyncRole(int64_t timestamp_ms) {
   if (!io_error_.ok())
     return io_error_;
   if (auto status = StorageStatus(state); !status.ok())
+    return status;
+  if (auto status = RefreshMembership(); !status.ok())
     return status;
   if (state.role != request_role_ || state.election.epoch != request_epoch_) {
     request_peer_.reset();
@@ -79,27 +117,56 @@ absl::Status FetchReplication::SyncRole(int64_t timestamp_ms) {
     voters.push_back(voter.key.id);
   sort(voters.begin(), voters.end());
   const auto start = log_.End().end_offset;
-  auto status = log_.AppendLeaderChange(state.election.epoch, timestamp_ms,
-                                        campaign_.target().local_replica.id, voters,
-                                        campaign_.GrantingVoters());
+  vector<ControlRecordValue> controls;
+  string version_bytes, voter_bytes;
+  if (membership_.KraftVersion() >= 1) {
+    if (!membership_.LastVoterOffset())
+      return DurableFailure(absl::DataLossError("Dynamic quorum has no VotersRecord"));
+    if (membership_.LastVoterOffset() == -1) {
+      KRaftVersionRecord version;
+      version.k_raft_version = membership_.KraftVersion();
+      if (Encode(version, 0, &version_bytes) != CodecError::kOk ||
+          Encode(*membership_.LatestVoters(), 0, &voter_bytes) != CodecError::kOk)
+        return DurableFailure(absl::DataLossError("Cannot serialize initial quorum membership"));
+      controls = {{5, version_bytes}, {6, voter_bytes}};
+    }
+  }
+  auto batch = MakeLeaderChangeBatch(start, state.election.epoch, timestamp_ms,
+                                     campaign_.target().local_replica.id, voters,
+                                     campaign_.GrantingVoters(), controls);
+  if (!batch.ok() || (start != 0 && log_.End().epoch >= state.election.epoch))
+    return DurableFailure(absl::DataLossError("LeaderChange batch must start a new log term"));
+  auto status = log_.Append(*batch, state.election.epoch);
   if (!status.ok())
     return DurableFailure(status);
+  if (auto s = membership_.Appended(*batch, log_.End().end_offset); !s.ok())
+    return DurableFailure(s);
+  if (auto s = RefreshMembership(); !s.ok())
+    return s;
   leader_epoch_ = state.election.epoch;
   replica_progress_.Reset();
   leader_hw_.emplace(start);
-  voter_ends_.assign(voters.size(), nullopt);
   UpdateHighWatermark();
   return absl::OkStatus();
 }
 
 void FetchReplication::UpdateHighWatermark() {
   const auto& voters = campaign_.voters();
+  voter_ends_.assign(voters.size(), nullopt);
+  bool local_member = false;
   for (size_t i = 0; i < voters.size(); ++i) {
-    if (voters[i].key.Matches(campaign_.target().local_replica))
+    if (voters[i].key.Matches(campaign_.target().local_replica)) {
+      local_member = true;
       voter_ends_[i] = LogOffsetMetadata{log_.End().end_offset};
+    } else if (auto end = replica_progress_.VoterOffset(voters[i].key.id)) {
+      voter_ends_[i] = LogOffsetMetadata{*end};
+    }
   }
   if (leader_hw_->Update(voter_ends_))
     committed_ = max(committed_.value_or(0), leader_hw_->value()->offset);
+  if (!local_member && active_voter_offset_ && leader_hw_->value() &&
+      leader_hw_->value()->offset > *active_voter_offset_)
+    (void)campaign_.Resign(leader_epoch_);
 }
 
 optional<int64_t> FetchReplication::HighWatermark() const {
@@ -122,6 +189,10 @@ absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoc
         "Append requires an initialized leader of the specified epoch");
   if (auto s = log_.Append(batches, expected_epoch); !s.ok())
     return log_.io_failure().ok() ? s : DurableFailure(s);
+  if (auto s = membership_.Appended(batches, log_.End().end_offset); !s.ok())
+    return DurableFailure(s);
+  if (auto s = RefreshMembership(); !s.ok())
+    return s;
   UpdateHighWatermark();
   return absl::OkStatus();
 }
@@ -211,7 +282,8 @@ absl::Status FetchReplication::HandleFetch(const FetchRequest& request, int16_t 
       const auto& voters = campaign_.voters();
       for (size_t i = 0; i < voters.size(); ++i) {
         if (voters[i].key.Matches(source)) {
-          voter_ends_[i] = LogOffsetMetadata{batch_start};
+          if (observe_applied_)
+            observe_applied_(source, fetch, batch_start, now_ms);
           epochs_.RecordFetch(source, state.election.epoch, now_ms, batch_start);
           UpdateHighWatermark();
           break;
@@ -229,6 +301,8 @@ absl::Status FetchReplication::HandleFetch(const FetchRequest& request, int16_t 
 
 optional<OutboundFetch> FetchReplication::PrepareFetch(int32_t peer_id, int16_t version,
                                                        int32_t max_wait_ms, int32_t max_bytes) {
+  if (!RefreshMembership().ok())
+    return nullopt;
   const auto& state = campaign_.state();
   const auto& target = campaign_.target();
   if (state.storage_error || requested_snapshot_ || peer_id == target.local_replica.id ||
@@ -260,6 +334,9 @@ optional<OutboundFetch> FetchReplication::PrepareFetch(int32_t peer_id, int16_t 
     part.replica_directory_id = target.local_replica.directory_id;
   if (version >= 18)
     part.high_watermark = HighWatermark().value_or(-1);
+  if (advertise_applied_ && state.role == QuorumRole::kFollower &&
+      state.election.leader_id == peer_id)
+    advertise_applied_(&part);
   return fetch;
 }
 
@@ -319,6 +396,9 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
     }
     if (auto s = log_.TruncateTo(offset, floor); !s.ok())
       return log_.io_failure().ok() ? s : DurableFailure(s);
+    membership_.TruncateNewEntries(offset);
+    if (auto s = RefreshMembership(); !s.ok())
+      return s;
   } else if (snapshot.epoch >= 0 || snapshot.end_offset >= 0) {
     if (snapshot.epoch < 0 || snapshot.end_offset < floor || snapshot.epoch > epoch)
       return absl::InvalidArgumentError("Invalid snapshot hint in Fetch response");
@@ -331,6 +411,12 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
       auto status = log_.AppendAsFollower(*part.records.data, epoch);
       if (!status.ok() && !log_.io_failure().ok())
         return DurableFailure(status);
+      if (status.ok()) {
+        if (auto s = membership_.Appended(*part.records.data, log_.End().end_offset); !s.ok())
+          return DurableFailure(s);
+        if (auto s = RefreshMembership(); !s.ok())
+          return s;
+      }
     }
     if (part.high_watermark >= 0)
       committed_ = max(floor, min(part.high_watermark, log_.End().end_offset));
@@ -351,6 +437,11 @@ absl::Status FetchReplication::SnapshotInstalled(LogPosition snapshot_id) {
     return absl::FailedPreconditionError(
         "Snapshot does not match this follower's requested log cut");
   committed_ = max(committed_.value_or(0), snapshot_id.end_offset);
+  // A downloaded snapshot can replace all local entries, including membership at
+  // the same numerical offset with a different term. Rebuild from its actual records.
+  membership_ = {};
+  if (auto s = RefreshMembership(true); !s.ok())
+    return s;
   requested_snapshot_.reset();
   return absl::OkStatus();
 }

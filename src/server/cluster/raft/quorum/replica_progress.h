@@ -19,6 +19,9 @@ class QuorumReplicaProgress {
   }
 
   void Reset();
+  void Reconfigure(std::span<const CampaignVoter> previous);
+  std::optional<int64_t> VoterOffset(int32_t id) const;
+  bool IsObserverCaughtUp(ReplicaKey observer, int64_t wall_ms) const;
   void Record(ReplicaKey source, int64_t fetch_offset, int64_t leader_end, int64_t wall_ms);
   void Describe(int16_t version, int64_t leader_end, int64_t wall_ms,
                 protocol::DescribeQuorumResponse::TopicData::PartitionData* partition);

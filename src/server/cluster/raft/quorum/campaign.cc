@@ -45,6 +45,27 @@ optional<ElectionCampaign::Endpoint> ElectionCampaign::KnownEndpoint(int32_t nod
   return nullopt;
 }
 
+error_code ElectionCampaign::InstallVoters(vector<CampaignVoter> voters) {
+  if (state_.storage_error)
+    return state_.storage_error;
+  set<int32_t> ids;
+  vector<ReplicaKey> keys;
+  for (const auto& voter : voters) {
+    if (voter.key.id < 0 || voter.endpoint.host.empty() || !voter.endpoint.port ||
+        !ids.insert(voter.key.id).second)
+      return make_error_code(errc::invalid_argument);
+    keys.push_back(voter.key);
+  }
+  voters_ = std::move(voters);
+  voter_keys_ = std::move(keys);
+  state_.election.voters = std::move(ids);
+  if (state_.election.leader_id) {
+    if (auto addr = KnownEndpoint(*state_.election.leader_id); addr)
+      leader_endpoint_ = std::move(addr);
+  }
+  return {};
+}
+
 error_code ElectionCampaign::Save(ElectionState next, QuorumRole role) {
   if (auto ec = persist_(next); ec) {
     state_.storage_error = ec;

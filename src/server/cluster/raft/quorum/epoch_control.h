@@ -42,6 +42,7 @@ class EpochControl {
   void RecordFetch(ReplicaKey replica, int32_t epoch, int64_t now_ms,
                    std::optional<int64_t> end_offset);
   [[nodiscard]] std::error_code Resign(int64_t now_ms);
+  void VotersChanged(std::span<const CampaignVoter> previous);
   std::vector<int32_t> UnacknowledgedVoters() const;
 
   [[nodiscard]] std::error_code ReceiveBegin(const protocol::BeginQuorumEpochRequest& request,

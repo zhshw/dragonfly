@@ -9,6 +9,7 @@
 #include "server/cluster/raft/log/partition_log.h"
 #include "server/cluster/raft/protocol/fetch.h"
 #include "server/cluster/raft/quorum/epoch_control.h"
+#include "server/cluster/raft/quorum/membership_history.h"
 #include "server/cluster/raft/quorum/replica_progress.h"
 #include "server/cluster/raft/replication/high_watermark.h"
 
@@ -29,6 +30,12 @@ class FetchReplication {
   FetchReplication(ElectionCampaign& campaign, EpochControl& epochs, PartitionLog& log,
                    protocol::Uuid topic_id, std::optional<int64_t> recovered_hw = std::nullopt);
 
+  // Also invoked before Recover on startup with an existing log or a bootstrap snapshot.
+  [[nodiscard]] absl::Status RefreshMembership(bool force = false);
+  const MembershipHistory& membership() const {
+    return membership_;
+  }
+
   // On becoming leader append and flush its LeaderChangeMessage before serving Fetch.
   [[nodiscard]] absl::Status SyncRole(int64_t timestamp_ms);
   [[nodiscard]] absl::Status Append(std::string_view batches, int32_t expected_epoch);
@@ -41,6 +48,14 @@ class FetchReplication {
   }
   QuorumReplicaProgress& replica_progress() {
     return replica_progress_;
+  }
+
+  using FetchPartition = protocol::FetchRequest::FetchTopic::FetchPartition;
+  using AdvertiseApplied = std::function<void(FetchPartition*)>;
+  using ObserveApplied = std::function<void(ReplicaKey, const FetchPartition&, int64_t, int64_t)>;
+  void SetDataApplyHooks(AdvertiseApplied advertise, ObserveApplied observe) {
+    advertise_applied_ = std::move(advertise);
+    observe_applied_ = std::move(observe);
   }
 
   // can_wait means a valid empty Fetch can remain outstanding. Retain this response for
@@ -81,6 +96,12 @@ class FetchReplication {
   PartitionLog& log_;
   protocol::Uuid topic_id_;
   QuorumReplicaProgress replica_progress_;
+  AdvertiseApplied advertise_applied_;
+  ObserveApplied observe_applied_;
+  const std::vector<CampaignVoter> static_voters_;
+  MembershipHistory membership_;
+  std::optional<int64_t> active_voter_offset_;
+  int16_t active_kraft_version_ = 0;
   std::optional<int64_t> committed_;
   std::optional<LeaderHighWatermark> leader_hw_;
   std::vector<std::optional<LogOffsetMetadata>> voter_ends_;

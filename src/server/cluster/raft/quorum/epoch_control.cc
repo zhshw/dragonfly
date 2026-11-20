@@ -276,12 +276,30 @@ void EpochControl::RecordFetch(ReplicaKey replica, int32_t epoch, int64_t now_ms
   }
   fetched_voters_.insert(replica.id);
 
-  // A fixed quorum's leader contributes one. Only distinct voter Fetch or FetchSnapshot
-  // contacts may extend the deadline; a successful BeginQuorumEpoch response cannot.
-  if (1 + fetched_voters_.size() >= campaign_.voters().size() / 2 + 1) {
+  // A leader being removed may still serve while the new majority commits the change.
+  auto local = VoterKey(campaign_.target().local_replica.id);
+  const size_t local_vote = local && local->Matches(campaign_.target().local_replica) ? 1 : 0;
+  if (local_vote + fetched_voters_.size() >= campaign_.voters().size() / 2 + 1) {
     last_majority_ms_ = now_ms;
     fetched_voters_.clear();
   }
+}
+
+void EpochControl::VotersChanged(span<const CampaignVoter> previous) {
+  if (tracked_role_ != QuorumRole::kLeader && tracked_role_ != QuorumRole::kResigned)
+    return;
+  for (const auto& old : previous) {
+    auto key = VoterKey(old.key.id);
+    if (!key || !old.key.Matches(*key)) {
+      peers_.erase(old.key.id);
+      fetched_voters_.erase(old.key.id);
+    }
+  }
+  for (const auto& node : campaign_.voters()) {
+    if (node.key.id != campaign_.target().local_replica.id)
+      peers_.try_emplace(node.key.id);
+  }
+  last_begin_ms_.reset();
 }
 
 int32_t EpochControl::SuccessorBackoff(

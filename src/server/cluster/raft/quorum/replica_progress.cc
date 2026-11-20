@@ -14,6 +14,38 @@ void QuorumReplicaProgress::Reset() {
   observers_.clear();
 }
 
+void QuorumReplicaProgress::Reconfigure(span<const CampaignVoter> previous) {
+  auto old = std::move(voters_);
+  voters_.clear();
+  for (const auto& voter : campaign_.voters()) {
+    auto same = find_if(previous.begin(), previous.end(),
+                        [&](const auto& node) { return node.key.Matches(voter.key); });
+    const auto identity = pair{voter.key.id, voter.key.directory_id};
+    if (auto it = old.find(voter.key.id); same != previous.end() && it != old.end())
+      voters_.emplace(voter.key.id, it->second);
+    else if (auto observed = observers_.find(identity); observed != observers_.end())
+      voters_.emplace(voter.key.id, observed->second);
+    observers_.erase(identity);
+    old.erase(voter.key.id);
+  }
+  for (const auto& voter : previous) {
+    if (auto it = old.find(voter.key.id); it != old.end())
+      observers_.try_emplace({voter.key.id, voter.key.directory_id}, it->second);
+  }
+}
+
+optional<int64_t> QuorumReplicaProgress::VoterOffset(int32_t id) const {
+  auto it = voters_.find(id);
+  return it == voters_.end() ? nullopt : optional<int64_t>{it->second.offset};
+}
+
+bool QuorumReplicaProgress::IsObserverCaughtUp(ReplicaKey key, int64_t wall_ms) const {
+  auto it = observers_.find({key.id, key.directory_id});
+  constexpr int64_t kMaxFetchAgeMs = 3'600'000;
+  return it != observers_.end() && it->second.last_caught_up > 0 && it->second.last_fetch > 0 &&
+         it->second.last_fetch > wall_ms - kMaxFetchAgeMs;
+}
+
 void QuorumReplicaProgress::Record(ReplicaKey source, int64_t fetch_offset, int64_t leader_end,
                                    int64_t wall_ms) {
   if (source.id < 0 || source.id == campaign_.target().local_replica.id)

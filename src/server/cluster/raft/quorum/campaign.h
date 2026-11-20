@@ -15,6 +15,7 @@ namespace dfly::cluster::raft {
 struct CampaignVoter {
   ReplicaKey key;
   QuorumEndpoint endpoint;
+  bool operator==(const CampaignVoter&) const = default;
 };
 
 struct OutboundVote {
@@ -63,6 +64,9 @@ class ElectionCampaign {
   const std::vector<CampaignVoter>& voters() const {
     return voters_;
   }
+  // Install the set recovered from the uncommitted quorum log or a snapshot. The
+  // leader removed by this record remains leader until that record is committed.
+  [[nodiscard]] std::error_code InstallVoters(std::vector<CampaignVoter> voters);
 
   // Called only when Fetch succeeds from the current leader in the specified epoch.
   void MarkFetchedFromLeader(int32_t leader_id, int32_t epoch);
