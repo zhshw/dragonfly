@@ -1,10 +1,10 @@
 # Dragonfly 组复制设计
 
-设计提案，与集群设计使用相同的 Kafka 和 Dragonfly 基线。一个复制组对应内部数据 topic 的一个 partition。集群图中的组 10 只有 A 与 A-r1，选举和提交都需要 2/2。本篇演示容忍单节点故障的变体：先将第三个 voter A-r2 加入组 10，之后 A、A-r1、A-r2 以 2/3 形成多数。slot 42、43 仍共用这一组日志；组 20 和元数据组均不参与计票。状态机、握手、快照和换主四个主题取自现有复制文档；每处均可展开原图。客户端写入一节补充展示数据 HW 与 RESP 回复的关系。[集群拓扑与 slot 映射](raft-cluster-design.md) · [现有复制设计](../replication.md)
+`--cluster_mode=yes` 的主节点按引擎线程推送 journal，副本用 LSN 报告执行进度。`--cluster_mode=raft` 的每个数据复制组拥有独立的分区日志，voter 在组内选主，按多数持久化位置确认写入。下文沿用同一组 A、A-r1 节点对照两套复制协议。Raft 示例另将 A-r2 加入组 10，使多数从 2/2 变为 2/3。slot 42 和 43 共用组 10 的日志。[集群拓扑与 slot 映射](raft-cluster-design.md) · [主从复制原图](../replication.md)
 
 ## 1. 复制状态机
 
-原图从主节点上的复制会话出发。新图从单个 follower 所负责的组出发；切换复制源或清理历史日志时，需要重新定位该组的恢复起点。
+原图跟踪主节点上的复制会话。Raft 图跟踪组 10 的一个 follower。组内换主时，follower 根据新 leader 的 epoch 和本地日志末端查找共同前缀。
 
 ![副本加载分配、恢复共同前缀或安装快照后进入 Fetch](figures/replica-states.svg)
 
@@ -42,7 +42,7 @@ flowchart LR
 
 ## 2. 握手、全量恢复与增量拉取
 
-现有副本先协商每线程的 flow，再切到主节点推送 journal。新模式根据元数据发现组的入口，再以本组 Raft 状态确认 leader 和 term，按日志位置拉取。两端历史一致时直接进入 Fetch 循环。图中 KV 镜像属于 Dragonfly 扩展，KRaft 元数据快照有独立身份和传输路径。
+`yes` 的副本与主节点协商每线程的 flow，完成同步后接收主节点推送的 journal。`raft` 的副本从元数据发现数据组的入口，由本组协议确认 leader 和 term，按日志位置拉取。两端历史一致时直接进入 Fetch 循环。图中 KV 镜像属于 Dragonfly 扩展，KRaft 元数据快照有独立身份和传输路径。
 
 ![按组 Fetch、截断分歧与安装 KV 快照](figures/replica-fetch.svg)
 
@@ -252,7 +252,7 @@ sequenceDiagram
 
 ## 6. KV 执行、快照与客户端故障语义
 
-现有 `Transaction::LogAutoJournalOnShard` 在命令执行流程中记录 journal，每线程独立分配 LSN；副本角色属于整个节点。改为按组 Raft 复制必须同时解决按分区寻址和回退 KV 可见性的两个问题。只替换 `DFLYCLUSTER CONFIG` 的来源，普通写仍然是现有异步主从语义。[事务执行](../../src/server/transaction.cc) · [Journal 格式](../../src/server/journal/types.h) · [现有主从管理](../../src/server/replica_manager.cc)
+`yes` 通过 `Transaction::LogAutoJournalOnShard` 记录已执行的变更，各引擎线程独立分配 LSN，副本跟随指定的主节点。`raft` 的数据组 leader 将 SET 的效果追加到本组日志。各副本按组内 offset 应用已提交前缀，leader 在本地 KV 应用后回复客户端。[Journal 格式](../../src/server/journal/types.h) · [主从复制管理](../../src/server/replica_manager.cc) · [Raft 数据节点](../../src/server/cluster/raft/runtime/data_node.cc)
 
 | 接入点 | 建议实现 |
 | --- | --- |
