@@ -96,7 +96,9 @@ def emit_struct(name, fields, constants, header, impl, flexible, common, parents
         if field.get("flexibleVersions"):
             raise ValueError(f"Per-field flexible versions require an explicit codec: {field}")
         number = None
-        if default not in ("null", "false", ""):
+        if default == "true":
+            number = "true"
+        elif default not in ("null", "false", ""):
             number = int(str(default), 0)
         initializer = f" = {number}" if number is not None else "{}"
         if (
@@ -116,16 +118,18 @@ def emit_struct(name, fields, constants, header, impl, flexible, common, parents
             since = first_version(field["taggedVersions"])
             if field["taggedVersions"] != field["versions"] or since < flexible:
                 raise ValueError(f"Unsupported tagged field shape: {field}")
-            if field["type"].startswith("[]"):
+            if "nullableVersions" in field:
+                if field.get("default") != "null":
+                    raise ValueError(f"Unsupported non-null default for nullable tag: {field}")
+                present = f"{member}.has_value()"
+            elif field["type"].startswith("[]"):
                 present = f"!{member}.empty()"
             elif field["type"] == "bool":
                 present = member
             elif "fields" in field or field["type"] == "uuid":
                 present = f"{member} != decltype({member}){{}}"
-            elif "nullableVersions" in field:
-                present = f"{member}.has_value()"
-            elif field["type"] in ("int16", "int32", "int64"):
-                present = f"{member} != {int(default)}"
+            elif field["type"] in ("int8", "int16", "int32", "int64"):
+                present = f"{member} != {number or 0}"
             else:
                 raise ValueError(f"Unsupported tagged field type: {field}")
             ignorable = str(field.get("ignorable", False)).lower()
@@ -158,7 +162,25 @@ def emit_struct(name, fields, constants, header, impl, flexible, common, parents
     )
 
 
-def generate(schema_dir, api, stem):
+def header_constants(headers, flexible):
+    constants = []
+    legacy_range = "0" if flexible == 1 else f"0-{flexible - 1}"
+    if set(headers) == {"0+"}:
+        constants.append(f"static constexpr int16_t kHeaderVersion = {headers['0+']};")
+        constants.append("static constexpr int16_t HeaderVersion(int16_t) {return kHeaderVersion;}")
+    elif set(headers) == {legacy_range, f"{flexible}+"}:
+        legacy_header = headers[legacy_range]
+        flexible_header = headers[f"{flexible}+"]
+        constants.append(
+            f"static constexpr int16_t HeaderVersion(int16_t version) {{"
+            f"return version < kFirstFlexibleVersion ? {legacy_header} : {flexible_header}; }}"
+        )
+    else:
+        raise ValueError(f"Unsupported header version map {headers}")
+    return constants
+
+
+def generate(schema_dir, names, stem):
     header = [
         NOTICE,
         "#pragma once",
@@ -183,42 +205,32 @@ def generate(schema_dir, api, stem):
         "",
     ]
     functions = []
-    for name in (api + "Request", api + "Response"):
+    for name in names:
         schema = json.loads(
             re.sub(
                 r"^\s*//[^\n]*", "", (schema_dir / f"{name}.json").read_text(), flags=re.MULTILINE
             )
         )
         flexible = first_version(schema["flexibleVersions"])
-        headers = schema["headerVersions"]
-        low, high = map(int, schema["validVersions"].split("-"))
+        versions = schema["validVersions"].split("-")
+        low, high = int(versions[0]), int(versions[-1])
         constants = [
             f"static constexpr int16_t kApiKey = {schema['apiKey']};",
             f"static constexpr int16_t kMinVersion = {low};",
             f"static constexpr int16_t kMaxVersion = {high};",
             f"static constexpr int16_t kFirstFlexibleVersion = {flexible};",
         ]
-        legacy_range = "0" if flexible == 1 else f"0-{flexible - 1}"
-        if set(headers) == {"0+"}:
-            constants.append(f"static constexpr int16_t kHeaderVersion = {headers['0+']};")
-            constants.append(
-                "static constexpr int16_t HeaderVersion(int16_t) {return kHeaderVersion;}"
-            )
-        elif set(headers) == {legacy_range, f"{flexible}+"}:
-            legacy_header = headers[legacy_range]
-            flexible_header = headers[f"{flexible}+"]
-            constants.append(
-                f"static constexpr int16_t HeaderVersion(int16_t version) {{"
-                f"return version < kFirstFlexibleVersion ? {legacy_header} : {flexible_header}; }}"
-            )
-        else:
-            raise ValueError(f"Unsupported header version map {headers}")
+        if "headerVersions" in schema:
+            constants.extend(header_constants(schema["headerVersions"], flexible))
         constants.append("")
         common = {struct["name"]: struct for struct in schema.get("commonStructs", [])}
         emit_struct(name, schema["fields"], constants, header, impl, flexible, common)
-        header.append(
-            "// Encode or decode one complete body without the RPC header or frame length."
-        )
+        if schema["type"] == "metadata":
+            header.append("// Encode or decode one metadata record body without its serde header.")
+        else:
+            header.append(
+                "// Encode or decode one complete body without the RPC header or frame length."
+            )
         header.append("// On failure the destination keeps its previous value.")
         for function, signature, args in [
             (
@@ -245,11 +257,34 @@ def generate(schema_dir, api, stem):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kafka", type=Path)
-    schema_dir = parser.parse_args().kafka / "clients/src/main/resources/common/message"
-    generate(schema_dir, "Vote", "vote")
-    generate(schema_dir, "ApiVersions", "api_versions")
-    generate(schema_dir, "BeginQuorumEpoch", "begin_epoch")
-    generate(schema_dir, "EndQuorumEpoch", "end_epoch")
-    generate(schema_dir, "Fetch", "fetch")
-    generate(schema_dir, "DescribeQuorum", "describe_quorum")
-    generate(schema_dir, "FetchSnapshot", "fetch_snapshot")
+    kafka = parser.parse_args().kafka
+    for api, stem in [
+        ("Vote", "vote"),
+        ("ApiVersions", "api_versions"),
+        ("BeginQuorumEpoch", "begin_epoch"),
+        ("EndQuorumEpoch", "end_epoch"),
+        ("Fetch", "fetch"),
+        ("DescribeQuorum", "describe_quorum"),
+        ("FetchSnapshot", "fetch_snapshot"),
+    ]:
+        generate(
+            kafka / "clients/src/main/resources/common/message",
+            [api + "Request", api + "Response"],
+            stem,
+        )
+    generate(
+        kafka / "metadata/src/main/resources/common/metadata",
+        [
+            "RegisterBrokerRecord",
+            "UnregisterBrokerRecord",
+            "FenceBrokerRecord",
+            "UnfenceBrokerRecord",
+            "FeatureLevelRecord",
+            "BrokerRegistrationChangeRecord",
+            "NoOpRecord",
+            "BeginTransactionRecord",
+            "EndTransactionRecord",
+            "AbortTransactionRecord",
+        ],
+        "metadata_records",
+    )

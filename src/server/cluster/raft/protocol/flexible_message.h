@@ -177,6 +177,19 @@ class Reader {
     return true;
   }
 
+  bool Varint(uint32_t* result) {
+    *result = 0;
+    for (int shift = 0; shift <= 28; shift += 7) {
+      uint8_t byte;
+      if (!Field(byte) || (shift == 28 && byte > 15))
+        return false;
+      *result |= static_cast<uint32_t>(byte & 127) << shift;
+      if (byte < 128)
+        return true;
+    }
+    return false;
+  }
+
   const int16_t version;
 
  private:
@@ -198,19 +211,6 @@ class Reader {
         return false;
     }
     return true;
-  }
-
-  bool Varint(uint32_t* result) {
-    *result = 0;
-    for (int shift = 0; shift <= 28; shift += 7) {
-      uint8_t byte;
-      if (!Field(byte) || (shift == 28 && byte > 15))
-        return false;
-      *result |= static_cast<uint32_t>(byte & 127) << shift;
-      if (byte < 128)
-        return true;
-    }
-    return false;
   }
 
   bool String(uint32_t length, std::string* value) {
@@ -346,6 +346,14 @@ class Writer {
     return true;
   }
 
+  void Varint(uint32_t value) {
+    while (value >= 128) {
+      bytes_->push_back(static_cast<char>((value & 127) | 128));
+      value >>= 7;
+    }
+    bytes_->push_back(static_cast<char>(value));
+  }
+
   const int16_t version;
   CodecError error = CodecError::kInvalidData;
 
@@ -356,14 +364,6 @@ class Writer {
     else
       Field(size);
     return true;
-  }
-
-  void Varint(uint32_t value) {
-    while (value >= 128) {
-      bytes_->push_back(static_cast<char>((value & 127) | 128));
-      value >>= 7;
-    }
-    bytes_->push_back(static_cast<char>(value));
   }
 
   template <typename T> bool AddTag(Tagged<T> tag, TaggedFields* fields) {
