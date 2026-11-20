@@ -82,6 +82,7 @@ endif()
 
 # Optionally include tiered_storage which interfaces with tiering_module
 add_library(dragonfly_lib
+            cluster/raft/data/set_executor.cc
             engine_shard.cc engine_shard_set.cc
             config_registry.cc conn_context.cc
             debugcmd.cc dflycmd.cc error.cc family_utils.cc metrics.cc string_stats.cc ${DF_SEARCH_SRCS}
@@ -130,6 +131,7 @@ endif()
 
 add_library(dfly_test_lib test_utils.cc)
 cxx_link(dfly_test_lib dragonfly_lib facade_test gtest_main_ext)
+helio_cxx_test(cluster/raft/data/set_executor_test dfly_test_lib LABELS DFLY)
 
 helio_cxx_test(dragonfly_test dfly_test_lib LABELS DFLY)
 helio_cxx_test(dragonfly_connection_test dfly_test_lib LABELS DFLY)

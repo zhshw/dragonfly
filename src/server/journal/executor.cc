@@ -50,6 +50,11 @@ JournalExecutor::~JournalExecutor() {
 }
 
 facade::DispatchResult JournalExecutor::Execute(DbIndex dbid, journal::ParsedEntry::CmdData& cmd) {
+  return Execute(dbid, cmd, *reply_builder_);
+}
+
+facade::DispatchResult JournalExecutor::Execute(DbIndex dbid, journal::ParsedEntry::CmdData& cmd,
+                                                facade::SinkReplyBuilder& reply) {
   if (dbid >= absl::GetFlag(FLAGS_dbnum)) {
     LOG(ERROR) << "Database index out of range in journal: " << dbid;
     return facade::DispatchResult::ERROR;
@@ -57,7 +62,7 @@ facade::DispatchResult JournalExecutor::Execute(DbIndex dbid, journal::ParsedEnt
 
   SelectDb(dbid);
   CommandContext cntx_cmd;
-  cntx_cmd.Init(reply_builder_.get(), &conn_context_);
+  cntx_cmd.Init(&reply, &conn_context_);
 
   // TODO: we should improve interfaces in callers (replica and rdb_load) so that we pass
   // CommandContext directly and avoid this swap.

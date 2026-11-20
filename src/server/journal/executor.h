@@ -30,6 +30,10 @@ class JournalExecutor {
   // Returns the result of Service::DispatchCommand
   facade::DispatchResult Execute(DbIndex dbid, journal::ParsedEntry::CmdData& cmd);
 
+  // Capture a reply when replay requires the command's own success acknowledgement.
+  facade::DispatchResult Execute(DbIndex dbid, journal::ParsedEntry::CmdData& cmd,
+                                 facade::SinkReplyBuilder& reply);
+
   void FlushAll();  // Execute FLUSHALL.
   void FlushSlots(const cluster::SlotRange& slot_range);
 
