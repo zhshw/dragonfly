@@ -1,0 +1,117 @@
+{
+  "name": "SlotMigrationRequest",
+  "apiKey": 20000,
+  "type": "request",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "headerVersions": {
+    "0+": 2
+  },
+  "fields": [
+    {
+      "name": "ClusterId",
+      "type": "string",
+      "versions": "0+"
+    },
+    {
+      "name": "Action",
+      "type": "int8",
+      "versions": "0+"
+    },
+    {
+      "name": "MigrationId",
+      "type": "uuid",
+      "versions": "0+"
+    },
+    {
+      "name": "Slot",
+      "type": "uint16",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceGroup",
+      "type": "int32",
+      "versions": "0+"
+    },
+    {
+      "name": "TargetGroup",
+      "type": "int32",
+      "versions": "0+"
+    },
+    {
+      "name": "Generation",
+      "type": "int64",
+      "versions": "0+"
+    },
+    {
+      "name": "GroupId",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "ReporterId",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "BrokerEpoch",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "LeaderEpoch",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "RecordEpoch",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "RecordEndOffset",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "HighWatermark",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "AppliedEndOffset",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "ExpectedPhase",
+      "type": "int8",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceEpoch",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "SourceEndOffset",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "Digest",
+      "type": "[]int8",
+      "versions": "0+"
+    }
+  ]
+}

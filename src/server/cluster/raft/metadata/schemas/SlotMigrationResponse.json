@@ -1,0 +1,37 @@
+{
+  "name": "SlotMigrationResponse",
+  "apiKey": 20000,
+  "type": "response",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "headerVersions": {
+    "0+": 1
+  },
+  "fields": [
+    {
+      "name": "ErrorCode",
+      "type": "int16",
+      "versions": "0+"
+    },
+    {
+      "name": "ErrorMessage",
+      "type": "string",
+      "versions": "0+"
+    },
+    {
+      "name": "Phase",
+      "type": "int8",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceFinished",
+      "type": "bool",
+      "versions": "0+"
+    },
+    {
+      "name": "TargetFinished",
+      "type": "bool",
+      "versions": "0+"
+    }
+  ]
+}

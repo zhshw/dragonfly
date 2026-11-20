@@ -123,18 +123,22 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
       Advertise<EndQuorumEpochRequest>(&response);
     if (handlers.describe_quorum)
       Advertise<DescribeQuorumRequest>(&response);
+    if (handlers.fetch_snapshot)
+      Advertise<FetchSnapshotRequest>(&response);
     if (handlers.broker_registration)
       Advertise<BrokerRegistrationRequest>(&response);
     if (handlers.broker_heartbeat)
       Advertise<BrokerHeartbeatRequest>(&response);
-    if (handlers.fetch_snapshot)
-      Advertise<FetchSnapshotRequest>(&response);
     if (handlers.add_voter)
       Advertise<AddRaftVoterRequest>(&response);
     if (handlers.remove_voter)
       Advertise<RemoveRaftVoterRequest>(&response);
     if (handlers.update_voter)
       Advertise<UpdateRaftVoterRequest>(&response);
+    if (handlers.slot_migration)
+      Advertise<SlotMigrationRequest>(&response);
+    if (handlers.fetch_slot_image)
+      Advertise<FetchSlotImageRequest>(&response);
 
     // Kafka omits features with minimum version zero in ApiVersions responses before v4.
     if (version >= 4 && handlers.add_voter && handlers.remove_voter && handlers.update_voter)
@@ -254,6 +258,12 @@ FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
       break;
     case BrokerHeartbeatRequest::kApiKey:
       dispatched = Dispatch(version, correlation_id, &reader, handlers.broker_heartbeat, response);
+      break;
+    case SlotMigrationRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.slot_migration, response);
+      break;
+    case FetchSlotImageRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.fetch_slot_image, response);
       break;
     case FetchSnapshotRequest::kApiKey:
       dispatched = Dispatch(version, correlation_id, &reader, handlers.fetch_snapshot, response);
@@ -414,6 +424,26 @@ CodecError EncodeRequestFrame(const RequestMetadata& header, const BrokerHeartbe
 }
 FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
                                 int32_t correlation_id, BrokerHeartbeatResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& header, const SlotMigrationRequest& request,
+                              int16_t version, std::string* output) {
+  return WriteRequest(header, request, version, SlotMigrationRequest::HeaderVersion(version),
+                      output);
+}
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, SlotMigrationResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& header, const FetchSlotImageRequest& request,
+                              int16_t version, std::string* output) {
+  return WriteRequest(header, request, version, FetchSlotImageRequest::HeaderVersion(version),
+                      output);
+}
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, FetchSlotImageResponse* response) {
   return ReadResponse(input, max_payload_size, version, correlation_id, response);
 }
 

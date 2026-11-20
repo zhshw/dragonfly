@@ -89,4 +89,40 @@ struct SlotAssignmentRecord {
 CodecError Encode(const SlotAssignmentRecord& message, int16_t version, std::string* out);
 CodecError Decode(std::string_view bytes, int16_t version, SlotAssignmentRecord* out);
 
+struct SlotMigrationRecord {
+  static constexpr int16_t kApiKey = 16388;
+  static constexpr int16_t kMinVersion = 0;
+  static constexpr int16_t kMaxVersion = 0;
+  static constexpr int16_t kFirstFlexibleVersion = 0;
+
+  Uuid migration_id{};
+  uint16_t slot{};
+  int32_t source_group{};
+  int32_t target_group{};
+  int64_t generation{};
+  int8_t phase{};
+  int32_t source_epoch = -1;
+  int64_t source_end_offset = -1;
+  int32_t target_epoch = -1;
+  int64_t target_end_offset = -1;
+  std::vector<int8_t> digest{};
+  bool source_finished{};
+  bool target_finished{};
+  struct AdminRequestData {
+    std::string request_id{};
+    std::string value{};
+    TaggedFields unknown_tags;
+    bool operator==(const AdminRequestData&) const = default;
+  };
+
+  AdminRequestData admin_request{};
+  TaggedFields unknown_tags;
+  bool operator==(const SlotMigrationRecord&) const = default;
+};
+
+// Encode or decode one metadata record body without its serde header.
+// On failure the destination keeps its previous value.
+CodecError Encode(const SlotMigrationRecord& message, int16_t version, std::string* out);
+CodecError Decode(std::string_view bytes, int16_t version, SlotMigrationRecord* out);
+
 }  // namespace dfly::cluster::raft::protocol

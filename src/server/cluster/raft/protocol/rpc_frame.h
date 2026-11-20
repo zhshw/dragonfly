@@ -15,8 +15,10 @@
 #include "server/cluster/raft/protocol/describe_quorum.h"
 #include "server/cluster/raft/protocol/end_epoch.h"
 #include "server/cluster/raft/protocol/fetch.h"
+#include "server/cluster/raft/protocol/fetch_slot_image.h"
 #include "server/cluster/raft/protocol/fetch_snapshot.h"
 #include "server/cluster/raft/protocol/remove_voter.h"
+#include "server/cluster/raft/protocol/slot_migration.h"
 #include "server/cluster/raft/protocol/update_voter.h"
 #include "server/cluster/raft/protocol/vote.h"
 
@@ -57,6 +59,8 @@ struct RpcHandlers {
   RpcHandler<DescribeQuorumRequest, DescribeQuorumResponse> describe_quorum;
   RpcHandler<FetchSnapshotRequest, FetchSnapshotResponse> fetch_snapshot;
   RpcHandler<FetchRequest, FetchResponse> fetch;
+  RpcHandler<SlotMigrationRequest, SlotMigrationResponse> slot_migration;
+  RpcHandler<FetchSlotImageRequest, FetchSlotImageResponse> fetch_slot_image;
 };
 
 // Reads one size-prefixed request from the accumulated receive buffer. Only kComplete consumes
@@ -166,5 +170,19 @@ struct RequestMetadata {
 [[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
                                               int16_t version, int32_t correlation_id,
                                               BrokerHeartbeatResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const SlotMigrationRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              SlotMigrationResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const FetchSlotImageRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              FetchSlotImageResponse* response);
 
 }  // namespace dfly::cluster::raft::protocol

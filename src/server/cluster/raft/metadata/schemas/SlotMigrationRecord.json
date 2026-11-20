@@ -1,0 +1,97 @@
+{
+  "name": "SlotMigrationRecord",
+  "apiKey": 16388,
+  "type": "metadata",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "fields": [
+    {
+      "name": "MigrationId",
+      "type": "uuid",
+      "versions": "0+"
+    },
+    {
+      "name": "Slot",
+      "type": "uint16",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceGroup",
+      "type": "int32",
+      "versions": "0+"
+    },
+    {
+      "name": "TargetGroup",
+      "type": "int32",
+      "versions": "0+"
+    },
+    {
+      "name": "Generation",
+      "type": "int64",
+      "versions": "0+"
+    },
+    {
+      "name": "Phase",
+      "type": "int8",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceEpoch",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "SourceEndOffset",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "TargetEpoch",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "TargetEndOffset",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "Digest",
+      "type": "[]int8",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceFinished",
+      "type": "bool",
+      "versions": "0+"
+    },
+    {
+      "name": "TargetFinished",
+      "type": "bool",
+      "versions": "0+"
+    },
+    {
+      "name": "AdminRequest",
+      "type": "AdminRequestData",
+      "versions": "0+",
+      "taggedVersions": "0+",
+      "tag": 0,
+      "fields": [
+        {
+          "name": "RequestId",
+          "type": "string",
+          "versions": "0+"
+        },
+        {
+          "name": "Value",
+          "type": "string",
+          "versions": "0+"
+        }
+      ]
+    }
+  ]
+}

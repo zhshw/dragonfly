@@ -1,0 +1,40 @@
+{
+  "name": "FetchSlotImageResponse",
+  "type": "response",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "apiKey": 20001,
+  "headerVersions": {
+    "0+": 1
+  },
+  "fields": [
+    {
+      "name": "ErrorCode",
+      "type": "int16",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceEpoch",
+      "type": "int32",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "SourceEndOffset",
+      "type": "int64",
+      "versions": "0+",
+      "default": "-1"
+    },
+    {
+      "name": "TotalSize",
+      "type": "int64",
+      "versions": "0+"
+    },
+    {
+      "name": "Bytes",
+      "type": "records",
+      "versions": "0+",
+      "nullableVersions": "0+"
+    }
+  ]
+}

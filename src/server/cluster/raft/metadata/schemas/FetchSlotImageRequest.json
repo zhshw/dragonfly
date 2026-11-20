@@ -1,0 +1,52 @@
+{
+  "name": "FetchSlotImageRequest",
+  "type": "request",
+  "validVersions": "0",
+  "flexibleVersions": "0+",
+  "apiKey": 20001,
+  "headerVersions": {
+    "0+": 2
+  },
+  "fields": [
+    {
+      "name": "ClusterId",
+      "type": "string",
+      "versions": "0+"
+    },
+    {
+      "name": "MigrationId",
+      "type": "uuid",
+      "versions": "0+"
+    },
+    {
+      "name": "Slot",
+      "type": "uint16",
+      "versions": "0+"
+    },
+    {
+      "name": "SourceGroup",
+      "type": "int32",
+      "versions": "0+"
+    },
+    {
+      "name": "TargetGroup",
+      "type": "int32",
+      "versions": "0+"
+    },
+    {
+      "name": "Generation",
+      "type": "int64",
+      "versions": "0+"
+    },
+    {
+      "name": "Position",
+      "type": "int64",
+      "versions": "0+"
+    },
+    {
+      "name": "MaxBytes",
+      "type": "int32",
+      "versions": "0+"
+    }
+  ]
+}

@@ -24,11 +24,14 @@ add_library(dfly_raft
             protocol/describe_quorum.cc
             protocol/end_epoch.cc
             protocol/fetch.cc
+            protocol/fetch_slot_image.cc
             protocol/fetch_snapshot.cc
             protocol/metadata_records.cc
             protocol/remove_voter.cc
             protocol/rpc_frame.cc
+            protocol/slot_migration.cc
             protocol/slot_records.cc
+            protocol/slot_transfer_record.cc
             protocol/update_voter.cc
             protocol/vote.cc
             protocol/voter_records.cc

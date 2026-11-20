@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include "server/cluster/raft/protocol/slot_transfer_record.h"
+
 namespace dfly::cluster::raft::protocol {
 namespace {
 
@@ -539,6 +541,54 @@ TEST(RpcFrameTest, KafkaJavaBrokerRegistrationAndHeartbeatFrames) {
       EXPECT_EQ(res.error_code, 77);
       EXPECT_TRUE(res.is_fenced);
     }
+  }
+}
+
+TEST(RpcFrameTest, SlotImagePayloadPreservesEmptyNullAndBinaryChunks) {
+  FetchSlotImageRequest req;
+  req.cluster_id = "c";
+  req.migration_id.back() = 1;
+  req.slot = 42;
+  req.source_group = 10;
+  req.target_group = 20;
+  req.generation = 3;
+  req.position = 201;
+  req.max_bytes = 65536;
+  std::string image(req.max_bytes, '\0');
+  image[1] = static_cast<char>(0xff);
+  std::string frame, reply;
+  ASSERT_EQ(EncodeRequestFrame({kCorrelationId, "df", {}}, req, 0, &frame), CodecError::kOk);
+  RpcHandlers handlers;
+  ASSERT_EQ(DispatchRpcFrame(frame, kMaxFrame, handlers, &reply).status, FrameStatus::kUnknownApi);
+  handlers.fetch_slot_image = [&](int16_t, const auto& decoded, auto* out) {
+    EXPECT_EQ(decoded, req);
+    out->source_epoch = 4;
+    out->source_end_offset = 101;
+    out->total_size = req.position + image.size();
+    out->bytes.data = image;
+    return std::error_code{};
+  };
+  ASSERT_EQ(DispatchRpcFrame(frame, kMaxFrame, handlers, &reply).status, FrameStatus::kComplete);
+  FetchSlotImageResponse response;
+  ASSERT_EQ(DecodeResponseFrame(reply, 1 << 20, 0, kCorrelationId, &response).status,
+            FrameStatus::kComplete);
+  ASSERT_EQ(response.bytes.data, image);
+  SlotTransferRecord record;
+  record.kind = 4;
+  record.migration_id = req.migration_id;
+  record.slot = req.slot;
+  record.digest.assign(32, -1);
+  for (auto chunk :
+       {std::optional<std::string>{}, std::optional<std::string>{""}, response.bytes.data}) {
+    record.bytes.data = chunk;
+    ASSERT_EQ(Encode(record, 0, &frame), CodecError::kOk);
+    SlotTransferRecord restored;
+    ASSERT_EQ(Decode(frame, 0, &restored), CodecError::kOk);
+    EXPECT_EQ(restored, record);
+    frame.pop_back();
+    auto saved = restored;
+    EXPECT_NE(Decode(frame, 0, &restored), CodecError::kOk);
+    EXPECT_EQ(restored, saved);
   }
 }
 
