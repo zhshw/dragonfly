@@ -74,7 +74,6 @@ absl::Status SnapshotTransfer::HandleRequest(const FetchSnapshotRequest& request
   if (part.error_code)
     return absl::OkStatus();
 
-  // Upstream serializes positions as longs but slices raw snapshot files with a Java int.
   auto chunk = log_.ReadSnapshot(id, input.position, request.max_bytes);
   if (!chunk.ok()) {
     if (absl::IsNotFound(chunk.status()))
@@ -87,7 +86,9 @@ absl::Status SnapshotTransfer::HandleRequest(const FetchSnapshotRequest& request
     }
     return absl::OkStatus();
   }
-  if (input.position > INT32_MAX) {
+  // KRaft's metadata listener limits file slices to Java int positions. The data topic carries
+  // full KV images and reads their wire-format int64 positions directly with pread.
+  if (target.topic == kMetadataTopic && input.position > INT32_MAX) {
     part.error_code = -1;
     return absl::OkStatus();
   }
@@ -210,7 +211,13 @@ absl::Status SnapshotTransfer::ReceiveResponse(int32_t source_id, uint64_t seque
     if (auto status = writer_->Append(part.position, *part.unaligned_records.data); !status.ok())
       return status;
     if (writer_->position() == writer_->size()) {
-      auto status = log_.InstallSnapshot(writer_.get(), fetch_.HighWatermark().value_or(0));
+      auto validate = [&](const SnapshotWriter& completed) {
+        if (auto s = fetch_.ValidateSnapshot(completed); !s.ok())
+          return s;
+        return validate_ ? validate_(completed) : absl::OkStatus();
+      };
+      auto status =
+          log_.InstallSnapshot(writer_.get(), fetch_.HighWatermark().value_or(0), validate);
 
       // A failed pre-publication validation discards this partial file. The next request
       // restarts the same immutable snapshot at byte zero. An uncertain publication fences I/O.

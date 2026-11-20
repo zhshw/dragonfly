@@ -7,6 +7,8 @@
 #include <gtest/gtest.h>
 #include <stdlib.h>
 
+#include <fstream>
+
 #include "server/cluster/raft/log/testdata/snapshot_fixture.h"
 
 namespace dfly::cluster::raft {
@@ -22,7 +24,7 @@ const vector<CampaignVoter> kVoters{{kLeader, {"a", 9400}}, {kPeer, {"b", 9401}}
 struct Replica {
   Replica(const fs::path& dir, ReplicaKey key)
       : log(PartitionLog::Open(dir).value()),
-        campaign({"c", "data", 10, key}, kVoters,
+        campaign({"c", kDataTopic, 10, key}, kVoters,
                  [](const ElectionState&) { return error_code{}; }),
         epochs(campaign, "RAFT", 100, 100),
         fetch(campaign, epochs, *log, {99}),
@@ -159,6 +161,59 @@ TEST_F(SnapshotTransferTest, MalformedAndUnavailableRequestsHaveCorrectErrorScop
   EXPECT_EQ(Handle(out).error_code, 42);
 }
 
+TEST_F(SnapshotTransferTest, DataSnapshotSlicesUse64BitBytePositions) {
+  // A sparse extent exercises the same file offsets as a multi-GiB KV image.
+  const auto position = int64_t{INT32_MAX} + 127;
+  fstream file(dir_ / "a" / SnapshotName(kCut), ios::in | ios::out | ios::binary);
+  file.seekp(position);
+  file.write("tail", 4);
+  file.close();
+  ASSERT_TRUE(file.good());
+  auto request = b->snapshots.Prepare(1, 16).value();
+  auto& input = request.request.topics[0].partitions[0];
+  input.position = position;
+  auto response = Handle(request);
+  const auto& slice = response.topics[0].partitions[0];
+  ASSERT_EQ(slice.error_code, 0);
+  EXPECT_EQ(slice.position, position);
+  EXPECT_EQ(slice.size, position + 4);
+  EXPECT_EQ(slice.unaligned_records.data.value(), "tail");
+  input.position = position + 4;
+  EXPECT_EQ(Handle(request).topics[0].partitions[0].error_code, 99);
+}
+
+TEST_F(SnapshotTransferTest, InvalidApplicationImagePreservesDurablePrefixAndCanRetry) {
+  array<string, 1> values{"prior"};
+  string prior = MakeDataBatch(0, 1, 100, values).value();
+  ASSERT_TRUE(b->log->AppendAsFollower(prior, 1).ok());
+  bool accept = false;
+  SnapshotTransfer transfer(b->campaign, b->epochs, b->fetch, *b->log,
+                            [&](const SnapshotWriter& file) {
+                              EXPECT_EQ(file.id(), kCut);
+                              auto bytes = file.Read(0, file.size());
+                              EXPECT_TRUE(bytes.ok());
+                              if (!bytes.ok())
+                                return bytes.status();
+                              EXPECT_EQ(bytes->bytes, data_);
+                              return accept ? absl::OkStatus() : absl::DataLossError("wrong image");
+                            });
+  auto request = transfer.Prepare(1, data_.size()).value();
+  bool reset;
+  EXPECT_TRUE(
+      absl::IsDataLoss(transfer.ReceiveResponse(0, request.sequence, Handle(request), &reset)));
+  EXPECT_FALSE(reset);
+  EXPECT_FALSE(b->log->LatestSnapshot());
+  EXPECT_FALSE(HasPartial());
+  EXPECT_EQ(b->log->StartOffset(), 0);
+  EXPECT_EQ(b->log->Read(0, 1, prior.size()).value(), prior);
+  accept = true;
+  request = transfer.Prepare(1, data_.size()).value();
+  EXPECT_EQ(request.request.topics[0].partitions[0].position, 0);
+  ASSERT_TRUE(transfer.ReceiveResponse(0, request.sequence, Handle(request), &reset).ok());
+  EXPECT_EQ(b->log->StartOffset(), kCut.end_offset);
+  EXPECT_EQ(b->fetch.HighWatermark(), kCut.end_offset);
+}
+
 TEST_F(SnapshotTransferTest, SnapshotContactExtendsQuorumDeadlineWithoutAcknowledgingLog) {
   vector<EpochNotification> messages;
   ASSERT_FALSE(a->epochs.Poll(100, &messages));
@@ -199,6 +254,30 @@ TEST_F(SnapshotTransferTest, RejectsWrongChunkAndReleasesPartialOnNewLeader) {
   EXPECT_FALSE(b->fetch.RequestedSnapshot());
   EXPECT_FALSE(HasPartial());
   EXPECT_FALSE(b->log->LatestSnapshot());
+}
+
+TEST_F(SnapshotTransferTest, InvalidVoterConfigurationPreservesPreviousCut) {
+  KRaftVersionRecord version;
+  version.k_raft_version = 1;
+  string encoded;
+  ASSERT_EQ(Encode(version, 0, &encoded), CodecError::kOk);
+  const array<ControlRecordValue, 1> controls{{{5, encoded}}};
+  auto header = MakeSnapshotHeaderBatch(kCut.epoch, 123, 100, controls).value();
+  string invalid = header + MakeSnapshotFooterBatch(2, kCut.epoch, 123).value();
+
+  auto request = b->snapshots.Prepare(1, invalid.size()).value();
+  auto response = Handle(request);
+  auto& part = response.topics[0].partitions[0];
+  part.size = invalid.size();
+  part.unaligned_records.data = invalid;
+  bool reset = true;
+  auto status = b->snapshots.ReceiveResponse(0, request.sequence, response, &reset);
+  EXPECT_TRUE(absl::IsDataLoss(status)) << status;
+  EXPECT_FALSE(reset);
+  EXPECT_FALSE(b->log->LatestSnapshot());
+  EXPECT_FALSE(HasPartial());
+  EXPECT_EQ(b->log->End().end_offset, 0);
+  EXPECT_EQ(b->fetch.RequestedSnapshot(), kCut);
 }
 
 TEST_F(SnapshotTransferTest, MissingSnapshotReturnsToFetchAndCorruptFileRestartsFromZero) {

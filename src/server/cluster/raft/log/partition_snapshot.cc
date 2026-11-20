@@ -62,7 +62,8 @@ bool PartitionLog::IsLocalBoundary(LogPosition id) const {
   return it != batches_.end() && it->end == id;
 }
 
-absl::Status PartitionLog::InstallSnapshot(SnapshotWriter* writer, int64_t hw) {
+absl::Status PartitionLog::InstallSnapshot(SnapshotWriter* writer, int64_t hw,
+                                           const SnapshotValidator& validate) {
   if (!io_failure_.ok())
     return io_failure_;
   if (!writer || hw < 0 || hw > End().end_offset)
@@ -81,7 +82,7 @@ absl::Status PartitionLog::InstallSnapshot(SnapshotWriter* writer, int64_t hw) {
       (!resets_log && (id.end_offset > hw || !IsLocalBoundary(id))))
     return absl::InvalidArgumentError(
         "Kafka snapshot conflicts with retained log or committed prefix");
-  auto status = writer->Freeze();
+  auto status = writer->Freeze(validate);
   if (!status.ok()) {
     if (writer->published_)
       io_failure_ = status;

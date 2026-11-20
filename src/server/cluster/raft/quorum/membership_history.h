@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <absl/functional/function_ref.h>
+
 #include <map>
 
 #include "server/cluster/raft/log/partition_log.h"
@@ -18,6 +20,9 @@ class MembershipHistory {
  public:
   // Recover from the latest snapshot and log, or incrementally scan newly appended batches.
   [[nodiscard]] absl::Status Update(const PartitionLog& log);
+  using ReadChunk = absl::FunctionRef<absl::StatusOr<SnapshotChunk>(int64_t, size_t)>;
+  [[nodiscard]] absl::Status LoadSnapshot(LogPosition id, ReadChunk read);
+
   // Called only after PartitionLog has validated and fsynced these bytes. A Fetch can
   // include a partial trailing batch which lies beyond the newly durable end.
   [[nodiscard]] absl::Status Appended(std::string_view batches, int64_t durable_end);
@@ -44,7 +49,6 @@ class MembershipHistory {
 
  private:
   absl::Status ReplayBatch(std::string_view bytes, std::optional<int64_t> snapshot_offset);
-  absl::Status LoadSnapshot(const PartitionLog& log, LogPosition id);
 
   std::map<int64_t, protocol::VotersRecord> voters_;
   std::map<int64_t, int16_t> versions_;

@@ -14,6 +14,9 @@
 
 namespace dfly::cluster::raft {
 
+inline constexpr char kMetadataTopic[] = "__cluster_metadata";
+inline constexpr char kDataTopic[] = "__dragonfly_data";
+
 struct QuorumEndpoint {
   std::string host;
   uint16_t port;

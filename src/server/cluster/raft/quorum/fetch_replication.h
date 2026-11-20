@@ -84,10 +84,15 @@ class FetchReplication {
       requested_snapshot_.reset();
   }
 
+  // Decode the downloaded quorum configuration before replacing the previous durable log.
+  [[nodiscard]] absl::Status ValidateSnapshot(const SnapshotWriter& writer) const;
+
   // Resume polling after the owner has atomically installed the requested snapshot.
   [[nodiscard]] absl::Status SnapshotInstalled(LogPosition snapshot_id);
 
  private:
+  absl::StatusOr<std::vector<CampaignVoter>> ConfiguredVoters(
+      const MembershipHistory& history) const;
   void UpdateHighWatermark();
   absl::Status DurableFailure(absl::Status status);
 

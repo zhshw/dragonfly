@@ -7,6 +7,7 @@
 #include <absl/status/statusor.h>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -31,6 +32,9 @@ struct SnapshotChunk {
 absl::StatusOr<SnapshotChunk> ReadSnapshotChunk(const std::filesystem::path& dir, LogPosition id,
                                                 int64_t position, size_t max_bytes);
 
+class SnapshotWriter;
+using SnapshotValidator = std::function<absl::Status(const SnapshotWriter&)>;
+
 // Receives a Kafka raw snapshot, one FetchSnapshot chunk at a time. Destruction aborts
 // an unfinished transfer. Only a fully validated and durable file gets an immutable name.
 class SnapshotWriter {
@@ -51,11 +55,14 @@ class SnapshotWriter {
 
   absl::Status Append(int64_t position, std::string_view bytes);
 
+  // Inspect the completed download before its name or log cut becomes durable.
+  absl::StatusOr<SnapshotChunk> Read(int64_t position, size_t max_bytes) const;
+
  private:
   friend class PartitionLog;
   static absl::StatusOr<std::unique_ptr<SnapshotWriter>> Create(const std::filesystem::path& dir,
                                                                 LogPosition id, int64_t size);
-  absl::Status Freeze();
+  absl::Status Freeze(const SnapshotValidator& validate);
   SnapshotWriter(LogPosition id, int64_t size) : id_(id), size_(size) {
   }
   LogPosition id_;

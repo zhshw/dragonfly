@@ -12,6 +12,7 @@
 
 #include "server/cluster/raft/bootstrap/raft_directory.h"
 #include "server/cluster/raft/config/quorum_config.h"
+#include "server/cluster/raft/log/snapshot_file.h"
 #include "server/cluster/raft/protocol/rpc_frame.h"
 
 namespace util::fb2 {
@@ -36,12 +37,11 @@ class RaftGroup {
   using ApplyCommitted = std::function<absl::Status(const PartitionLog&, int64_t)>;
 
   // A metadata observer uses the controllers' voter set for discovery and never votes.
-  static absl::StatusOr<std::unique_ptr<RaftGroup>> Open(const std::filesystem::path& dir,
-                                                         const RaftDirectoryIdentity& identity,
-                                                         Kind kind, int32_t partition,
-                                                         const VoterConnections& voters,
-                                                         bool observer = false,
-                                                         ApplyCommitted apply = {});
+  // validate checks a fully downloaded snapshot before it can replace the durable log.
+  static absl::StatusOr<std::unique_ptr<RaftGroup>> Open(
+      const std::filesystem::path& dir, const RaftDirectoryIdentity& identity, Kind kind,
+      int32_t partition, const VoterConnections& voters, bool observer = false,
+      ApplyCommitted apply = {}, SnapshotValidator validate = {});
   ~RaftGroup();
   void Start(util::fb2::ProactorBase* owner);
   void RequestStop();
@@ -55,8 +55,6 @@ class RaftGroup {
   std::unique_ptr<Impl> impl_;
 };
 
-inline constexpr char kMetadataTopic[] = "__cluster_metadata";
-inline constexpr char kDataTopic[] = "__dragonfly_data";
 inline constexpr size_t kMaxRaftFrame = 16U << 20;
 
 }  // namespace dfly::cluster::raft

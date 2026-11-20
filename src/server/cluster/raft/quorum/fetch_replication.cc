@@ -52,29 +52,46 @@ FetchReplication::FetchReplication(ElectionCampaign& campaign, EpochControl& epo
   }
 }
 
-absl::Status FetchReplication::RefreshMembership(bool force) {
-  if (auto s = membership_.Update(log_); !s.ok())
-    return DurableFailure(s);
-  const bool dynamic_seed = membership_.KraftVersion() == 1 && !membership_.LastVoterOffset();
-  if (!force && active_voter_offset_ == membership_.LastVoterOffset() &&
-      active_kraft_version_ == membership_.KraftVersion())
-    return absl::OkStatus();
+absl::StatusOr<vector<CampaignVoter>> FetchReplication::ConfiguredVoters(
+    const MembershipHistory& history) const {
   vector<CampaignVoter> next;
-  if (const auto* record = membership_.LatestVoters()) {
+  if (const auto* record = history.LatestVoters()) {
     for (const auto& voter : record->voters) {
       auto endpoint = find_if(voter.endpoints.begin(), voter.endpoints.end(), [&](const auto& ep) {
         return absl::EqualsIgnoreCase(ep.name, ListenerName());
       });
       if (endpoint == voter.endpoints.end())
-        return DurableFailure(absl::DataLossError("Voter has no endpoint for the quorum listener"));
+        return absl::DataLossError("Voter has no endpoint for the quorum listener");
       next.push_back(
           {{voter.voter_id, voter.voter_directory_id}, {endpoint->host, endpoint->port}});
     }
-  } else if (!dynamic_seed) {
+  } else if (history.KraftVersion() == 0) {
     next = static_voters_;
   }
+  return next;
+}
+
+absl::Status FetchReplication::ValidateSnapshot(const SnapshotWriter& writer) const {
+  MembershipHistory history;
+  auto read = [&](int64_t position, size_t bytes) { return writer.Read(position, bytes); };
+  if (auto s = history.LoadSnapshot(writer.id(), read); !s.ok())
+    return s;
+  if ((history.KraftVersion() == 1) != history.LastVoterOffset().has_value())
+    return absl::DataLossError("Snapshot quorum feature level and voter set disagree");
+  return ConfiguredVoters(history).status();
+}
+
+absl::Status FetchReplication::RefreshMembership(bool force) {
+  if (auto s = membership_.Update(log_); !s.ok())
+    return DurableFailure(s);
+  if (!force && active_voter_offset_ == membership_.LastVoterOffset() &&
+      active_kraft_version_ == membership_.KraftVersion())
+    return absl::OkStatus();
+  auto next = ConfiguredVoters(membership_);
+  if (!next.ok())
+    return DurableFailure(next.status());
   const auto prior = campaign_.voters();
-  if (auto ec = campaign_.InstallVoters(std::move(next)); ec)
+  if (auto ec = campaign_.InstallVoters(*std::move(next)); ec)
     return DurableFailure(absl::FailedPreconditionError(ec.message()));
   active_voter_offset_ = membership_.LastVoterOffset();
   active_kraft_version_ = membership_.KraftVersion();

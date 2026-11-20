@@ -60,7 +60,8 @@ using PeerTask = variant<monostate, OutboundVote, EpochNotification, Pull>;
 class RaftGroup::Impl {
  public:
   Impl(VoteTarget target, vector<CampaignVoter> voters, const filesystem::path& dir,
-       unique_ptr<PartitionLog> log, Kind kind, bool observer, ApplyCommitted apply)
+       unique_ptr<PartitionLog> log, Kind kind, bool observer, ApplyCommitted apply,
+       SnapshotValidator validate)
       : log_(std::move(log)),
         store_(dir),
         bootstrap_(voters),
@@ -71,9 +72,8 @@ class RaftGroup::Impl {
                   }),
         epochs_(campaign_, kind == Kind::kMetadata ? "CONTROLLER" : "RAFT", kFetchTimeoutMs, 1000),
         replication_(campaign_, epochs_, *log_, TopicId(kind)),
-        snapshots_(campaign_, epochs_, replication_, *log_),
+        snapshots_(campaign_, epochs_, replication_, *log_, std::move(validate)),
         changes_(campaign_, epochs_, replication_, kRequestTimeoutMs),
-        kind_(kind),
         observer_(observer),
         apply_(std::move(apply)) {
   }
@@ -388,7 +388,7 @@ class RaftGroup::Impl {
 
   void FetchSnapshotFrom(PeerConnection& peer, int32_t leader, const atomic_bool& active) {
     int16_t version;
-    if (kind_ != Kind::kMetadata || peer.Negotiate<FetchSnapshotRequest>(0, &version))
+    if (peer.Negotiate<FetchSnapshotRequest>(0, &version))
       return;
     auto fetch = worker_.Await([&] { return snapshots_.Prepare(version, kMaxFetchBytes); });
     if (!fetch || fetch->peer_id != leader)
@@ -403,8 +403,13 @@ class RaftGroup::Impl {
       auto s = snapshots_.ReceiveResponse(leader, fetch->sequence, response, &reset);
       if (!s.ok())
         VLOG(1) << "Snapshot from node " << leader << ": " << s;
-      if (reset)
+      if (reset) {
         ResetDeadline(NowMs());
+
+        // Deliver a newly installed cut before the next Fetch can advertise application progress.
+        if (!replication_.RequestedSnapshot())
+          Tick();
+      }
     });
   }
 
@@ -420,7 +425,6 @@ class RaftGroup::Impl {
   FetchReplication replication_;
   SnapshotTransfer snapshots_;
   VoterChanges changes_;
-  const Kind kind_;
   const bool observer_;
   ApplyCommitted apply_;
   int64_t applied_ = -1;
@@ -467,13 +471,12 @@ RpcHandlers RaftGroup::Impl::Handlers() {
   handlers.update_voter = [this](int16_t, const auto& req, auto* res) {
     return ChangeVoters(req, res);
   };
-  if (kind_ == Kind::kMetadata)
-    handlers.fetch_snapshot = [this](int16_t v, const auto& req, auto* res) {
-      return OnWorker([&] {
-        auto s = snapshots_.HandleRequest(req, v, NowMs(), res);
-        return s.ok() ? error_code{} : make_error_code(errc::io_error);
-      });
-    };
+  handlers.fetch_snapshot = [this](int16_t v, const auto& req, auto* res) {
+    return OnWorker([&] {
+      auto s = snapshots_.HandleRequest(req, v, NowMs(), res);
+      return s.ok() ? error_code{} : make_error_code(errc::io_error);
+    });
+  };
   handlers.describe_quorum = [this](int16_t v, const auto& req, auto* res) {
     return OnWorker([&] { return DescribeQuorum(campaign_, replication_, v, req, WallMs(), res); });
   };
@@ -576,7 +579,8 @@ absl::StatusOr<unique_ptr<RaftGroup>> RaftGroup::Open(const filesystem::path& di
                                                       const RaftDirectoryIdentity& identity,
                                                       Kind kind, int32_t partition,
                                                       const VoterConnections& voters, bool observer,
-                                                      ApplyCommitted apply) {
+                                                      ApplyCommitted apply,
+                                                      SnapshotValidator validate) {
   if (partition < 0 || voters.empty() || (kind == Kind::kMetadata && partition != 0) ||
       (observer && (kind != Kind::kMetadata || voters.contains(identity.node_id))))
     return absl::InvalidArgumentError("Invalid quorum partition, local role or voter set");
@@ -594,7 +598,7 @@ absl::StatusOr<unique_ptr<RaftGroup>> RaftGroup::Open(const filesystem::path& di
   VoteTarget target{
       identity.cluster_id, topic, partition, {identity.node_id, identity.directory_id}};
   auto core = make_unique<Impl>(std::move(target), std::move(members), group_dir, *std::move(log),
-                                kind, observer, std::move(apply));
+                                kind, observer, std::move(apply), std::move(validate));
   if (auto s = core->Recover(); !s.ok())
     return s;
   return unique_ptr<RaftGroup>(new RaftGroup(std::move(core)));

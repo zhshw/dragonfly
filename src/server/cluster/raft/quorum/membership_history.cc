@@ -131,23 +131,30 @@ absl::Status MembershipHistory::ReplayBatch(string_view bytes, optional<int64_t>
   return absl::OkStatus();
 }
 
-absl::Status MembershipHistory::LoadSnapshot(const PartitionLog& log, LogPosition id) {
+absl::Status MembershipHistory::LoadSnapshot(LogPosition id, ReadChunk read) {
   MembershipHistory recovered;
   int64_t position = 0;
   while (true) {
-    auto prefix = log.ReadSnapshot(id, position, 12);
+    auto prefix = read(position, kBatchHeaderSize);
     if (!prefix.ok())
       return prefix.status();
     auto size = RecordBatchSize(prefix->bytes);
     if (!size.ok())
       return size.status();
-    auto bytes = log.ReadSnapshot(id, position, *size);
-    if (!bytes.ok())
-      return bytes.status();
-    if (auto s = recovered.ReplayBatch(bytes->bytes, id.end_offset - 1); !s.ok())
-      return s;
-    position += bytes->bytes.size();
-    if (position == bytes->total_size)
+    if (prefix->bytes.size() != kBatchHeaderSize || *size > uint64_t(prefix->total_size - position))
+      return absl::DataLossError("Incomplete quorum snapshot batch");
+
+    // Both readers verify the complete Kafka envelope before restoring membership.
+    // Only control batches can change the voter set. Skip over the KV payload in data batches.
+    if (absl::big_endian::Load16(prefix->bytes.data() + 21) & 0x20) {
+      auto bytes = read(position, *size);
+      if (!bytes.ok())
+        return bytes.status();
+      if (auto s = recovered.ReplayBatch(bytes->bytes, id.end_offset - 1); !s.ok())
+        return s;
+    }
+    position += *size;
+    if (position == prefix->total_size)
       break;
   }
   recovered.next_offset_ = id.end_offset;
@@ -178,7 +185,10 @@ absl::Status MembershipHistory::Appended(string_view bytes, int64_t durable_end)
 absl::Status MembershipHistory::Update(const PartitionLog& log) {
   if (next_offset_ < log.StartOffset()) {
     if (auto snapshot = log.LatestSnapshot()) {
-      if (auto s = LoadSnapshot(log, *snapshot); !s.ok())
+      auto read = [&](int64_t position, size_t bytes) {
+        return log.ReadSnapshot(*snapshot, position, bytes);
+      };
+      if (auto s = LoadSnapshot(*snapshot, read); !s.ok())
         return s;
     } else if (next_offset_ == -1 && log.StartOffset() == 0) {
       next_offset_ = 0;
@@ -186,6 +196,11 @@ absl::Status MembershipHistory::Update(const PartitionLog& log) {
       return absl::DataLossError("Cannot recover membership history without a snapshot");
     }
   }
+  // The cut is exclusive. An uncommitted voter change exactly at start may be truncated;
+  // keep the configuration effective in the snapshot so it can become active again.
+  if (log.StartOffset() > 0)
+    TruncateOldEntries(log.StartOffset() - 1);
+
   const auto end = log.End().end_offset;
   if (next_offset_ > end)
     return absl::FailedPreconditionError("Membership history requires suffix truncation");

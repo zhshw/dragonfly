@@ -67,7 +67,8 @@ class PartitionLog {
   // Install a received leader snapshot ahead of the local log, or freeze an image at a
   // locally committed batch boundary. Only DeleteBeforeSnapshot discards a matching prefix.
   absl::StatusOr<std::unique_ptr<SnapshotWriter>> BeginSnapshot(LogPosition id, int64_t size) const;
-  absl::Status InstallSnapshot(SnapshotWriter* writer, int64_t high_watermark);
+  absl::Status InstallSnapshot(SnapshotWriter* writer, int64_t high_watermark,
+                               const SnapshotValidator& validate = {});
   absl::StatusOr<SnapshotChunk> ReadSnapshot(LogPosition id, int64_t position,
                                              size_t max_bytes) const;
   // The caller has applied the snapshot and supplies the group's exclusive high watermark.

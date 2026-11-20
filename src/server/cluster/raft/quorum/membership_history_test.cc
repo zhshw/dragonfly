@@ -85,22 +85,33 @@ TEST_F(MembershipHistoryTest, MatchesKafkaControlRecordsAndAppliesUncommittedCha
 }
 
 TEST_F(MembershipHistoryTest, TruncatesUncommittedVoterChangesAndKeepsFloorAtCompaction) {
-  ASSERT_TRUE(log_->Append(Batch(0, 6, Members()), 2).ok());
+  ASSERT_TRUE(log_->Append(Batch(0, 5, Version(1)) + Batch(1, 6, Members()), 2).ok());
   members_.voters[0].endpoints[0].port = 9100;
-  ASSERT_TRUE(log_->Append(Batch(1, 6, Members()), 2).ok());
-  members_.voters[0].endpoints[0].port = 9200;
   ASSERT_TRUE(log_->Append(Batch(2, 6, Members()), 2).ok());
+  members_.voters[0].endpoints[0].port = 9200;
+  ASSERT_TRUE(log_->Append(Batch(3, 6, Members()), 2).ok());
   ASSERT_TRUE(history_.Update(*log_).ok());
-  history_.TruncateOldEntries(1);
-  EXPECT_FALSE(history_.VotersAt(0));
-  ASSERT_NE(history_.VotersAt(1), nullptr);
-  EXPECT_EQ(history_.VotersAt(1)->voters[0].endpoints[0].port, 9100);
-  ASSERT_TRUE(log_->TruncateTo(2, 2).ok());
-  history_.TruncateNewEntries(2);
-  EXPECT_EQ(history_.LastVoterOffset(), 1);
+
+  const LogPosition cut{2, 3};
+  auto header = history_.SnapshotHeader(cut, 100, 50).value();
+  auto footer = MakeSnapshotFooterBatch(DecodeRecordBatch(header)->end.end_offset, 2, 100).value();
+  auto snapshot = header + footer;
+  auto writer = log_->BeginSnapshot(cut, snapshot.size()).value();
+  ASSERT_TRUE(writer->Append(0, snapshot).ok());
+  ASSERT_TRUE(log_->InstallSnapshot(writer.get(), cut.end_offset).ok());
+  ASSERT_TRUE(log_->DeleteBeforeSnapshot(cut, cut.end_offset).ok());
+  ASSERT_TRUE(history_.Update(*log_).ok());
+  EXPECT_FALSE(history_.VotersAt(1));
+  ASSERT_NE(history_.VotersAt(2), nullptr);
+  EXPECT_EQ(history_.VotersAt(2)->voters[0].endpoints[0].port, 9100);
+  EXPECT_EQ(history_.LatestVoters()->voters[0].endpoints[0].port, 9200);
+
+  ASSERT_TRUE(log_->TruncateTo(3, 3).ok());
+  history_.TruncateNewEntries(3);
+  EXPECT_EQ(history_.LastVoterOffset(), 2);
   EXPECT_EQ(history_.LatestVoters()->voters[0].endpoints[0].port, 9100);
   members_.voters[0].endpoints[0].port = 9300;
-  ASSERT_TRUE(log_->Append(Batch(2, 6, Members()), 2).ok());
+  ASSERT_TRUE(log_->Append(Batch(3, 6, Members()), 2).ok());
   ASSERT_TRUE(history_.Update(*log_).ok());
   EXPECT_EQ(history_.LatestVoters()->voters[0].endpoints[0].port, 9300);
 }

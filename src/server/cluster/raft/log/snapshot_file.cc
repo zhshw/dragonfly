@@ -47,6 +47,15 @@ absl::StatusOr<int64_t> FileSize(int fd) {
   return st.st_size;
 }
 
+absl::StatusOr<SnapshotChunk> ReadChunk(int fd, int64_t size, int64_t position, size_t max_bytes) {
+  if (position < 0 || position >= size)
+    return absl::OutOfRangeError("FetchSnapshot position is outside snapshot");
+  SnapshotChunk chunk{size, string(min<size_t>(size - position, max_bytes), '\0')};
+  if (auto s = ReadAt(fd, position, chunk.bytes.data(), chunk.bytes.size()); !s.ok())
+    return s;
+  return chunk;
+}
+
 bool ValidEnvelopeValue(string_view value, bool header) {
   protocol::detail::Reader reader(0, value);
   protocol::TaggedFields tags;
@@ -155,12 +164,7 @@ absl::StatusOr<SnapshotChunk> ReadSnapshotChunk(const fs::path& dir, LogPosition
   auto size = FileSize(fd);
   if (!size.ok())
     return size.status();
-  if (position < 0 || position >= *size)
-    return absl::OutOfRangeError("FetchSnapshot position is outside snapshot");
-  SnapshotChunk chunk{*size, string(min<size_t>(*size - position, max_bytes), '\0')};
-  if (auto s = ReadAt(fd, position, chunk.bytes.data(), chunk.bytes.size()); !s.ok())
-    return s;
-  return chunk;
+  return ReadChunk(fd, *size, position, max_bytes);
 }
 
 absl::StatusOr<unique_ptr<SnapshotWriter>> SnapshotWriter::Create(const fs::path& dir,
@@ -202,11 +206,21 @@ absl::Status SnapshotWriter::Append(int64_t position, string_view bytes) {
   return absl::OkStatus();
 }
 
-absl::Status SnapshotWriter::Freeze() {
+absl::StatusOr<SnapshotChunk> SnapshotWriter::Read(int64_t position, size_t max_bytes) const {
+  if (position_ != size_)
+    return absl::FailedPreconditionError("Incomplete Kafka snapshot");
+  return ReadChunk(fd_, size_, position, max_bytes);
+}
+
+absl::Status SnapshotWriter::Freeze(const SnapshotValidator& validate) {
   if (position_ != size_)
     return absl::FailedPreconditionError("Incomplete Kafka snapshot");
   if (auto s = ValidateFile(fd_, id_); !s.ok())
     return s;
+  if (validate) {
+    if (auto s = validate(*this); !s.ok())
+      return s;
+  }
   if (fsync(fd_) == -1)
     return DiskError("Syncing complete Kafka snapshot");
 

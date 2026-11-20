@@ -21,8 +21,12 @@ struct OutboundSnapshotFetch {
 class SnapshotTransfer {
  public:
   SnapshotTransfer(ElectionCampaign& campaign, EpochControl& epochs, FetchReplication& fetch,
-                   PartitionLog& log)
-      : campaign_(campaign), epochs_(epochs), fetch_(fetch), log_(log) {
+                   PartitionLog& log, SnapshotValidator validate = {})
+      : campaign_(campaign),
+        epochs_(epochs),
+        fetch_(fetch),
+        log_(log),
+        validate_(std::move(validate)) {
   }
 
   // Call after FetchReplication::SyncRole to drop stale requests and partial snapshots.
@@ -40,6 +44,7 @@ class SnapshotTransfer {
   EpochControl& epochs_;
   FetchReplication& fetch_;
   PartitionLog& log_;
+  SnapshotValidator validate_;
   std::optional<LogPosition> target_;
   std::unique_ptr<SnapshotWriter> writer_;
   int32_t leader_ = -1;
