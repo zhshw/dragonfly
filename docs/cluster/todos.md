@@ -28,6 +28,15 @@ Dragonfly 在 Linux Debug 上通过 controller 集成测试 6/6、数据组集�
 
 同级 Kafka 仓库 `5b648ca9` 的上游对照测试通过 704 项。raft 模块的 593 项覆盖选举、Fetch、快照和 voter 变更，对应 Dragonfly 的组内协议。metadata 模块的 111 项覆盖 controller 激活、broker 心跳和元数据回放，对应 Dragonfly 的控制面。[上游 Raft 测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft) · [上游元数据测试](../../../kafka/metadata/src/test/java/org/apache/kafka) · [Dragonfly quorum 测试](../../src/server/cluster/raft/quorum) · [Dragonfly 元数据测试](../../src/server/cluster/raft/metadata)
 
+## 数据组复制与快照恢复
+
+KRaft 用排他 offset 和 leader epoch 标识快照。副本缺少可读日志前缀时，leader 在 Fetch 响应中给出快照 ID，副本按字节位置执行 FetchSnapshot，安装后从该 offset 继续 Fetch。Dragonfly 在这套传输中保存本组的 KV 和迁槽状态。[Kafka 快照测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/KafkaRaftClientSnapshotTest.java) · [数据组复制设计](raft-replication-design.md)
+
+- [ ] **状态机**　在已提交并应用的完整批次边界保存各 DB 的 KV、实际持有的槽及 generation、冻结与导入进度。恢复同一 cut 后，旧 generation 继续受限，已应用记录不重复执行。
+- [ ] **本地快照与日志清理**　按新提交的日志字节数或时间生成快照，持久化成功后推进可读日志起点。保留快照及其后的日志，重启时先恢复快照，再回放已提交的后缀。
+- [ ] **落后副本追赶**　落后位置仍在日志内时沿用普通 Fetch，早于保留起点时通过 FetchSnapshot 分块补齐。检查快照身份、大小和内容，安装后继续复制新写入。
+- [ ] **进程验收**　让一台 voter 离线至组内清掉旧前缀，验证它追平、能接任 leader 并读回快照和后缀中的值。迁槽冻结期间重启数据节点，再验证操作恢复、归属和邻槽数据。
+
 ## 复现命令
 
 在 Linux 的仓库根目录执行。测试需要 `redis-cli` 和 Python 的 `redis` 包。多进程用例自行分配本地端口，并用与 `dragonfly` 同目录的 `raft_storage` 格式化临时节点目录。运行完整的 7 项数据组用例时，需设置 `KAFKA_TEST_CLASSPATH`，包含编译后的 `LiveQuorum.class` 所在目录、Kafka 客户端及其运行依赖。省略这个变量会跳过 Java 联调用例。[Python 依赖](../../tests/dragonfly/requirements.txt) · [Java 探针源码](../../src/server/cluster/raft/protocol/testdata/LiveQuorum.java)
