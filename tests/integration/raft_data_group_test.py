@@ -29,6 +29,9 @@ class RaftDataGroupFixture(unittest.TestCase):
     learner = None
     new_controller = None
     controller_admin = False
+    data_threads = 1
+    snapshot_bytes = {}
+    snapshot_interval_ms = 0
 
     def setUp(self):
         self.bin = Path(os.environ.get("DRAGONFLY_PATH", "build-dbg/dragonfly")).resolve()
@@ -133,7 +136,7 @@ class RaftDataGroupFixture(unittest.TestCase):
             f"--raft_cluster_id={self.cluster_id}",
             f"--raft_quorum_voters={voters}",
             "--force_epoll",
-            "--proactor_threads=1",
+            f"--proactor_threads={self.data_threads if node in self.resp else 1}",
             "--logtostderr",
         ]
         if node in self.resp:
@@ -143,6 +146,11 @@ class RaftDataGroupFixture(unittest.TestCase):
                 f"--port={self.resp[node]}",
                 f"--bind={HOST}",
             ]
+            if node in self.snapshot_bytes:
+                flags += [
+                    f"--raft_data_snapshot_bytes={self.snapshot_bytes[node]}",
+                    f"--raft_data_snapshot_interval_ms={self.snapshot_interval_ms}",
+                ]
         else:
             flags += [
                 "--raft_role=controller",
@@ -210,6 +218,23 @@ class RaftDataGroupFixture(unittest.TestCase):
         if not replies or any(r != replies[0] for r in replies) or len(replies[0]) != 2:
             return None
         return sorted(replies[0])
+
+    def retained_checkpoint(self, node, group, min_offset):
+        directory = self.root / str(node) / f"__dragonfly_data-{group}"
+        marker = directory / "dragonfly-log-end"
+        if not marker.exists():
+            return None
+        data = marker.read_bytes()
+
+        # The DFE2 marker publishes the first readable offset and its epoch atomically.
+        if data[:4] != b"DFE2":
+            return None
+        offset = int.from_bytes(data[4:12], "big")
+        epoch = int.from_bytes(data[12:16], "big")
+        if offset < min_offset:
+            return None
+        checkpoint = directory / f"{offset:020d}-{epoch:010d}.checkpoint"
+        return checkpoint if checkpoint.exists() else None
 
     @staticmethod
     def key_for_range(start, end):
@@ -341,6 +366,8 @@ class RaftDataGroupTest(RaftDataGroupFixture):
 
 class ControllerAdminTest(RaftDataGroupFixture):
     controller_admin = True
+    snapshot_bytes = {node: 64 << 20 for members in GROUPS.values() for node in members}
+    snapshot_interval_ms = 250
 
     def test_submit_query_and_recover_management_request(self):
         slots = self.wait_for(self.slots)
@@ -415,18 +442,44 @@ class ControllerAdminTest(RaftDataGroupFixture):
         self.assertEqual(successor.get(request_key), value)
         self.assertEqual(successor.hgetall(op_key)[b"migration_id"], status[b"migration_id"])
         self.wait_for(lambda: successor.hgetall(op_key).get(b"phase") == b"frozen")
+
+        def assert_frozen(client, *args):
+            with self.assertRaises(redis.exceptions.ResponseError) as rejected:
+                client.execute_command(*args)
+            error = rejected.exception
+            self.assertTrue(
+                isinstance(error, redis.exceptions.TryAgainError)
+                or str(error).startswith("TRYAGAIN "),
+                str(error),
+            )
+
         with redis.Redis(host=HOST, port=source_port) as source:
-            for args in (("GET", keys[0]), ("SET", keys[0], b"frozen write")):
-                with self.assertRaises(redis.exceptions.ResponseError) as rejected:
-                    source.execute_command(*args)
-                error = rejected.exception
-                self.assertTrue(
-                    isinstance(error, redis.exceptions.TryAgainError)
-                    or str(error).startswith("TRYAGAIN "),
-                    str(error),
-                )
+            assert_frozen(source, "GET", keys[0])
+            assert_frozen(source, "SET", keys[0], b"frozen write")
             self.assertTrue(source.set(neighbor, b"written while frozen"))
             self.assertEqual(source.get(neighbor), b"written while frozen")
+        # Restart both source voters after their durable log starts beyond the frozen image.
+        source_leader = next(n for n in GROUPS[10] if self.resp[n] == source_port)
+        frozen_cut = describe(self.raft[source_leader], b"__dragonfly_data", 10).hw
+        for member in GROUPS[10]:
+            self.wait_for(lambda: self.retained_checkpoint(member, 10, frozen_cut))
+        for member in GROUPS[10]:
+            self.stop(member, crash=True)
+        for member in GROUPS[10]:
+            self.start(member)
+
+        def restored_leader():
+            for member in GROUPS[10]:
+                try:
+                    if self.client(member).get(neighbor) == b"written while frozen":
+                        return member
+                except redis.RedisError:
+                    continue
+
+        source_leader = self.wait_for(restored_leader)
+        assert_frozen(self.client(source_leader), "GET", keys[0])
+        self.assertEqual(successor.hgetall(op_key)[b"phase"], b"frozen")
+
         self.start(target_follower)
         self.wait_for(lambda: successor.hgetall(op_key).get(b"phase") == b"finished")
 
@@ -465,9 +518,14 @@ class ControllerAdminTest(RaftDataGroupFixture):
             return target_port
 
         new_key = b"{12561}:after-cutover"
-        with redis.Redis(host=HOST, port=check_completed()) as target:
+        target_port = check_completed()
+        with redis.Redis(host=HOST, port=target_port) as target:
             self.assertTrue(target.set(new_key, b"new owner write"))
             self.assertEqual(target.get(new_key), b"new owner write")
+        target_leader = next(n for n in GROUPS[20] if self.resp[n] == target_port)
+        target_cut = describe(self.raft[target_leader], b"__dragonfly_data", 20).hw
+        for member in GROUPS[20]:
+            self.wait_for(lambda: self.retained_checkpoint(member, 20, target_cut))
         for running in list(self.proc):
             self.stop(running, crash=True)
         self.config.unlink()
@@ -549,14 +607,10 @@ class DynamicControllerDiscoveryTest(RaftDataGroupFixture):
             self.assertTrue(target.set(key, b"after controller election"))
 
 
-class DynamicDataGroupTest(RaftDataGroupFixture):
+class DynamicDataGroupFixture(RaftDataGroupFixture):
     learner = 13
 
-    def test_promote_caught_up_learner_and_survive_primary_failure(self):
-        slots = self.wait_for(self.slots)
-        leader = next(n for n in GROUPS[10] if self.resp[n] == slots[0][2][1])
-        key = self.key_for_range(0, 8191)
-        self.assertTrue(self.client(leader).set(key, b"confirmed-with-two"))
+    def promote_learner(self, leader):
         view = lambda n: describe(self.raft[n], b"__dragonfly_data", 10)
         self.wait_for(
             lambda: (v := view(leader))
@@ -574,12 +628,23 @@ class DynamicDataGroupTest(RaftDataGroupFixture):
             endpoint=self.raft[self.learner],
         )
         self.assertEqual(error, 0)
-        before = self.wait_for(
+        return self.wait_for(
             lambda: (v := view(leader))
             and len(v.voters) == 3
             and min(v.voters.values()) >= v.hw
             and v
         )
+
+
+class DynamicDataGroupTest(DynamicDataGroupFixture):
+
+    def test_promote_caught_up_learner_and_survive_primary_failure(self):
+        slots = self.wait_for(self.slots)
+        leader = next(n for n in GROUPS[10] if self.resp[n] == slots[0][2][1])
+        key = self.key_for_range(0, 8191)
+        self.assertTrue(self.client(leader).set(key, b"confirmed-with-two"))
+        before = self.promote_learner(leader)
+        view = lambda n: describe(self.raft[n], b"__dragonfly_data", 10)
         self.stop(leader, crash=True)
 
         def next_leader():
@@ -601,6 +666,71 @@ class DynamicDataGroupTest(RaftDataGroupFixture):
         self.assertTrue(self.client(elected.leader).set(key, b"confirmed-after-failover"))
         routes = self.wait_for(self.slots)
         self.assertEqual([(r[0], r[1]) for r in routes], [(0, 8191), (8192, 16383)])
+
+
+class DataSnapshotRecoveryTest(DynamicDataGroupFixture):
+    data_threads = 2
+    snapshot_bytes = {11: 1280 * 1024, 12: 1280 * 1024, 13: 64 << 20}
+
+    def test_lagging_voter_installs_snapshot_and_replays_tail(self):
+        slots = self.wait_for(self.slots)
+        leader = next(n for n in GROUPS[10] if self.resp[n] == slots[0][2][1])
+        promoted = self.promote_learner(leader)
+        self.stop(self.learner, crash=True)
+
+        # Random values cross the size trigger and require multiple 1 MiB FetchSnapshot responses.
+        # These tags route to group 10, with one on each of the two engine shards.
+        tags = (b"{12561}", b"{104856}")
+        values = {tags[i % 2] + f":part{i}".encode(): os.urandom(256 * 1024) for i in range(6)}
+        with self.client(leader) as client:
+            self.assertEqual(client.info("server")["thread_count"], self.data_threads)
+            for key, value in values.items():
+                self.assertTrue(client.set(key, value))
+        checkpoint = self.wait_for(
+            lambda: self.retained_checkpoint(leader, 10, promoted.voters[self.learner] + 1)
+        )
+        expected_image = checkpoint.read_bytes()
+        self.assertGreater(len(expected_image), 1 << 20)
+
+        # This committed suffix is smaller than the next checkpoint trigger and is delivered by Fetch.
+        tail_key = b"{12561}:tail"
+        with redis.Redis(
+            host=HOST, port=self.resp[leader], single_connection_client=True
+        ) as client:
+            self.assertTrue(client.set(tail_key, b"from incremental fetch"))
+            self.start(self.learner)
+            self.wait_for(lambda: client.wait(2, 500) == 2)
+
+        installed = self.wait_for(
+            lambda: self.retained_checkpoint(self.learner, 10, promoted.voters[self.learner] + 1)
+        )
+        self.assertEqual(installed.name, checkpoint.name)
+        self.assertEqual(installed.read_bytes(), expected_image)
+
+        # Make the recovered voter the only eligible leader so client reads inspect its own engine.
+        for member in sorted(GROUPS[10], key=lambda n: n == leader):
+            self.assertEqual(
+                change_voter(self.raft[leader], 81, self.cluster_id, member, bytes([member]) * 16),
+                0,
+            )
+        self.wait_for(
+            lambda: (v := describe(self.raft[self.learner], b"__dragonfly_data", 10))
+            and v.leader == self.learner
+            and set(v.voters) == {self.learner}
+        )
+        with self.client(self.learner) as client:
+            self.assertEqual(self.wait_for(lambda: client.get(tail_key)), b"from incremental fetch")
+            for key, value in values.items():
+                self.assertEqual(client.get(key), value)
+            self.assertTrue(client.set(tail_key, b"after promotion"))
+
+        # The new leader's log still starts at the downloaded cut; recover its suffix on restart.
+        self.stop(self.learner, crash=True)
+        self.start(self.learner)
+        with self.client(self.learner) as client:
+            self.assertEqual(self.wait_for(lambda: client.get(tail_key)), b"after promotion")
+            for key, value in values.items():
+                self.assertEqual(client.get(key), value)
 
 
 if __name__ == "__main__":
