@@ -36,6 +36,8 @@ KRaft 用排他 offset 和 leader epoch 标识快照。副本缺少可读日志�
 - [x] **本地快照与日志清理**　按新提交的日志字节数或时间生成快照，持久化成功后推进可读日志起点。保留快照及其后的日志，重启时先恢复快照，再回放已提交的后缀。[快照运行时](../../src/server/cluster/raft/runtime/data_snapshot.cc) · [RDB 恢复测试](../../src/server/cluster/raft/data/kv_rdb_test.cc)
 - [x] **落后副本追赶**　落后位置仍在日志内时沿用普通 Fetch，早于保留起点时通过 FetchSnapshot 分块补齐。检查快照身份、大小和内容，安装后继续复制新写入。[FetchSnapshot 测试](../../src/server/cluster/raft/quorum/snapshot_transfer_test.cc)
 - [x] **进程验收**　让一台 voter 离线至组内清掉旧前缀，验证它追平、能接任 leader 并读回快照和后缀中的值。迁槽冻结期间重启数据节点，再验证操作恢复、归属和邻槽数据。[进程测试](../../tests/integration/raft_data_group_test.py)
+- [x] **复制对比**　在旧版异步和 Raft 两种集群写入相同的大值，停止一台副本后恢复并逐键校验。暂停一台和两台副本，分别检查 SET、WAIT、另一组的可用性，以及少数派日志的可见性。[配对测试](../../tests/integration/replication_comparison_test.py)
+- [x] **传输阻塞与恢复**　旧版全量同步时暂停副本读取，验证写入反压和缓冲排空。Raft 副本下载部分快照时将其暂停并强杀，验证多数仍可提交，恢复后完整快照和尾部写入均可读回。与上游 KRaft 的多数提交、Fetch 批次边界、快照分块用例逐项对照。[实测结果与复现命令](raft-replication-design.md#7-数据组复制对比实测)
 
 双引擎分片的进程用例逐字节比较了 leader 与落后 voter 的快照，文件超过 1 MiB，需要多次 FetchSnapshot。尾部新写达到 `WAIT 2` 后，让恢复的 voter 当选并再次重启，验证两个引擎分片上的值和增量写入。七节点用例还验证了冻结时两个源 voter 从快照恢复、随后迁槽完成及整群重启。Kafka 对照执行了 `MockLogTest` 和 `KafkaRaftClientSnapshotTest` 中的快照提示、分块响应与监听器通知用例。[上游日志测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/MockLogTest.java) · [上游快照测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/KafkaRaftClientSnapshotTest.java)
 
