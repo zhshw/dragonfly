@@ -6,6 +6,7 @@ add_library(dfly_raft
             protocol/rpc_frame.cc
             protocol/vote.cc
             quorum/election.cc
+            quorum/vote_handler.cc
             replication/high_watermark.cc
             storage/file_quorum_state_store.cc)
 target_compile_features(dfly_raft PUBLIC cxx_std_20)
@@ -19,5 +20,6 @@ helio_cxx_test(config/quorum_config_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/rpc_frame_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/vote_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/election_test dfly_raft LABELS DFLY)
+helio_cxx_test(quorum/vote_handler_test dfly_raft LABELS DFLY)
 helio_cxx_test(replication/high_watermark_test dfly_raft LABELS DFLY)
 helio_cxx_test(storage/file_quorum_state_store_test dfly_raft LABELS DFLY)
