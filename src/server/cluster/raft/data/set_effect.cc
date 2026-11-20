@@ -150,20 +150,40 @@ absl::Status CommittedEffects::ApplyRecord(string_view payload, LogPosition end,
   auto effect = DecodeSetEffect(payload);
   if (!effect.ok())
     return effect.status();
-  if (effect->group_id != group_id_)
+  return ApplyEffect(*effect, apply);
+}
+
+absl::Status CommittedEffects::ApplyEffect(const SetEffect& effect, ApplySet apply) {
+  if (effect.group_id != group_id_)
     return absl::FailedPreconditionError("SET effect belongs to another replication group");
-  if (transfers_.BlocksAccess(effect->slot, effect->generation))
+  if (transfers_.BlocksAccess(effect.slot, effect.generation))
     return absl::FailedPreconditionError("SET effect addresses a fenced slot generation");
-  if (effect->action == SetEffect::Action::kReplace) {
-    if (auto s = apply(*effect); !s.ok())
+  if (effect.action == SetEffect::Action::kReplace) {
+    if (auto s = apply(effect); !s.ok())
       return s;
-    slot_generations_[effect->slot] = effect->generation;
+    slot_generations_[effect.slot] = effect.generation;
   }
   return absl::OkStatus();
 }
 
+void CommittedEffects::RememberAppended(LogPosition end, size_t encoded_bytes, SetEffect effect) {
+  if (!pending_.empty() && (pending_.back().end.epoch != end.epoch ||
+                            pending_.back().end.end_offset >= end.end_offset)) {
+    pending_.clear();
+    pending_bytes_ = 0;
+  }
+
+  // When a quorum lags, subsequent proposals can still commit via the WAL.
+  if (pending_.size() >= 4096 || encoded_bytes > kMaxBatchSize - pending_bytes_)
+    return;
+  pending_.push_back({end, encoded_bytes, std::move(effect)});
+  pending_bytes_ += encoded_bytes;
+}
+
 absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, ApplySet apply,
                                        ApplySlotImage apply_image) {
+  if (!log.io_failure().ok())
+    return log.io_failure();
   if (applied_offset() < log.StartOffset() || applied_offset() > log.End().end_offset)
     return absl::FailedPreconditionError(
         "KV image applied offset is outside the retained group log");
@@ -173,7 +193,25 @@ absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, Appl
     return absl::FailedPreconditionError("Group apply is already in progress");
   applying_ = true;
   absl::Cleanup reset = [this] { applying_ = false; };
+
+  // A new epoch can replace the old leader's uncommitted suffix. Replay that prefix
+  // from the authoritative WAL even if some of its old entries survived the election.
+  if (!pending_.empty() && pending_.front().end.epoch != log.End().epoch) {
+    pending_.clear();
+    pending_bytes_ = 0;
+  }
   while (applied_offset() < hw) {
+    if (!pending_.empty() && pending_.front().end.end_offset == applied_offset() + 1) {
+      const auto& next = pending_.front();
+      if (auto s = ApplyEffect(next.effect, apply); !s.ok())
+        return s;
+      applied_ = next.end;
+      applied_bytes_ += next.encoded_bytes;
+      pending_bytes_ -= next.encoded_bytes;
+      pending_.pop_front();
+      continue;
+    }
+
     // A one-byte budget returns just the first complete batch, even across a segment boundary.
     int64_t base;
     auto bytes = log.Read(applied_offset(), hw, 1, &base);

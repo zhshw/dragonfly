@@ -49,6 +49,7 @@ class LargeSnapshotStallTest(DynamicDataGroupFixture):
         rows = self.wait_for(self.slots)
         leader = next(n for n in GROUPS[10] if self.resp[n] == rows[0][2][1])
         self.promote_learner(leader)
+        leader, _ = self.wait_benchmark_topology()
         lagging = self.learner
         self.stop(lagging, crash=True)
         expected = {}

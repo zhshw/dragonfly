@@ -7,6 +7,15 @@
 #include "server/cluster/raft/protocol/flexible_message.h"
 
 namespace dfly::cluster::raft::protocol {
+
+std::optional<size_t> RpcFrameSize(std::string_view prefix, size_t max_payload_size) {
+  int32_t size;
+  if (!detail::Reader(0, prefix).Field(size) || size <= 0 ||
+      static_cast<size_t>(size) > max_payload_size)
+    return std::nullopt;
+  return sizeof(size) + static_cast<size_t>(size);
+}
+
 namespace {
 
 using detail::Reader;
@@ -16,16 +25,15 @@ constexpr int16_t kUnsupportedVersion = 35;
 constexpr int16_t kInvalidRequest = 42;
 
 FrameResult ReadFrame(std::string_view input, size_t max_payload_size, std::string_view* payload) {
-  Reader reader(0, input);
-  int32_t size;
-  if (!reader.Field(size))
+  if (input.size() < sizeof(int32_t))
     return {FrameStatus::kNeedMore};
-  if (size <= 0 || static_cast<size_t>(size) > max_payload_size)
+  auto size = RpcFrameSize(input, max_payload_size);
+  if (!size)
     return {FrameStatus::kInvalidFrame};
-  if (reader.remaining().size() < static_cast<size_t>(size))
+  if (input.size() < *size)
     return {FrameStatus::kNeedMore};
-  *payload = reader.remaining().substr(0, size);
-  return {FrameStatus::kComplete, sizeof(size) + static_cast<size_t>(size)};
+  *payload = input.substr(sizeof(int32_t), *size - sizeof(int32_t));
+  return {FrameStatus::kComplete, *size};
 }
 
 CodecError WriteFrame(std::string_view header, std::string_view body, std::string* output) {

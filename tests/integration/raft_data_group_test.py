@@ -223,12 +223,24 @@ class RaftDataGroupFixture(unittest.TestCase):
     def retained_checkpoint(self, node, group, min_offset):
         directory = self.root / str(node) / f"__dragonfly_data-{group}"
         marker = directory / "dragonfly-log-end"
-        if not marker.exists():
-            return None
-        data = marker.read_bytes()
+        try:
+            with marker.open("rb") as source:
+                size = os.fstat(source.fileno()).st_size
 
-        # The DFE2 marker publishes the first readable offset and its epoch atomically.
-        if data[:4] != b"DFE2":
+                # DFE3 prepares one of two blocks and atomically selects it via inode size.
+                slot_stride = 64 * 1024
+                first_slot_size = 2 * slot_stride
+                if size in (first_slot_size, first_slot_size + 15):
+                    source.seek(0 if size == first_slot_size else slot_stride)
+                    magic = b"DFE3"
+                else:
+                    magic = b"DFE2"
+                data = source.read(44)
+                if os.fstat(source.fileno()).st_size != size:
+                    return None
+        except FileNotFoundError:
+            return None
+        if len(data) != 44 or data[:4] != magic:
             return None
         offset = int.from_bytes(data[4:12], "big")
         epoch = int.from_bytes(data[12:16], "big")
@@ -320,6 +332,7 @@ class RaftDataGroupTest(RaftDataGroupFixture):
         master, follower = slots[0][2:4]
         key = self.key_for_range(*slots[0][:2])
         values = [f"writer-{i}".encode() for i in range(8)]
+        ordinary = {value: b"{" + key + b"}:" + value for value in values}
         ready = Barrier(len(values))
 
         def compete(value):
@@ -327,6 +340,9 @@ class RaftDataGroupTest(RaftDataGroupFixture):
                 host=HOST, port=master[1], single_connection_client=True, socket_timeout=7
             ) as writer:
                 writer.ping()
+                ready.wait(timeout=7)
+                self.assertTrue(writer.set(ordinary[value], value))
+                self.assertEqual(writer.wait(1, 2500), 1)
                 ready.wait(timeout=7)
                 result = writer.set(key, value, nx=True)
                 if result is True:
@@ -337,6 +353,8 @@ class RaftDataGroupTest(RaftDataGroupFixture):
             self.assertIsNone(client.set(key, "missing", xx=True))
             with ThreadPoolExecutor(max_workers=len(values)) as workers:
                 results = list(workers.map(compete, values))
+            for value in values:
+                self.assertEqual(client.get(ordinary[value]), value)
             self.assertCountEqual(results, [True] + [None] * (len(values) - 1))
             self.assertEqual(client.get(key), values[results.index(True)])
             self.assertIsNone(client.set(key, "ignored", nx=True))
@@ -628,6 +646,56 @@ class DynamicControllerDiscoveryTest(RaftDataGroupFixture):
 class DynamicDataGroupFixture(RaftDataGroupFixture):
     learner = 13
 
+    def wait_benchmark_topology(self):
+        """Wait for the promoted topology on every data node and return both write leaders."""
+        controllers = {1, 2, 3}
+        groups = (
+            (10, (0, 8191), {*GROUPS[10], self.learner}),
+            (20, (8192, 16383), set(GROUPS[20])),
+        )
+        endpoints = {
+            (HOST.encode(), port, f"{node:040x}".encode()): node for node, port in self.resp.items()
+        }
+
+        def caught_up(view, leader, members):
+            return (
+                view
+                and view.leader == leader
+                and view.epoch > 0
+                and view.hw > 0
+                and set(view.voters) == members
+                and all(offset >= view.hw for offset in view.voters.values())
+            )
+
+        def ready():
+            if not self.raft.keys() <= self.proc.keys():
+                return None
+            rows = self.slots()
+            if not rows:
+                return None
+            leaders = []
+            try:
+                if not any(caught_up(describe(self.raft[n]), n, controllers) for n in controllers):
+                    return None
+                for row, (gid, bounds, members) in zip(rows, groups):
+                    nodes = [endpoints.get(tuple(node[:3])) for node in row[2:]]
+                    if (
+                        tuple(row[:2]) != bounds
+                        or len(nodes) != len(members)
+                        or set(nodes) != members
+                    ):
+                        return None
+                    leader = nodes[0]
+                    view = describe(self.raft[leader], b"__dragonfly_data", gid)
+                    if not caught_up(view, leader, members):
+                        return None
+                    leaders.append(leader)
+            except (ConnectionError, TimeoutError):
+                return None
+            return tuple(leaders)
+
+        return self.wait_for(ready)
+
     def elect_recovered_learner(self, leader):
         # Remove the old leader last so each change goes to the active leader. Direct GET
         # requests after this election inspect the recovered voter's own engine.
@@ -726,6 +794,8 @@ class DataSnapshotRecoveryTest(DynamicDataGroupFixture):
 
         # This committed suffix is smaller than the next checkpoint trigger and is delivered by Fetch.
         tail_key = b"{12561}:tail"
+        with redis.Redis(host=HOST, port=self.resp[leader], db=1) as other_db:
+            self.assertTrue(other_db.set(tail_key, b"db1 incremental value"))
         with redis.Redis(
             host=HOST, port=self.resp[leader], single_connection_client=True
         ) as client:
@@ -753,6 +823,8 @@ class DataSnapshotRecoveryTest(DynamicDataGroupFixture):
             self.assertEqual(self.wait_for(lambda: client.get(tail_key)), b"after promotion")
             for key, value in values.items():
                 self.assertEqual(client.get(key), value)
+        with redis.Redis(host=HOST, port=self.resp[self.learner], db=1) as other_db:
+            self.assertEqual(other_db.get(tail_key), b"db1 incremental value")
 
 
 if __name__ == "__main__":

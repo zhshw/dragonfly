@@ -196,7 +196,20 @@ optional<int64_t> FetchReplication::HighWatermark() const {
   return leader_hw_->value()->offset;
 }
 
-absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoch) {
+optional<string_view> FetchReplication::ParkedFetch::Records(int32_t max_bytes) const {
+  if (!ready_.load(memory_order_acquire))
+    return nullopt;
+  return string_view(bytes_).substr(0, max<size_t>(max(0, max_bytes), first_batch_size_));
+}
+
+FetchReplication::ParkedFetch::Tail FetchReplication::CurrentFetchTail() const {
+  return {{leader_epoch_, log_.End().end_offset}, log_.StartOffset(), HighWatermark().value_or(-1)};
+}
+
+absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoch,
+                                      bool* may_have_appended) {
+  if (may_have_appended)
+    *may_have_appended = false;
   const auto& state = campaign_.state();
   if (auto s = StorageStatus(state); !s.ok())
     return s;
@@ -204,8 +217,22 @@ absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoc
       leader_epoch_ != expected_epoch)
     return absl::FailedPreconditionError(
         "Append requires an initialized leader of the specified epoch");
-  if (auto s = log_.Append(batches, expected_epoch); !s.ok())
+  auto written = [&](size_t first_batch_size) {
+    if (may_have_appended)
+      *may_have_appended = true;
+    auto parked = parked_fetch_.lock();
+    if (!parked || parked->tail_ != CurrentFetchTail())
+      return;
+    parked_fetch_.reset();
+    parked->first_batch_size_ = first_batch_size;
+    parked->bytes_.assign(batches.substr(0, max(first_batch_size, parked->max_bytes_)));
+    parked->ready_.store(true, memory_order_release);
+    wake_fetch_();
+  };
+  if (auto s = log_.Append(batches, expected_epoch, written); !s.ok())
     return log_.io_failure().ok() ? s : DurableFailure(s);
+  if (may_have_appended)
+    *may_have_appended = true;
   if (auto s = membership_.Appended(batches, log_.End().end_offset); !s.ok())
     return DurableFailure(s);
   if (auto s = RefreshMembership(); !s.ok())
@@ -216,7 +243,10 @@ absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoc
 
 absl::Status FetchReplication::HandleFetch(const FetchRequest& request, int16_t version,
                                            optional<int64_t> contact_ms, int64_t wall_ms,
-                                           FetchResponse* response, bool* can_wait) {
+                                           FetchResponse* response, bool* can_wait,
+                                           shared_ptr<const ParkedFetch>* parked) {
+  if (parked)
+    parked->reset();
   *response = {};
   *can_wait = false;
   const auto& state = campaign_.state();
@@ -315,6 +345,17 @@ absl::Status FetchReplication::HandleFetch(const FetchRequest& request, int16_t 
   *can_wait = position.kind == FetchPosition::Kind::kValid && part.records.data->empty() &&
               request.max_wait_ms > 0 &&
               (version < 18 || fetch.high_watermark >= part.high_watermark);
+  if (*can_wait && parked && wake_fetch_ && fetch.fetch_offset == log_.End().end_offset) {
+    auto tail = CurrentFetchTail();
+    auto pending = parked_fetch_.lock();
+    if (!pending || pending->tail_ != tail) {
+      pending = make_shared<ParkedFetch>();
+      pending->tail_ = tail;
+      parked_fetch_ = pending;
+    }
+    pending->max_bytes_ = max<size_t>(pending->max_bytes_, max(0, request.max_bytes));
+    *parked = std::move(pending);
+  }
   return absl::OkStatus();
 }
 

@@ -128,17 +128,47 @@ TEST_F(PartitionLogTest, CorruptDurablePrefixStopsRecovery) {
 
 TEST_F(PartitionLogTest, PartialDurabilityFailureRequiresReopen) {
   auto batch = MakeDataBatch(0, 1, 1, values_).value();
-  ASSERT_TRUE(fs::create_directory(dir_ / "dragonfly-log-end.tmp"));
+  const auto marker = dir_ / "dragonfly-log-end";
+  const auto published = fs::file_size(marker);
+  fs::resize_file(marker, published + 1);
   EXPECT_FALSE(log_->Append(batch, 1).ok());
   EXPECT_EQ(log_->End().end_offset, 0);
   EXPECT_FALSE(log_->Read(0, 0, SIZE_MAX).ok());
   EXPECT_FALSE(log_->Append(batch, 1).ok());
   log_.reset();
-  fs::remove(dir_ / "dragonfly-log-end.tmp");
+  fs::resize_file(marker, published);
   Open();
   EXPECT_EQ(log_->End().end_offset, 0);
   EXPECT_EQ(fs::file_size(Segment()), 0u);
   EXPECT_TRUE(log_->Append(batch, 1).ok());
+}
+
+TEST_F(PartitionLogTest, PreparedSlotIsInvisibleUntilSelectorIsDurable) {
+  const auto marker = dir_ / "dragonfly-log-end";
+  auto empty = fs::file_size(marker);
+  fs::create_hard_link(marker, dir_ / "same-checkpoint");
+  auto batch = MakeDataBatch(0, 1, 1, values_).value();
+  ASSERT_TRUE(log_->Append(batch, 1).ok());
+  ASSERT_TRUE(fs::equivalent(marker, dir_ / "same-checkpoint"));
+  ASSERT_NE(fs::file_size(marker), empty);
+  log_.reset();
+
+  // Model a crash after syncing the new record, with the previous selector still on disk.
+  fs::resize_file(marker, empty);
+  Open();
+  EXPECT_EQ(log_->End().end_offset, 0);
+  EXPECT_EQ(fs::file_size(Segment()), 0u);
+
+  // Recovery also ignores a torn preparation in the inactive block.
+  log_.reset();
+  fstream(marker, ios::in | ios::out | ios::binary).seekp(64 * 1024).put('!');
+  Open();
+  ASSERT_TRUE(log_->Append(batch, 1).ok());
+  log_.reset();
+
+  // Once selected, a damaged record is fatal even if the other slot is intact.
+  fstream(marker, ios::in | ios::out | ios::binary).seekp(64 * 1024 + 40).write("bad!", 4);
+  EXPECT_TRUE(absl::IsDataLoss(PartitionLog::Open(dir_).status()));
 }
 
 TEST_F(PartitionLogTest, RawKafkaSegmentMustBeContinuous) {
@@ -190,13 +220,15 @@ TEST_F(PartitionLogTest, UnpublishedRollAndMissingDurableMiddleSegment) {
   auto second = MakeDataBatch(2, 3, 2, values_).value();
   auto third = MakeDataBatch(4, 3, 3, values_).value();
   ASSERT_TRUE(log_->Append(first, 3).ok());
-  ASSERT_TRUE(fs::create_directory(dir_ / "dragonfly-log-end.tmp"));
+  const auto marker = dir_ / "dragonfly-log-end";
+  const auto published = fs::file_size(marker);
+  fs::resize_file(marker, published + 1);
   EXPECT_FALSE(log_->Append(second, 3).ok());
   EXPECT_FALSE(log_->io_failure().ok());
   auto middle = dir_ / "00000000000000000002.log";
   EXPECT_TRUE(fs::exists(middle));
   log_.reset();
-  fs::remove(dir_ / "dragonfly-log-end.tmp");
+  fs::resize_file(marker, published);
   Open(100);
   EXPECT_FALSE(fs::exists(middle));
   EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
@@ -222,6 +254,38 @@ TEST_F(PartitionLogTest, UpgradeSingleSegmentMarker) {
   Open(100);
   EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
   auto next = MakeDataBatch(2, 4, 2, values_).value();
+  ASSERT_TRUE(log_->Append(next, 4).ok());
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{4, 4}));
+}
+
+TEST_F(PartitionLogTest, FailedUpgradeKeepsSegmentedLegacyBoundary) {
+  auto first = MakeDataBatch(0, 3, 1, values_).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  log_.reset();
+  const auto marker = dir_ / "dragonfly-log-end";
+  string legacy(44, '\0');
+  legacy.replace(0, 4, "DFE2");
+  absl::big_endian::Store64(legacy.data() + 24, first.size());
+  absl::big_endian::Store64(legacy.data() + 32, 2);
+  absl::big_endian::Store32(
+      legacy.data() + 40,
+      static_cast<uint32_t>(absl::ComputeCrc32c(string_view(legacy).substr(0, 40))));
+  ofstream(marker, ios::binary) << legacy;
+  Open();
+
+  // The old checkpoint must remain authoritative until the new inode is ready to install.
+  const auto temporary = dir_ / "dragonfly-log-end.tmp";
+  ASSERT_TRUE(fs::create_directory(temporary));
+  auto next = MakeDataBatch(2, 4, 2, values_).value();
+  EXPECT_FALSE(log_->Append(next, 4).ok());
+  EXPECT_EQ(fs::file_size(marker), legacy.size());
+  log_.reset();
+  fs::remove(temporary);
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  EXPECT_EQ(fs::file_size(Segment()), first.size());
   ASSERT_TRUE(log_->Append(next, 4).ok());
   log_.reset();
   Open();

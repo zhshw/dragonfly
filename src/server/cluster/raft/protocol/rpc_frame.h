@@ -5,6 +5,7 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <system_error>
 
 #include "server/cluster/raft/protocol/add_voter.h"
@@ -38,6 +39,9 @@ struct FrameResult {
   size_t consumed = 0;
   std::error_code handler_error{};
 };
+
+// Returns the total wire size from a complete, valid Kafka length prefix.
+[[nodiscard]] std::optional<size_t> RpcFrameSize(std::string_view prefix, size_t max_payload_size);
 
 template <typename Request, typename Response>
 using RpcHandler = std::function<std::error_code(int16_t, const Request&, Response*)>;

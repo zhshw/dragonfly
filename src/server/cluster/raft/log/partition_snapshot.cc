@@ -124,7 +124,7 @@ absl::Status PartitionLog::RemovePrefix(int64_t first_base) {
 absl::Status PartitionLog::ResetToSnapshot(LogPosition id) {
   // Commit the empty extent first. Recovery can finish replacing even a segment with the
   // same filename from an older epoch, regardless of which physical files survived.
-  if (auto s = PublishMarker(dir_fd_, {id, id.end_offset, 0, id.end_offset}); !s.ok())
+  if (auto s = marker_.Publish(dir_fd_, {id, id.end_offset, 0, id.end_offset}); !s.ok())
     return s;
   if (auto s = SetActive(id.end_offset, O_CREAT); !s.ok())
     return s;
@@ -159,7 +159,7 @@ absl::Status PartitionLog::DeleteBeforeSnapshot(LogPosition id, int64_t hw) {
       upper_bound(batches_.begin(), batches_.end(), id.end_offset,
                   [](int64_t offset, const Batch& b) { return offset < b.end.end_offset; });
   int64_t first_base = first->segment_base;
-  io_failure_ = PublishMarker(dir_fd_, {id, active_base_, active_bytes_, End().end_offset});
+  io_failure_ = marker_.Publish(dir_fd_, {id, active_base_, active_bytes_, End().end_offset});
   if (!io_failure_.ok())
     return io_failure_;
   start_ = id;

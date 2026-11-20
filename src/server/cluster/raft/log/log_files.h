@@ -26,7 +26,19 @@ struct DurableEnd {
   int64_t offset = 0;
 };
 
-absl::StatusOr<std::optional<DurableEnd>> ReadMarker(int dir_fd);
-absl::Status PublishMarker(int dir_fd, const DurableEnd& end);
+// One writer under the partition directory lock. Reads legacy DFE1/DFE2 checkpoints too.
+class RecoveryMarker {
+ public:
+  RecoveryMarker() = default;
+  ~RecoveryMarker();
+  RecoveryMarker(const RecoveryMarker&) = delete;
+  RecoveryMarker& operator=(const RecoveryMarker&) = delete;
+
+  absl::StatusOr<std::optional<DurableEnd>> Read(int dir_fd);
+  absl::Status Publish(int dir_fd, const DurableEnd& end);
+
+ private:
+  int fd_ = -1;
+};
 
 }  // namespace dfly::cluster::raft::log_files

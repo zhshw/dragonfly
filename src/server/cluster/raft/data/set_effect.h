@@ -7,6 +7,7 @@
 #include <absl/functional/function_ref.h>
 #include <absl/status/statusor.h>
 
+#include <deque>
 #include <string>
 
 #include "server/cluster/raft/data/kv_snapshot.h"
@@ -67,6 +68,10 @@ class CommittedEffects {
                                                        std::string_view migrations,
                                                        std::span<const SnapshotSlotRange> slots);
 
+  // Keep the resolved effect of a successful leader append for delivery on commit.
+  // encoded_bytes is the size of its single-record WAL batch, used by snapshot accounting.
+  void RememberAppended(LogPosition end, size_t encoded_bytes, SetEffect effect);
+
   // Apply complete, committed batches in order. The callback checks historical slot ownership
   // and returns OK only after the replacement is visible on its engine shard.
   absl::Status ApplyTo(const PartitionLog& log, int64_t high_watermark, ApplySet apply);
@@ -77,6 +82,16 @@ class CommittedEffects {
   absl::Status ApplyRecord(std::string_view payload, LogPosition end, ApplySet apply,
                            ApplySlotImage apply_image);
 
+  absl::Status ApplyEffect(const SetEffect& effect, ApplySet apply);
+
+  struct PendingEffect {
+    LogPosition end;
+    size_t encoded_bytes;
+    SetEffect effect;
+  };
+
+  std::deque<PendingEffect> pending_;
+  size_t pending_bytes_ = 0;
   int32_t group_id_;
   LogPosition applied_;
   uint64_t applied_bytes_ = 0;

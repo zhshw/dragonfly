@@ -6,6 +6,8 @@
 
 #include <arpa/inet.h>
 
+#include <algorithm>
+
 #include "util/fibers/dns_resolve.h"
 #include "util/fibers/proactor_base.h"
 
@@ -21,6 +23,48 @@ void PeerConnection::Close() {
     socket_.reset();
   }
   versions_ = {};
+}
+
+std::error_code PeerConnection::ReceiveFrame(std::chrono::steady_clock::time_point deadline,
+                                             absl::FunctionRef<bool(std::string_view)> decode) {
+  size_t received = 0;
+  auto receive = [&](io::MutableBytes buffer) -> std::error_code {
+    auto left = deadline - std::chrono::steady_clock::now();
+    if (left <= left.zero())
+      return std::make_error_code(std::errc::timed_out);
+    socket_->set_timeout(
+        static_cast<uint32_t>(std::chrono::ceil<std::chrono::milliseconds>(left).count()));
+    auto n = socket_->Recv(buffer);
+    if (!n || *n == 0)
+      return n ? std::make_error_code(std::errc::connection_reset) : n.error();
+    received += *n;
+    return {};
+  };
+
+  // A single read usually contains the entire response for votes and idle Fetches.
+  char first[4096];
+  do {
+    if (auto ec = receive(io::MutableBuffer(first).subspan(received)); ec)
+      return ec;
+  } while (received < sizeof(int32_t));
+  auto size = protocol::RpcFrameSize({first, received}, max_frame_size_);
+  if (!size || received > *size)
+    return std::make_error_code(std::errc::protocol_error);
+  io::MutableBytes buffer = io::MutableBuffer(first);
+  std::unique_ptr<uint8_t[]> large;
+  if (*size >= buffer.size() && received < *size) {
+    // The spare byte detects unsolicited data arriving with the end of the response.
+    large = std::make_unique_for_overwrite<uint8_t[]>(*size + 1);
+    std::copy_n(buffer.data(), received, large.get());
+    buffer = {large.get(), *size + 1};
+  }
+  while (received < *size) {
+    if (auto ec = receive(buffer.subspan(received)); ec)
+      return ec;
+  }
+  if (received != *size || !decode(io::View(buffer.first(received))))
+    return std::make_error_code(std::errc::protocol_error);
+  return {};
 }
 
 std::error_code PeerConnection::EnsureConnected() {

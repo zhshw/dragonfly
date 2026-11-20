@@ -27,6 +27,7 @@
 #include "util/accept_server.h"
 #include "util/fibers/fiberqueue_threadpool.h"
 #include "util/fibers/pool.h"
+#include "util/fibers/synchronization.h"
 
 ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_bytes);
 ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_interval_ms);
@@ -50,14 +51,46 @@ absl::Status ClusterDown() {
   return absl::UnavailableError("-CLUSTERDOWN Data group unavailable");
 }
 
+struct PendingSet {
+  DbIndex db;
+  SlotId slot;
+  string_view key;
+  string_view value;
+  optional<SetCondition> condition;
+  absl::Status status{};
+  bool stored = true;
+  optional<SetEffect> effect{};
+  size_t encoded_bytes = 0;
+  LogPosition end{};
+};
+
+struct SetBatch {
+  vector<PendingSet*> requests;
+  size_t value_bytes = 0;
+  absl::Status status;
+  fb2::EmbeddedBlockingCounter appended{1};
+};
+
 struct LocalPartition {
   LocalPartition(int32_t group, const string& cluster_id, Service& service,
                  fb2::ProactorBase* owner)
-      : id(group), effects(group), snapshots(cluster_id, group, service, owner) {
+      : id(group),
+        effects(group),
+        snapshots(cluster_id, group, service, owner),
+        apply_executor(&service) {
   }
+
+  // Client fibers may run on different proactors. Only registration and detaching
+  // the open batch need the mutex; all validation and appends run on the group worker.
+  fb2::Mutex batch_mu;
+  shared_ptr<SetBatch> open_batch;
   int32_t id;
   CommittedEffects effects;
   DataSnapshotter snapshots;
+
+  // The group worker applies one committed effect at a time on the owner proactor.
+  // Keeping its executor lets journal replay activate each DB once across all shards.
+  JournalExecutor apply_executor;
   DataApplyProgress progress;
   unique_ptr<RaftGroup> raft;
   unique_ptr<SlotMigrationDriver> migrations;
@@ -160,6 +193,8 @@ class DataNodeImpl final : public DataNode {
   }
   absl::StatusOr<bool> ProposeSet(DbIndex db, string_view key, string_view value,
                                   optional<SetCondition> condition, DataWritePosition* position);
+  absl::Status AppendSetBatch(LocalPartition& local, SetBatch& batch, RaftGroup::State state,
+                              bool* done);
   absl::Status OpenPartition(const MetadataImage& image, const Broker& local);
   void BrokerLoop();
   void MigrationLoop();
@@ -212,10 +247,7 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
         return s;
       auto apply_set = [&](const SetEffect& effect) {
         // Re-enter the service on a proactor. Client writes wait outside shard transactions.
-        return owner_->Await([&] {
-          JournalExecutor executor(service_);
-          return ExecuteSetEffect(executor, effect);
-        });
+        return owner_->Await([&] { return ExecuteSetEffect(replica->apply_executor, effect); });
       };
       auto apply_slot = [&](SlotId slot, optional<string_view> bytes, string_view digest) {
         return owner_->Await([&] {
@@ -449,65 +481,137 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
     return Route(slot, nullptr).status();
   }
 
-  optional<LogPosition> ticket;
-  bool stored = true;
-  auto deadline = steady_clock::now() + seconds(5);
-  auto status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
-    if (stopping_)
-      return ClusterDown();
-    int32_t epoch = state.election.state().election.epoch;
-    if (ticket) {
-      if (state.election.state().role != QuorumRole::kLeader || epoch != ticket->epoch)
-        return ClusterDown();
-      *done = local->effects.applied_offset() >= ticket->end_offset;
-      return absl::OkStatus();
+  PendingSet proposal{db, slot, key, value, condition};
+  const auto deadline = steady_clock::now() + seconds(5);
+  shared_ptr<SetBatch> batch;
+  bool dispatch;
+  {
+    // The first request dispatches immediately. Only writes already waiting when the worker
+    // picks up the batch share its flush. Conditional SET evaluates against committed KV alone.
+    constexpr size_t kMaxGroupPayload = 1U << 20;
+    constexpr size_t kMaxGroupRequests = 32;
+    const size_t size = key.size() + value.size();
+    lock_guard lock(local->batch_mu);
+    batch = local->open_batch;
+    dispatch = !batch || condition || batch->requests.size() >= kMaxGroupRequests ||
+               batch->value_bytes + size > kMaxGroupPayload;
+    if (dispatch) {
+      batch = make_shared<SetBatch>();
+      local->open_batch = condition ? nullptr : batch;
     }
-    auto route = Route(slot, local.get());
-    if (!route.ok())
-      return route.status();
-    auto hw = state.replication.HighWatermark();
-    if (local->id != route->owner.group_id || state.election.state().role != QuorumRole::kLeader ||
-        !hw || local->effects.applied_offset() < *hw)
-      return ClusterDown();
+    batch->value_bytes += size;
+    batch->requests.push_back(&proposal);
+  }
 
-    // A predicate must see every earlier proposal. Yield outside the group worker until
-    // those proposals have committed and applied, then recheck leadership and routing.
-    int64_t offset = state.log.End().end_offset;
-    if (condition) {
-      if (local->effects.applied_offset() != offset)
+  if (dispatch) {
+    auto seal = [&] {
+      lock_guard lock(local->batch_mu);
+      if (local->open_batch == batch)
+        local->open_batch.reset();
+    };
+    batch->status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
+      seal();
+      return AppendSetBatch(*local, *batch, state, done);
+    });
+
+    // VisitUntil can stop before invoking the callback, for example during shutdown.
+    if (!batch->status.ok())
+      seal();
+    batch->appended.Dec();
+  } else {
+    batch->appended.Wait();
+  }
+
+  if (!proposal.status.ok())
+    return proposal.status;
+  if (!batch->status.ok()) {
+    if (absl::IsDeadlineExceeded(batch->status))
+      return absl::UnavailableError("-TRYAGAIN Data group is catching up");
+    return batch->status;
+  }
+  if (proposal.stored)
+    *position = {local->id, proposal.end.epoch, proposal.end.end_offset};
+  auto status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
+    if (stopping_ || state.election.state().role != QuorumRole::kLeader ||
+        state.election.state().election.epoch != proposal.end.epoch)
+      return ClusterDown();
+    *done = local->effects.applied_offset() >= proposal.end.end_offset;
+    return absl::OkStatus();
+  });
+  if (!status.ok())
+    return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
+  return proposal.stored;
+}
+
+absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch,
+                                          RaftGroup::State state, bool* done) {
+  const auto& election = state.election.state();
+  const auto hw = state.replication.HighWatermark();
+  const int32_t epoch = election.election.epoch;
+  int64_t offset = state.log.End().end_offset;
+  const auto timestamp =
+      duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+  string records;
+  for (auto* request : batch.requests) {
+    auto route = Route(request->slot, &local);
+    if (!route.ok()) {
+      request->status = route.status();
+      continue;
+    }
+    if (stopping_ || election.role != QuorumRole::kLeader || !hw ||
+        local.effects.applied_offset() < *hw) {
+      request->status = ClusterDown();
+      continue;
+    }
+    if (request->condition) {
+      DCHECK_EQ(batch.requests.size(), 1u);
+      if (local.effects.applied_offset() != offset)
         return absl::OkStatus();
       auto exists = owner_->Await([&] {
         JournalExecutor executor(service_);
-        return ExistsForSet(executor, db, key);
+        return ExistsForSet(executor, request->db, request->key);
       });
       if (!exists.ok())
         return exists.status();
-      stored = *exists == (*condition == SetCondition::kIfExists);
+      request->stored = *exists == (*request->condition == SetCondition::kIfExists);
     }
-    auto action = stored ? SetEffect::Action::kReplace : SetEffect::Action::kNoop;
-    SetEffect effect{local->id,   db,
-                     slot,        route->owner.generation,
-                     string(key), stored ? string(value) : string{},
+    auto action = request->stored ? SetEffect::Action::kReplace : SetEffect::Action::kNoop;
+    SetEffect effect{local.id,
+                     request->db,
+                     request->slot,
+                     route->owner.generation,
+                     string(request->key),
+                     request->stored ? string(request->value) : string{},
                      action};
-    auto timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-    auto batch = MakeSetEffectBatch(offset, epoch, timestamp, effect);
-    if (!batch.ok())
-      return batch.status();
-    auto appended = state.replication.Append(*batch, epoch);
-    if (appended.ok()) {
-      ticket = LogPosition{epoch, offset + 1};
-      if (stored)
-        *position = {local->id, epoch, offset + 1};
+    auto encoded = MakeSetEffectBatch(offset, epoch, timestamp, effect);
+    if (!encoded.ok()) {
+      request->status = encoded.status();
+      continue;
     }
-    return appended;
-  });
-  if (status.ok())
-    return stored;
-  if (ticket)
-    return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
-  if (absl::IsDeadlineExceeded(status))
-    return absl::UnavailableError("-TRYAGAIN Data group is catching up");
-  return status;
+    request->effect = std::move(effect);
+    request->encoded_bytes = encoded->size();
+    request->end = {epoch, ++offset};
+    if (records.empty())
+      records = *std::move(encoded);
+    else
+      records.append(*encoded);
+  }
+  *done = true;
+  if (records.empty())
+    return absl::OkStatus();
+  bool may_have_appended = false;
+  auto status = state.replication.Append(records, epoch, &may_have_appended);
+  if (!status.ok()) {
+    if (may_have_appended)
+      return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
+    return status;
+  }
+  for (auto* request : batch.requests) {
+    if (request->effect)
+      local.effects.RememberAppended(request->end, request->encoded_bytes,
+                                     std::move(*request->effect));
+  }
+  return absl::OkStatus();
 }
 
 absl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState() {

@@ -212,6 +212,59 @@ TEST_F(FetchReplicationTest, CompletingParkedFetchDoesNotRenewQuorumContact) {
   EXPECT_EQ(a.campaign.state().role, QuorumRole::kResigned);
 }
 
+TEST_F(FetchReplicationTest, ParkedFollowerPersistsWrittenDataBeforeLeaderPublishesItsEnd) {
+  auto a = Make(kA), b = Make(kB);
+  Elect(&a, &b);
+  for (int i = 0; i < 2; ++i) {
+    auto fetch = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, fetch.sequence, Handle(&a, fetch)).ok());
+  }
+
+  const auto first = Batch(1, 5), second = Batch(2, 5);
+  const int32_t budget = first.size() + 1;
+  auto pending = b.fetch.PrepareFetch(1, 18, 500, budget).value();
+  shared_ptr<const FetchReplication::ParkedFetch> parked;
+  FetchResponse response;
+  bool sent = false;
+  a.fetch.SetFetchWakeup([&] {
+    // The leader has written both batches, but its local flush and publication are still ahead.
+    ASSERT_EQ(a.fetch.LogEndOffset(), 1);
+    ASSERT_EQ(a.fetch.HighWatermark(), 1);
+    ASSERT_TRUE(parked);
+    EXPECT_EQ(parked->Records(1), first);
+    ASSERT_EQ(parked->Records(budget), first + second.substr(0, 1));
+    response.responses[0].partitions[0].records.data->assign(*parked->Records(budget));
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, pending.sequence, response).ok());
+    EXPECT_EQ(b.fetch.LogEndOffset(), 2);
+    EXPECT_EQ(b.fetch.HighWatermark(), 1);
+    EXPECT_EQ(a.fetch.HighWatermark(), 1);
+    sent = true;
+  });
+  bool can_wait = false;
+  ASSERT_TRUE(
+      a.fetch.HandleFetch(pending.request, 18, now_, now_, &response, &can_wait, &parked).ok());
+  ASSERT_TRUE(can_wait);
+  ASSERT_TRUE(parked);
+  EXPECT_FALSE(parked->Records(budget));
+
+  bool may_have_appended = true;
+  EXPECT_FALSE(a.fetch.Append(Batch(9, 5), 5, &may_have_appended).ok());
+  EXPECT_FALSE(may_have_appended);
+  EXPECT_FALSE(sent);
+  ASSERT_TRUE(a.fetch.Append(first + second, 5, &may_have_appended).ok());
+  EXPECT_TRUE(may_have_appended);
+  ASSERT_TRUE(sent);
+  EXPECT_EQ(a.fetch.LogEndOffset(), 3);
+  EXPECT_EQ(a.fetch.HighWatermark(), 1);
+
+  // Only the next Fetch can report the follower's durable end. Its partial second batch
+  // is fetched again at offset 2 and still cannot count toward the current majority.
+  auto ack = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
+  auto suffix = Handle(&a, ack);
+  EXPECT_EQ(suffix.responses[0].partitions[0].records.data, second);
+  EXPECT_EQ(a.fetch.HighWatermark(), 2);
+}
+
 TEST_F(FetchReplicationTest, VersionedIdentityAndMalformedRequestsDoNotCountAsVoters) {
   auto a = Make(kA), b = Make(kB);
   Elect(&a, &b);
@@ -430,8 +483,11 @@ TEST_F(FetchReplicationTest, SingleVoterCommittedLocallyAndDiskFailureFencesCamp
   auto epoch = a.campaign.state().election.epoch;
   ASSERT_TRUE(a.fetch.Append(Batch(1, epoch), epoch).ok());
   EXPECT_EQ(a.fetch.HighWatermark(), 2);
-  ASSERT_TRUE(fs::create_directory(Path(1, 10) / "dragonfly-log-end.tmp"));
-  EXPECT_FALSE(a.fetch.Append(Batch(2, epoch), epoch).ok());
+  auto marker = Path(1, 10) / "dragonfly-log-end";
+  fs::resize_file(marker, fs::file_size(marker) + 1);
+  bool may_have_appended = false;
+  EXPECT_FALSE(a.fetch.Append(Batch(2, epoch), epoch, &may_have_appended).ok());
+  EXPECT_TRUE(may_have_appended);
   EXPECT_TRUE(a.campaign.state().storage_error);
   EXPECT_FALSE(a.fetch.HighWatermark());
   EXPECT_FALSE(a.fetch.SyncRole(now_).ok());
@@ -449,9 +505,18 @@ TEST_F(FetchReplicationTest, NewMajorityGovernsUncommittedRemovalAndLeaderResign
   exchange(&b);
   exchange(&b);
   ASSERT_EQ(a.fetch.HighWatermark(), 1);
+  a.fetch.SetFetchWakeup(
+      [] { ADD_FAILURE() << "A voter-set change must finish installing first"; });
+  auto request = b.fetch.PrepareFetch(kA.id, 18, 100, 1024).value().request;
+  shared_ptr<const FetchReplication::ParkedFetch> parked;
+  bool can_wait = false;
+  FetchResponse response;
+  ASSERT_TRUE(a.fetch.HandleFetch(request, 18, now_, now_, &response, &can_wait, &parked).ok());
+  ASSERT_TRUE(parked);
   string value = VoterValue(span(kVoters).subspan(1));
   array<ControlRecordValue, 1> control{{{6, value}}};
   ASSERT_TRUE(a.fetch.Append(MakeControlBatch(1, 5, 100, control).value(), 5).ok());
+  EXPECT_FALSE(parked->Records(1024));
   EXPECT_EQ(a.campaign.voters().size(), 2u);
   EXPECT_EQ(a.fetch.membership().LastVoterOffset(), 1);
   exchange(&b);

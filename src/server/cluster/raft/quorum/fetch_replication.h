@@ -6,6 +6,8 @@
 
 #include <absl/status/statusor.h>
 
+#include <atomic>
+
 #include "server/cluster/raft/log/partition_log.h"
 #include "server/cluster/raft/protocol/fetch.h"
 #include "server/cluster/raft/quorum/epoch_control.h"
@@ -38,7 +40,10 @@ class FetchReplication {
 
   // On becoming leader append and flush its LeaderChangeMessage before serving Fetch.
   [[nodiscard]] absl::Status SyncRole(int64_t timestamp_ms);
-  [[nodiscard]] absl::Status Append(std::string_view batches, int32_t expected_epoch);
+  // A successful data write can survive a later flush error or be replicated before it.
+  // may_have_appended lets the client distinguish an uncertain outcome from a rejection.
+  [[nodiscard]] absl::Status Append(std::string_view batches, int32_t expected_epoch,
+                                    bool* may_have_appended = nullptr);
   std::optional<int64_t> HighWatermark() const;
   int64_t LogEndOffset() const {
     return log_.End().end_offset;
@@ -58,12 +63,38 @@ class FetchReplication {
     observe_applied_ = std::move(observe);
   }
 
+  // A group of valid, empty Fetches at the same leader epoch and tail can share one copy of
+  // the next written data. Readers only access it after publication on the disk worker.
+  class ParkedFetch {
+   public:
+    std::optional<std::string_view> Records(int32_t max_bytes) const;
+
+   private:
+    friend class FetchReplication;
+    struct Tail {
+      LogPosition end;
+      int64_t start_offset;
+      int64_t high_watermark;
+      bool operator==(const Tail&) const = default;
+    };
+    Tail tail_{};
+    size_t max_bytes_ = 0;
+    size_t first_batch_size_ = 0;
+    std::string bytes_;
+    std::atomic_bool ready_{false};
+  };
+
+  void SetFetchWakeup(std::function<void()> wakeup) {
+    wake_fetch_ = std::move(wakeup);
+  }
+
   // can_wait means a valid empty Fetch can remain outstanding. On a log append, HW advance
   // or role change, recompute without a new contact_ms to count the original contact
   // only once. On timeout send the retained response.
   [[nodiscard]] absl::Status HandleFetch(const protocol::FetchRequest& request, int16_t version,
                                          std::optional<int64_t> contact_ms, int64_t wall_ms,
-                                         protocol::FetchResponse* response, bool* can_wait);
+                                         protocol::FetchResponse* response, bool* can_wait,
+                                         std::shared_ptr<const ParkedFetch>* parked = nullptr);
 
   // A probe from an unattached replica can learn the current leader; data is installed
   // only from a matched follower fetch. Superseding an outstanding fetch fences its reply.
@@ -94,6 +125,7 @@ class FetchReplication {
   absl::StatusOr<std::vector<CampaignVoter>> ConfiguredVoters(
       const MembershipHistory& history) const;
   void UpdateHighWatermark();
+  ParkedFetch::Tail CurrentFetchTail() const;
   absl::Status DurableFailure(absl::Status status);
 
   ElectionCampaign& campaign_;
@@ -103,6 +135,8 @@ class FetchReplication {
   QuorumReplicaProgress replica_progress_;
   AdvertiseApplied advertise_applied_;
   ObserveApplied observe_applied_;
+  std::weak_ptr<ParkedFetch> parked_fetch_;
+  std::function<void()> wake_fetch_;
   const std::vector<CampaignVoter> static_voters_;
   MembershipHistory membership_;
   std::optional<int64_t> active_voter_offset_;

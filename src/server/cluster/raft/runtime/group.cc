@@ -79,6 +79,8 @@ class RaftGroup::Impl {
         changes_(campaign_, epochs_, replication_, kRequestTimeoutMs),
         observer_(observer),
         apply_(std::move(apply)) {
+    if (kind == Kind::kData)
+      replication_.SetFetchWakeup([this] { fetch_changed_.notifyAll(); });
   }
 
   absl::Status Recover() {
@@ -612,10 +614,12 @@ error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
   const auto deadline = steady_clock::now() + milliseconds(request.max_wait_ms);
   auto key = fetch_changed_.prepareWait();
   bool can_wait = false;
+  shared_ptr<const FetchReplication::ParkedFetch> parked;
   auto respond = [&](bool initial) {
     return OnWorker([&] {
       auto contact = initial ? optional<int64_t>{NowMs()} : nullopt;
-      auto s = replication_.HandleFetch(request, version, contact, WallMs(), response, &can_wait);
+      auto s = replication_.HandleFetch(request, version, contact, WallMs(), response, &can_wait,
+                                        initial ? &parked : nullptr);
       return s.ok() ? error_code{} : make_error_code(errc::io_error);
     });
   };
@@ -625,6 +629,14 @@ error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
   // Timeout returns the retained empty response. Waking a parked RPC never adds voter contact.
   if (fetch_changed_.wait_until(key.epoch(), deadline) == cv_status::timeout)
     return {};
+  if (parked && !stopping_) {
+    if (auto records = parked->Records(request.max_bytes)) {
+      // The response retains the previously validated epoch and HW. Only a later Fetch can
+      // report a higher durable offset, and that request runs on the serialized group worker.
+      response->responses.front().partitions.front().records.data->assign(*records);
+      return {};
+    }
+  }
   return respond(false);
 }
 

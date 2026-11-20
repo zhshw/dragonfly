@@ -39,9 +39,9 @@ class RaftListenerTest : public testing::Test {
     pool_.reset(util::fb2::Pool::Epoll(1));
     pool_->Run();
     server_ = std::make_unique<util::AcceptServer>(pool_.get(), false);
-    auto* listener = new RaftListener(4096, std::move(handlers), std::move(on_pre_shutdown));
-    ASSERT_FALSE(server_->AddListener("127.0.0.1", 0, listener));
-    port_ = listener->socket()->LocalEndpoint().port();
+    listener_ = new RaftListener(4096, std::move(handlers), std::move(on_pre_shutdown));
+    ASSERT_FALSE(server_->AddListener("127.0.0.1", 0, listener_));
+    port_ = listener_->socket()->LocalEndpoint().port();
     server_->Run();
 
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -67,6 +67,7 @@ class RaftListenerTest : public testing::Test {
   int fd_ = -1;
   std::unique_ptr<util::ProactorPool> pool_;
   std::unique_ptr<util::AcceptServer> server_;
+  RaftListener* listener_ = nullptr;
 };
 
 TEST_F(RaftListenerTest, FragmentedAndPipelinedRequestsKeepCorrelationAndOrder) {
@@ -134,6 +135,62 @@ TEST_F(RaftListenerTest, StorageFailureClosesWithoutAcknowledgement) {
   ASSERT_EQ(write(fd_, wire.data(), wire.size()), static_cast<ssize_t>(wire.size()));
   char byte;
   EXPECT_EQ(read(fd_, &byte, 1), 0);
+}
+
+class FetchResponseListenerTest : public RaftListenerTest {
+ protected:
+  void SetUp() override {
+    payload_.resize(256 * 1024);
+    for (size_t i = 0; i < payload_.size(); ++i)
+      payload_[i] = static_cast<char>(i ^ (i >> 8) ^ (i >> 16));
+    protocol::RpcHandlers handlers;
+    handlers.fetch = [this](int16_t, const protocol::FetchRequest& request,
+                            protocol::FetchResponse* response) {
+      auto& part = response->responses.emplace_back().partitions.emplace_back();
+      part.records.data = payload_.substr(0, request.max_bytes);
+      return std::error_code{};
+    };
+    StartListener(std::move(handlers));
+  }
+
+  std::string payload_;
+};
+
+TEST_F(FetchResponseListenerTest, PeerReadsLargeResponseAndReusesConnection) {
+  pool_->GetNextProactor()->Await([&] {
+    PeerConnection peer({"127.0.0.1", port_}, 2000, 512 * 1024);
+    protocol::FetchRequest request;
+    protocol::FetchResponse response, expected;
+    auto& records = expected.responses.emplace_back().partitions.emplace_back().records.data;
+    records = payload_;
+    ASSERT_FALSE(peer.Call(request, 18, &response));
+    EXPECT_EQ(response, expected);
+
+    // A new connection would be closed, so this Fetch must reuse the stream at the next frame.
+    listener_->pause_accepting();
+    request.max_bytes = 17;
+    records = payload_.substr(0, request.max_bytes);
+    ASSERT_FALSE(peer.Call(request, 18, &response));
+    EXPECT_EQ(response, expected);
+    peer.Close();
+  });
+}
+
+TEST_F(FetchResponseListenerTest, PeerRejectsOversizedResponseAndReconnects) {
+  pool_->GetNextProactor()->Await([&] {
+    PeerConnection peer({"127.0.0.1", port_}, 2000, 4096);
+    protocol::FetchRequest request;
+    protocol::FetchResponse response, expected;
+    EXPECT_EQ(peer.Call(request, 18, &response), std::errc::protocol_error);
+    EXPECT_EQ(response, expected);
+
+    request.max_bytes = 17;
+    expected.responses.emplace_back().partitions.emplace_back().records.data =
+        payload_.substr(0, request.max_bytes);
+    ASSERT_FALSE(peer.Call(request, 18, &response));
+    EXPECT_EQ(response, expected);
+    peer.Close();
+  });
 }
 
 class ParkedFetchListenerTest : public RaftListenerTest {

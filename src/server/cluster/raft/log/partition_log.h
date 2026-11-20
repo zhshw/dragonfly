@@ -4,14 +4,17 @@
 
 #pragma once
 
+#include <absl/functional/function_ref.h>
 #include <absl/status/statusor.h>
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "server/cluster/raft/log/log_files.h"
 #include "server/cluster/raft/log/snapshot_file.h"
 #include "server/cluster/raft/quorum/election.h"
 
@@ -50,7 +53,11 @@ class PartitionLog {
 
   // Leader appends contain whole batches of this epoch; follower appends may include
   // earlier epochs and a partial trailing batch from Fetch.
-  absl::Status Append(std::string_view batches, int32_t leader_epoch);
+  // For an all-data append, notify after the complete write and before its durability barrier.
+  // The callback receives the first complete batch's byte size. End() is still the durable LEO.
+  using DataWritten = absl::FunctionRef<void(size_t)>;
+  absl::Status Append(std::string_view batches, int32_t leader_epoch,
+                      std::optional<DataWritten> written = std::nullopt);
   absl::Status AppendAsFollower(std::string_view batches, int32_t fetch_epoch);
 
   absl::Status AppendLeaderChange(int32_t epoch, int64_t timestamp_ms, int32_t leader_id,
@@ -92,12 +99,14 @@ class PartitionLog {
   bool IsLocalBoundary(LogPosition id) const;
   absl::Status SetActive(int64_t base, int flags);
   absl::Status RemoveSuffixSegments();
-  absl::Status AppendBatches(std::string_view batches, int32_t epoch, bool follower);
+  absl::Status AppendBatches(std::string_view batches, int32_t epoch, bool follower,
+                             std::optional<DataWritten> written);
   absl::Status PublishEnd(int64_t file_end, int64_t end_offset);
 
   std::filesystem::path dir_;
   int dir_fd_ = -1;
   int log_fd_ = -1;
+  log_files::RecoveryMarker marker_;
   size_t segment_bytes_;
   int64_t active_base_ = 0;
   int64_t active_bytes_ = 0;

@@ -7,6 +7,7 @@ import math
 import os
 import random
 import signal
+from threading import Barrier
 import time
 import unittest
 
@@ -34,6 +35,10 @@ def elapsed_ms(start):
     return round((time.monotonic() - start) * 1000, 2)
 
 
+def percentile(samples, fraction):
+    return sorted(samples)[math.ceil(len(samples) * fraction) - 1]
+
+
 @contextmanager
 def paused(process):
     process.send_signal(signal.SIGSTOP)
@@ -47,7 +52,7 @@ def paused(process):
 
 
 class ReplicationComparison:
-    """Both runners use the same node IDs, slots, data and single outstanding SET."""
+    """Both runners use the same node IDs, slots, data and one outstanding SET per client."""
 
     def setUp(self):
         super().setUp()
@@ -67,53 +72,109 @@ class ReplicationComparison:
     def test_lagging_replica_catches_up_bulk(self):
         leader = self.leader
         mib = int(os.getenv("REPLICATION_TEST_MIB", "64"))
+        clients = int(os.getenv("REPLICATION_TEST_CLIENTS", "1"))
+        settle_seconds = float(os.getenv("REPLICATION_TEST_SETTLE_SECONDS", "5"))
+        warmup_writes = int(os.getenv("REPLICATION_TEST_WARMUP_WRITES", "32"))
         self.assertGreater(mib, 0)
+        self.assertGreaterEqual(settle_seconds, 0)
+        self.assertGreaterEqual(warmup_writes, 0)
         rng = random.Random(42)
         data = [
             (TAGS[i % 2] + f":{i}".encode(), rng.randbytes(BLOCK))
             for i in range(mib * MIB // BLOCK)
         ]
 
-        with self.writer(leader) as writer:
-            self.assertEqual(writer.info("server")["thread_count"], 2)
-            self.assertTrue(writer.set(STABLE, b"ready"))
-            self.assertEqual(writer.wait(2, 5000), 2)
-            self.stop(13, crash=True)
+        self.assertTrue(1 <= clients <= len(data))
+        warmup = [
+            (TAGS[i % len(TAGS)] + f":warmup:{i}".encode(), rng.randbytes(BLOCK))
+            for i in range(warmup_writes)
+        ]
+
+        def write_slice(writer, records, barrier):
             latencies = []
+            barrier.wait(timeout=10)
             start = time.monotonic()
-            for key, value in data:
+            for key, value in records:
                 sent = time.monotonic()
                 self.assertTrue(writer.set(key, value))
-                latencies.append(elapsed_ms(sent))
-            write_ms = elapsed_ms(start)
-            self.assertEqual(writer.wait(1, 5000), 1)
+                last_ack = time.monotonic()
+                latencies.append((last_ack - sent) * 1000)
+            return start, last_ack, latencies
+
+        def confirm(writer, key, value, replicas):
+            self.assertTrue(writer.set(key, value))
+            self.assertEqual(writer.wait(replicas, 5000), replicas)
+            self.assertEqual(writer.get(key), value)
+
+        with ExitStack() as stack:
+            writers = [stack.enter_context(self.writer(leader)) for _ in range(clients)]
+            for writer in writers:
+                self.assertEqual(writer.info("server")["thread_count"], 2)
+            other = stack.enter_context(self.writer(self.other_leader))
+            other_key = self.key_for_range(8192, 16383)
+            confirm(writers[0], STABLE, b"ready", 2)
+            confirm(other, other_key, b"ready", 1)
+            self.stop(13, crash=True)
+            confirm(writers[0], PROBE, b"after stop", 1)
+            confirm(other, other_key, b"after stop", 1)
+            time.sleep(settle_seconds)
+
+            with ThreadPoolExecutor(max_workers=clients) as executor:
+
+                def write_batch(batch):
+                    active = min(clients, len(batch))
+                    if not active:
+                        return []
+                    barrier = Barrier(active)
+                    pending = [
+                        executor.submit(write_slice, writers[i], batch[i::clients], barrier)
+                        for i in range(active)
+                    ]
+                    return [f.result() for f in pending]
+
+                write_batch(warmup)
+                for writer in writers[: min(clients, warmup_writes)]:
+                    self.assertEqual(writer.wait(1, 5000), 1)
+                samples = write_batch(data)
+
+            write_ms = round(
+                (max(end for _, end, _ in samples) - min(s for s, _, _ in samples)) * 1000, 2
+            )
+            latencies = [ms for _, _, times in samples for ms in times]
+            for writer in writers:
+                self.assertEqual(writer.wait(1, 5000), 1)
 
             # Include process launch and reconnection in time to recover. Legacy WAIT takes a
             # fresh replica snapshot per invocation, so retry if the new process is not online.
             start = time.monotonic()
             self.start(13)
-            self.wait_for(lambda: writer.wait(2, 500) == 2, timeout=60 + mib)
+            self.wait_for(lambda: all(w.wait(2, 500) == 2 for w in writers), timeout=60 + mib)
             recovery_ms = elapsed_ms(start)
 
         self.prepare_readback(leader)
         with self.client(13) as recovered:
             self.assertEqual(self.wait_for(lambda: recovered.get(STABLE)), b"ready")
-            for key, value in data:
+            for key, value in warmup + data:
                 self.assertTrue(recovered.get(key) == value, key)
 
-        latencies.sort()
         print(
             json.dumps(
                 dict(
                     mode=self.mode,
+                    clients=clients,
                     payload_mib=mib,
                     keys=len(data),
+                    settle_seconds=settle_seconds,
+                    warmup_writes=warmup_writes,
                     readback_node=13,
                     write_ms=write_ms,
                     mib_per_s=round(mib * 1000 / write_ms, 2),
-                    set_p50_ms=latencies[math.ceil(len(data) * 0.5) - 1],
-                    set_p95_ms=latencies[math.ceil(len(data) * 0.95) - 1],
-                    set_max_ms=max(latencies),
+                    first_set_p50_ms=round(
+                        percentile([times[0] for _, _, times in samples], 0.5), 2
+                    ),
+                    set_p50_ms=round(percentile(latencies, 0.5), 2),
+                    set_p95_ms=round(percentile(latencies, 0.95), 2),
+                    set_max_ms=round(max(latencies), 2),
                     restart_to_wait_two_ms=recovery_ms,
                 )
             ),
@@ -203,6 +264,7 @@ class RaftReplicationComparisonTest(ReplicationComparison, DynamicDataGroupFixtu
     def setUp(self):
         super().setUp()
         self.promote_learner(self.leader)
+        self.leader, self.other_leader = self.wait_benchmark_topology()
 
     def prepare_readback(self, leader):
         self.assertIsNone(self.retained_checkpoint(leader, 10, 1))

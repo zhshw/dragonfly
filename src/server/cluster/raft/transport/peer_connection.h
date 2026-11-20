@@ -4,7 +4,8 @@
 
 #pragma once
 
-#include <algorithm>
+#include <absl/functional/function_ref.h>
+
 #include <chrono>
 #include <limits>
 #include <memory>
@@ -50,6 +51,8 @@ class PeerConnection {
 
  private:
   std::error_code EnsureConnected();
+  std::error_code ReceiveFrame(std::chrono::steady_clock::time_point deadline,
+                               absl::FunctionRef<bool(std::string_view)> decode);
 
   template <typename Request, typename Response>
   std::error_code Exchange(const Request& request, int16_t version, Response* response) {
@@ -67,32 +70,14 @@ class PeerConnection {
       Close();
       return ec;
     }
-    wire.clear();
-    char chunk[4096];
-    while (true) {
-      auto left = deadline - std::chrono::steady_clock::now();
-      if (left <= left.zero()) {
-        Close();
-        return std::make_error_code(std::errc::timed_out);
-      }
-      socket_->set_timeout(
-          static_cast<uint32_t>(std::chrono::ceil<std::chrono::milliseconds>(left).count()));
-      auto n = socket_->Recv(io::MutableBuffer(chunk));
-      if (!n || *n == 0) {
-        Close();
-        return n ? std::make_error_code(std::errc::connection_reset) : n.error();
-      }
-      wire.append(chunk, *n);
-      auto frame = protocol::DecodeResponseFrame(wire, max_frame_size_, version,
+    auto ec = ReceiveFrame(deadline, [&](std::string_view bytes) {
+      auto frame = protocol::DecodeResponseFrame(bytes, max_frame_size_, version,
                                                  header.correlation_id, response);
-      if (frame.status == protocol::FrameStatus::kNeedMore)
-        continue;
-      if (frame.status == protocol::FrameStatus::kComplete && frame.consumed == wire.size())
-        return {};
-
+      return frame.status == protocol::FrameStatus::kComplete && frame.consumed == bytes.size();
+    });
+    if (ec)
       Close();
-      return std::make_error_code(std::errc::protocol_error);
-    }
+    return ec;
   }
 
   QuorumEndpoint endpoint_;

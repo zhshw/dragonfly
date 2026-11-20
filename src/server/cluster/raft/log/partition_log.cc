@@ -81,7 +81,7 @@ absl::Status PartitionLog::SetActive(int64_t base, int flags) {
 }
 
 absl::Status PartitionLog::Recover() {
-  auto stored = ReadMarker(dir_fd_);
+  auto stored = marker_.Read(dir_fd_);
   if (!stored.ok())
     return stored.status();
   auto marker = *stored;
@@ -235,7 +235,7 @@ absl::Status PartitionLog::RecoverSegment(optional<int64_t> durable_bytes,
 }
 
 absl::Status PartitionLog::PublishEnd(int64_t file_end, int64_t offset) {
-  return PublishMarker(dir_fd_, {start_, active_base_, file_end, offset});
+  return marker_.Publish(dir_fd_, {start_, active_base_, file_end, offset});
 }
 
 LogPosition PartitionLog::End() const {
@@ -256,15 +256,17 @@ LogPosition PartitionLog::EndForEpoch(int32_t epoch) const {
   return {epoch, StartOffset()};
 }
 
-absl::Status PartitionLog::Append(string_view batches, int32_t epoch) {
-  return AppendBatches(batches, epoch, false);
+absl::Status PartitionLog::Append(string_view batches, int32_t epoch,
+                                  optional<DataWritten> written) {
+  return AppendBatches(batches, epoch, false, written);
 }
 
 absl::Status PartitionLog::AppendAsFollower(string_view batches, int32_t epoch) {
-  return AppendBatches(batches, epoch, true);
+  return AppendBatches(batches, epoch, true, nullopt);
 }
 
-absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool follower) {
+absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool follower,
+                                         optional<DataWritten> written) {
   if (!io_failure_.ok())
     return io_failure_;
   vector<Batch> pending;
@@ -282,6 +284,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
     auto batch = DecodeRecordBatch(remaining.substr(0, *size));
     if (!batch.ok())
       return batch.status();
+    if (batch->control)
+      written.reset();
     if (follower && batch->end.epoch > epoch)
       break;
     if (batch->base_offset != end.end_offset || batch->end.epoch < end.epoch ||
@@ -314,6 +318,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
   io_failure_ = WriteAt(log_fd_, active_bytes_, bytes.substr(0, length));
   if (!io_failure_.ok())
     return io_failure_;
+  if (written)
+    (*written)(pending.front().file_end - pending.front().file_start);
   if (fsync(log_fd_) != 0)
     return io_failure_ = DiskError("Syncing quorum log append");
   io_failure_ = PublishEnd(pos, end.end_offset);

@@ -95,6 +95,44 @@ TEST_F(SetEffectTest, OnlyCommittedEffectsAreAppliedOnceInLogOrder) {
   EXPECT_EQ(seen, vector<SetEffect>{second});
 }
 
+TEST_F(SetEffectTest, LeaderDeliversCachedEffectsOnlyAfterCommitAndDiscardsReplacedSuffix) {
+  CommittedEffects state(10);
+  auto first = MakeSetEffectBatch(0, 3, 10, first_).value();
+  auto old = first_;
+  old.value = "uncommitted";
+  auto second = MakeSetEffectBatch(1, 3, 10, old).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  state.RememberAppended({3, 1}, first.size(), first_);
+  ASSERT_TRUE(log_->Append(second, 3).ok());
+  state.RememberAppended({3, 2}, second.size(), old);
+
+  vector<SetEffect> seen;
+  auto apply = [&](const SetEffect& effect) {
+    seen.push_back(effect);
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(state.ApplyTo(*log_, 0, apply).ok());
+  EXPECT_TRUE(seen.empty());
+
+  // Hide the closed first segment to prove that a cache hit does not reopen it.
+  auto segment = dir_ / "00000000000000000000.log";
+  fs::rename(segment, dir_ / "held-segment");
+  ASSERT_FALSE(log_->Read(0, 1, 1).ok());
+  ASSERT_TRUE(state.ApplyTo(*log_, 1, apply).ok());
+  fs::rename(dir_ / "held-segment", segment);
+  EXPECT_EQ(seen, vector<SetEffect>{first_});
+  EXPECT_EQ(state.applied_bytes(), first.size());
+
+  ASSERT_TRUE(log_->TruncateTo(1, 1).ok());
+  auto replacement = first_;
+  replacement.value = "new leader";
+  second = MakeSetEffectBatch(1, 4, 20, replacement).value();
+  ASSERT_TRUE(log_->AppendAsFollower(second, 4).ok());
+  ASSERT_TRUE(state.ApplyTo(*log_, 2, apply).ok());
+  EXPECT_EQ(seen, (vector<SetEffect>{first_, replacement}));
+  EXPECT_EQ(state.applied_bytes(), first.size() + second.size());
+}
+
 TEST_F(SetEffectTest, FailedApplyAndWrongGroupDoNotAdvanceCursor) {
   ASSERT_TRUE(Append(first_).ok());
   auto second = first_;
