@@ -2,6 +2,7 @@ add_library(dfly_raft
             bootstrap/meta_properties.cc
             bootstrap/raft_directory.cc
             config/quorum_config.cc
+            data/set_effect.cc
             log/log_files.cc
             log/partition_log.cc
             log/partition_snapshot.cc
@@ -36,6 +37,7 @@ cxx_link(raft_storage dfly_raft)
 
 helio_cxx_test(bootstrap/raft_directory_test dfly_raft LABELS DFLY)
 helio_cxx_test(config/quorum_config_test dfly_raft LABELS DFLY)
+helio_cxx_test(data/set_effect_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/partition_log_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/partition_snapshot_test dfly_raft LABELS DFLY)
 helio_cxx_test(log/record_batch_test dfly_raft LABELS DFLY)
