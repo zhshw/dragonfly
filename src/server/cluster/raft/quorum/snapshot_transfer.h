@@ -31,6 +31,11 @@ class SnapshotTransfer {
 
   // Call after FetchReplication::SyncRole to drop stale requests and partial snapshots.
   void SyncRole();
+
+  // Next byte to fetch in the current partial snapshot, or zero if there is no download.
+  int64_t DownloadPosition() const {
+    return writer_ ? writer_->position() : 0;
+  }
   [[nodiscard]] absl::Status HandleRequest(const protocol::FetchSnapshotRequest& request,
                                            int16_t version, int64_t monotonic_ms,
                                            protocol::FetchSnapshotResponse* response);

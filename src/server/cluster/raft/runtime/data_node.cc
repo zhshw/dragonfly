@@ -107,7 +107,8 @@ class DataNodeImpl final : public DataNode {
     handlers.fetch_snapshot = Forward(&RpcHandlers::fetch_snapshot);
     handlers.fetch_slot_image = Forward(&RpcHandlers::fetch_slot_image);
     handlers.describe_quorum = Forward(&RpcHandlers::describe_quorum);
-    auto listener = make_unique<RaftListener>(kMaxRaftFrame, std::move(handlers));
+    auto listener =
+        make_unique<RaftListener>(kMaxRaftFrame, std::move(handlers), [this] { RequestStop(); });
     if (auto ec = acceptor->AddListener(listen_.host.c_str(), listen_.port, listener.get()); ec)
       return absl::ErrnoToStatus(ec.value(), "Binding data quorum listener");
     listener.release();
@@ -121,8 +122,7 @@ class DataNodeImpl final : public DataNode {
   }
 
   void Stop() override {
-    stopping_ = true;
-    observer_->RequestStop();
+    RequestStop();
     if (control_fiber_.IsJoinable())
       control_fiber_.Join();
     if (migration_fiber_.IsJoinable())
@@ -142,6 +142,13 @@ class DataNodeImpl final : public DataNode {
   absl::StatusOr<DataReplicationState> ReplicationState() override;
 
  private:
+  void RequestStop() {
+    stopping_ = true;
+    observer_->RequestStop();
+    if (auto group = partition_.load())
+      group->raft->RequestStop();
+  }
+
   template <typename R, typename S>
   auto Forward(RpcHandler<R, S> RpcHandlers::*member) -> RpcHandler<R, S> {
     return [this, member](int16_t version, const R& request, S* response) {
@@ -445,68 +452,62 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
   optional<LogPosition> ticket;
   bool stored = true;
   auto deadline = steady_clock::now() + seconds(5);
-  while (!stopping_ && steady_clock::now() < deadline) {
-    bool applied = false;
-    auto status = local->raft->Visit([&](RaftGroup::State state) {
-      int32_t epoch = state.election.state().election.epoch;
-      if (ticket) {
-        if (state.election.state().role != QuorumRole::kLeader || epoch != ticket->epoch)
-          return ClusterDown();
-        applied = local->effects.applied_offset() >= ticket->end_offset;
-        return absl::OkStatus();
-      }
-      auto route = Route(slot, local.get());
-      if (!route.ok())
-        return route.status();
-      auto hw = state.replication.HighWatermark();
-      if (local->id != route->owner.group_id ||
-          state.election.state().role != QuorumRole::kLeader || !hw ||
-          local->effects.applied_offset() < *hw)
+  auto status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
+    if (stopping_)
+      return ClusterDown();
+    int32_t epoch = state.election.state().election.epoch;
+    if (ticket) {
+      if (state.election.state().role != QuorumRole::kLeader || epoch != ticket->epoch)
         return ClusterDown();
-
-      // A predicate must see every earlier proposal. Yield outside the group worker until
-      // those proposals have committed and applied, then recheck leadership and routing.
-      int64_t offset = state.log.End().end_offset;
-      if (condition) {
-        if (local->effects.applied_offset() != offset)
-          return absl::OkStatus();
-        auto exists = owner_->Await([&] {
-          JournalExecutor executor(service_);
-          return ExistsForSet(executor, db, key);
-        });
-        if (!exists.ok())
-          return exists.status();
-        stored = *exists == (*condition == SetCondition::kIfExists);
-      }
-      auto action = stored ? SetEffect::Action::kReplace : SetEffect::Action::kNoop;
-      SetEffect effect{local->id,   db,
-                       slot,        route->owner.generation,
-                       string(key), stored ? string(value) : string{},
-                       action};
-      auto timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-      auto batch = MakeSetEffectBatch(offset, epoch, timestamp, effect);
-      if (!batch.ok())
-        return batch.status();
-      auto appended = state.replication.Append(*batch, epoch);
-      if (appended.ok()) {
-        ticket = LogPosition{epoch, offset + 1};
-        if (stored)
-          *position = {local->id, epoch, offset + 1};
-      }
-      return appended;
-    });
-    if (!status.ok()) {
-      if (ticket)
-        break;
-      return status;
+      *done = local->effects.applied_offset() >= ticket->end_offset;
+      return absl::OkStatus();
     }
-    if (applied)
-      return stored;
-    util::ThisFiber::SleepFor(milliseconds(5));
-  }
-  if (!ticket)
+    auto route = Route(slot, local.get());
+    if (!route.ok())
+      return route.status();
+    auto hw = state.replication.HighWatermark();
+    if (local->id != route->owner.group_id || state.election.state().role != QuorumRole::kLeader ||
+        !hw || local->effects.applied_offset() < *hw)
+      return ClusterDown();
+
+    // A predicate must see every earlier proposal. Yield outside the group worker until
+    // those proposals have committed and applied, then recheck leadership and routing.
+    int64_t offset = state.log.End().end_offset;
+    if (condition) {
+      if (local->effects.applied_offset() != offset)
+        return absl::OkStatus();
+      auto exists = owner_->Await([&] {
+        JournalExecutor executor(service_);
+        return ExistsForSet(executor, db, key);
+      });
+      if (!exists.ok())
+        return exists.status();
+      stored = *exists == (*condition == SetCondition::kIfExists);
+    }
+    auto action = stored ? SetEffect::Action::kReplace : SetEffect::Action::kNoop;
+    SetEffect effect{local->id,   db,
+                     slot,        route->owner.generation,
+                     string(key), stored ? string(value) : string{},
+                     action};
+    auto timestamp = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    auto batch = MakeSetEffectBatch(offset, epoch, timestamp, effect);
+    if (!batch.ok())
+      return batch.status();
+    auto appended = state.replication.Append(*batch, epoch);
+    if (appended.ok()) {
+      ticket = LogPosition{epoch, offset + 1};
+      if (stored)
+        *position = {local->id, epoch, offset + 1};
+    }
+    return appended;
+  });
+  if (status.ok())
+    return stored;
+  if (ticket)
+    return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
+  if (absl::IsDeadlineExceeded(status))
     return absl::UnavailableError("-TRYAGAIN Data group is catching up");
-  return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
+  return status;
 }
 
 absl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState() {

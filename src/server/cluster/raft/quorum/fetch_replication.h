@@ -58,11 +58,11 @@ class FetchReplication {
     observe_applied_ = std::move(observe);
   }
 
-  // can_wait means a valid empty Fetch can remain outstanding. Retain this response for
-  // timeout; on a log append, HW advance or role change, recompute it. On expiry send
-  // the retained response without reporting a second contact from the voter.
+  // can_wait means a valid empty Fetch can remain outstanding. On a log append, HW advance
+  // or role change, recompute without a new contact_ms to count the original contact
+  // only once. On timeout send the retained response.
   [[nodiscard]] absl::Status HandleFetch(const protocol::FetchRequest& request, int16_t version,
-                                         int64_t now_ms, int64_t wall_ms,
+                                         std::optional<int64_t> contact_ms, int64_t wall_ms,
                                          protocol::FetchResponse* response, bool* can_wait);
 
   // A probe from an unattached replica can learn the current leader; data is installed

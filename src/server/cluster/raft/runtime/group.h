@@ -7,6 +7,7 @@
 #include <absl/functional/function_ref.h>
 #include <absl/status/statusor.h>
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
 
@@ -48,6 +49,11 @@ class RaftGroup {
   void Join();
   protocol::RpcHandlers Handlers();
   absl::Status Visit(Operation operation);
+
+  // Run on the disk worker and recheck after a commit or leadership change until done.
+  // Only the calling fiber parks. The operation may use a ticket to track an earlier append.
+  absl::Status VisitUntil(std::chrono::steady_clock::time_point deadline,
+                          absl::FunctionRef<absl::Status(State, bool* done)> operation);
 
  private:
   class Impl;

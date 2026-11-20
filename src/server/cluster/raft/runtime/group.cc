@@ -4,10 +4,12 @@
 
 #include "server/cluster/raft/runtime/group.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/random/random.h>
 
 #include <atomic>
 #include <chrono>
+#include <tuple>
 
 #include "base/logging.h"
 #include "server/cluster/raft/bootstrap/raft_directory.h"
@@ -16,6 +18,7 @@
 #include "server/cluster/raft/quorum/snapshot_transfer.h"
 #include "server/cluster/raft/quorum/voter_changes.h"
 #include "server/cluster/raft/transport/peer_connection.h"
+#include "util/fibers/event_count.h"
 #include "util/fibers/fiberqueue_threadpool.h"
 #include "util/fibers/proactor_base.h"
 
@@ -105,6 +108,8 @@ class RaftGroup::Impl {
 
   void RequestStop() {
     stopping_ = true;
+    fetch_changed_.notifyAll();
+    commit_changed_.notifyAll();
   }
 
   void Join() {
@@ -115,7 +120,7 @@ class RaftGroup::Impl {
 
   RpcHandlers Handlers();
   absl::Status Visit(Operation operation) {
-    return worker_.Await([&] {
+    return RunOnWorker([&] {
       Tick();
       if (failed_ || stopping_)
         return absl::UnavailableError("Quorum is unavailable");
@@ -123,7 +128,42 @@ class RaftGroup::Impl {
     });
   }
 
+  absl::Status VisitUntil(steady_clock::time_point deadline,
+                          absl::FunctionRef<absl::Status(State, bool*)> operation) {
+    while (steady_clock::now() < deadline) {
+      // Subscribe before checking the ticket so a concurrent commit cannot be missed.
+      auto key = commit_changed_.prepareWait();
+      bool done = false;
+      auto status = Visit([&](State state) { return operation(state, &done); });
+      if (!status.ok() || done)
+        return status;
+      commit_changed_.wait_until(key.epoch(), deadline);
+    }
+    return absl::DeadlineExceededError("Timed out waiting for quorum commit");
+  }
+
  private:
+  auto CommitState() const {
+    const auto& state = campaign_.state();
+    return tuple{state.role, state.election.epoch, replication_.HighWatermark(), failed_};
+  }
+
+  template <typename F> auto RunOnWorker(F&& operation) -> decltype(operation()) {
+    return worker_.Await([&] {
+      const auto commit = CommitState();
+      const auto end = log_->End();
+      absl::Cleanup notify = [&] {
+        if (CommitState() != commit) {
+          commit_changed_.notifyAll();
+          fetch_changed_.notifyAll();
+        } else if (log_->End() != end) {
+          fetch_changed_.notifyAll();
+        }
+      };
+      return operation();
+    });
+  }
+
   bool LocalVoter() const {
     return !observer_ && ranges::any_of(campaign_.voters(), [&](const CampaignVoter& peer) {
       return peer.key.Matches(campaign_.target().local_replica);
@@ -153,7 +193,7 @@ class RaftGroup::Impl {
     };
     map<int32_t, unique_ptr<PeerWorker>> peers;
     while (!stopping_) {
-      auto desired = worker_.Await([&] {
+      auto desired = RunOnWorker([&] {
         Tick();
         return DesiredPeers();
       });
@@ -271,7 +311,7 @@ class RaftGroup::Impl {
   }
 
   template <typename F> error_code OnWorker(F&& f) {
-    return worker_.Await([&] {
+    return RunOnWorker([&] {
       Tick();
       if (failed_ || stopping_)
         return make_error_code(errc::state_not_recoverable);
@@ -282,7 +322,7 @@ class RaftGroup::Impl {
   void RunPeer(const CampaignVoter& voter, const atomic_bool& active) {
     PeerConnection peer(voter.endpoint, kRequestTimeoutMs, kMaxRaftFrame);
     while (!stopping_ && active) {
-      auto task = worker_.Await([&] { return Next(voter.key); });
+      auto task = RunOnWorker([&] { return Next(voter.key); });
       if (auto* vote = get_if<OutboundVote>(&task)) {
         VoteResponse response;
         bool pre_vote = vote->request.topics[0].partitions[0].pre_vote;
@@ -308,10 +348,12 @@ class RaftGroup::Impl {
             Discover(peer, voter, active);
             break;
           case Pull::kFetch:
-            FetchFrom(peer, voter.key.id, active);
+            if (FetchFrom(peer, voter.key.id, active))
+              continue;
             break;
           case Pull::kSnapshot:
-            FetchSnapshotFrom(peer, voter.key.id, active);
+            if (FetchSnapshotFrom(peer, voter.key.id, active))
+              continue;
             break;
         }
       }
@@ -338,30 +380,45 @@ class RaftGroup::Impl {
     });
   }
 
-  void FetchFrom(PeerConnection& peer, int32_t leader, const atomic_bool& active) {
+  bool FetchFrom(PeerConnection& peer, int32_t leader, const atomic_bool& active) {
     int16_t version;
     if (peer.Negotiate<FetchRequest>(kMinRaftFetchVersion, &version))
-      return;
-    auto fetch = worker_.Await([&]() -> optional<OutboundFetch> {
+      return false;
+    auto fetch = RunOnWorker([&]() -> optional<OutboundFetch> {
       if (failed_ || campaign_.state().role != QuorumRole::kFollower ||
           campaign_.state().election.leader_id != leader)
         return nullopt;
       return replication_.PrepareFetch(leader, version, 100, kMaxFetchBytes);
     });
     if (!fetch)
-      return;
+      return false;
     FetchResponse response;
+    const auto start = steady_clock::now();
     if (peer.Call(fetch->request, version, &response))
-      return;
-    worker_.Await([&] {
+      return false;
+    const bool waited = steady_clock::now() - start >= milliseconds(fetch->request.max_wait_ms);
+    return RunOnWorker([&] {
       if (!active)
-        return;
+        return false;
+      const auto end = log_->End();
+      const auto hw = replication_.HighWatermark();
       bool reset = false;
       auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, response, &reset);
-      if (!s.ok())
+      if (!s.ok()) {
         VLOG(1) << "Fetch from node " << leader << ": " << s;
-      if (reset)
-        ResetDeadline(NowMs());
+        return false;
+      }
+      if (!reset)
+        return false;
+      ResetDeadline(NowMs());
+      if (log_->End() != end || replication_.HighWatermark() != hw ||
+          replication_.RequestedSnapshot())
+        return true;
+
+      // An idle long poll already waited. Re-arm it immediately so the next append can wake it.
+      const auto& part = response.responses.front().partitions.front();
+      return waited && part.diverging_epoch.epoch < 0 && part.snapshot_id.epoch < 0 &&
+             (!part.records.data || part.records.data->empty());
     });
   }
 
@@ -378,7 +435,7 @@ class RaftGroup::Impl {
     if (part.partition_index != campaign_.target().partition || part.error_code ||
         part.leader_id != voter.key.id)
       return;
-    worker_.Await([&] {
+    RunOnWorker([&] {
       if (active && part.leader_epoch >= campaign_.state().election.epoch) {
         if (auto ec = campaign_.ObserveLeader(part.leader_epoch, voter.key.id, voter.endpoint); ec)
           VLOG(1) << "Metadata discovery: " << ec.message();
@@ -386,30 +443,37 @@ class RaftGroup::Impl {
     });
   }
 
-  void FetchSnapshotFrom(PeerConnection& peer, int32_t leader, const atomic_bool& active) {
+  bool FetchSnapshotFrom(PeerConnection& peer, int32_t leader, const atomic_bool& active) {
     int16_t version;
     if (peer.Negotiate<FetchSnapshotRequest>(0, &version))
-      return;
-    auto fetch = worker_.Await([&] { return snapshots_.Prepare(version, kMaxFetchBytes); });
+      return false;
+    auto fetch = RunOnWorker([&] { return snapshots_.Prepare(version, kMaxFetchBytes); });
     if (!fetch || fetch->peer_id != leader)
-      return;
+      return false;
     FetchSnapshotResponse response;
     if (peer.Call(fetch->request, version, &response))
-      return;
-    worker_.Await([&] {
+      return false;
+    return RunOnWorker([&] {
       if (!active)
-        return;
+        return false;
+      const auto position = snapshots_.DownloadPosition();
+      const auto latest = log_->LatestSnapshot();
       bool reset = false;
       auto s = snapshots_.ReceiveResponse(leader, fetch->sequence, response, &reset);
-      if (!s.ok())
+      if (!s.ok()) {
         VLOG(1) << "Snapshot from node " << leader << ": " << s;
-      if (reset) {
-        ResetDeadline(NowMs());
-
-        // Deliver a newly installed cut before the next Fetch can advertise application progress.
-        if (!replication_.RequestedSnapshot())
-          Tick();
+        return false;
       }
+      if (!reset)
+        return false;
+      ResetDeadline(NowMs());
+      const bool progressed =
+          snapshots_.DownloadPosition() > position || log_->LatestSnapshot() != latest;
+
+      // Deliver a newly installed cut before the next Fetch can advertise application progress.
+      if (!replication_.RequestedSnapshot())
+        Tick();
+      return progressed;
     });
   }
 
@@ -427,6 +491,8 @@ class RaftGroup::Impl {
   VoterChanges changes_;
   const bool observer_;
   ApplyCommitted apply_;
+  fb2::EventCount fetch_changed_;
+  fb2::EventCount commit_changed_;
   int64_t applied_ = -1;
   map<int32_t, int64_t> discovery_after_;
   fb2::FiberQueueThreadPool worker_{1};
@@ -543,32 +609,23 @@ error_code RaftGroup::Impl::ChangeVoters(const Request& req, Response* res) {
 
 error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
                                   FetchResponse* response) {
-  // Delay an empty Fetch until data or the commit boundary changes, or until maxWaitMs.
-  // Checking the watched values must not count a parked request as repeated voter contact.
-  using Watch = tuple<QuorumRole, int32_t, LogPosition, optional<int64_t>>;
-  optional<Watch> previous;
-  bool can_wait = false;
   const auto deadline = steady_clock::now() + milliseconds(request.max_wait_ms);
-  do {
-    if (auto ec = OnWorker([&] {
-          Watch current(role_, epoch_, log_->End(), replication_.HighWatermark());
-          if (previous == current)
-            return error_code{};
-          const bool completing = previous.has_value();
-          previous = current;
-          auto s =
-              replication_.HandleFetch(request, version, NowMs(), WallMs(), response, &can_wait);
-          if (completing)
-            can_wait = false;
-          return s.ok() ? error_code{} : make_error_code(errc::io_error);
-        });
-        ec)
-      return ec;
-    if (!can_wait || steady_clock::now() >= deadline)
-      return {};
-    util::ThisFiber::SleepUntil(min(deadline, steady_clock::now() + milliseconds(25)));
-  } while (!stopping_);
-  return make_error_code(errc::operation_canceled);
+  auto key = fetch_changed_.prepareWait();
+  bool can_wait = false;
+  auto respond = [&](bool initial) {
+    return OnWorker([&] {
+      auto contact = initial ? optional<int64_t>{NowMs()} : nullopt;
+      auto s = replication_.HandleFetch(request, version, contact, WallMs(), response, &can_wait);
+      return s.ok() ? error_code{} : make_error_code(errc::io_error);
+    });
+  };
+  if (auto ec = respond(true); ec || !can_wait || steady_clock::now() >= deadline)
+    return ec;
+
+  // Timeout returns the retained empty response. Waking a parked RPC never adds voter contact.
+  if (fetch_changed_.wait_until(key.epoch(), deadline) == cv_status::timeout)
+    return {};
+  return respond(false);
 }
 
 RaftGroup::RaftGroup(unique_ptr<Impl> impl) : impl_(std::move(impl)) {
@@ -617,6 +674,11 @@ RpcHandlers RaftGroup::Handlers() {
 }
 absl::Status RaftGroup::Visit(Operation operation) {
   return impl_->Visit(operation);
+}
+
+absl::Status RaftGroup::VisitUntil(steady_clock::time_point deadline,
+                                   absl::FunctionRef<absl::Status(State, bool*)> operation) {
+  return impl_->VisitUntil(deadline, operation);
 }
 
 }  // namespace dfly::cluster::raft

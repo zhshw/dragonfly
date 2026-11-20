@@ -215,8 +215,8 @@ absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoc
 }
 
 absl::Status FetchReplication::HandleFetch(const FetchRequest& request, int16_t version,
-                                           int64_t now_ms, int64_t wall_ms, FetchResponse* response,
-                                           bool* can_wait) {
+                                           optional<int64_t> contact_ms, int64_t wall_ms,
+                                           FetchResponse* response, bool* can_wait) {
   *response = {};
   *can_wait = false;
   const auto& state = campaign_.state();
@@ -295,13 +295,15 @@ absl::Status FetchReplication::HandleFetch(const FetchRequest& request, int16_t 
       if (!bytes.ok())
         return DurableFailure(bytes.status());
       part.records.data = *std::move(bytes);
+      if (!contact_ms)
+        break;
       replica_progress_.Record(source, batch_start, log_.End().end_offset, wall_ms);
       const auto& voters = campaign_.voters();
       for (size_t i = 0; i < voters.size(); ++i) {
         if (voters[i].key.Matches(source)) {
           if (observe_applied_)
-            observe_applied_(source, fetch, batch_start, now_ms);
-          epochs_.RecordFetch(source, state.election.epoch, now_ms, batch_start);
+            observe_applied_(source, fetch, batch_start, *contact_ms);
+          epochs_.RecordFetch(source, state.election.epoch, *contact_ms, batch_start);
           UpdateHighWatermark();
           break;
         }

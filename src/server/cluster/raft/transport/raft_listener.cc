@@ -51,12 +51,20 @@ class RaftConnection final : public util::Connection {
 
 }  // namespace
 
-RaftListener::RaftListener(size_t max_request_size, protocol::RpcHandlers handlers)
-    : max_request_size_(max_request_size), handlers_(std::move(handlers)) {
+RaftListener::RaftListener(size_t max_request_size, protocol::RpcHandlers handlers,
+                           std::function<void()> on_pre_shutdown)
+    : max_request_size_(max_request_size),
+      handlers_(std::move(handlers)),
+      on_pre_shutdown_(std::move(on_pre_shutdown)) {
 }
 
 util::Connection* RaftListener::NewConnection(util::fb2::ProactorBase*) {
   return new RaftConnection(max_request_size_, handlers_);
+}
+
+void RaftListener::PreShutdown() {
+  if (on_pre_shutdown_)
+    on_pre_shutdown_();
 }
 
 }  // namespace dfly::cluster::raft

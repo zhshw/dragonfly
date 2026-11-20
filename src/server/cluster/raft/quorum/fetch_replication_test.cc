@@ -174,6 +174,44 @@ TEST_F(FetchReplicationTest, IndependentTwoVoterPartitionsLoseMajorityIndependen
   EXPECT_TRUE(a20.fetch.Append(Batch(1, 5), 5).ok());
 }
 
+TEST_F(FetchReplicationTest, CompletingParkedFetchDoesNotRenewQuorumContact) {
+  auto a = Make(kA), b = Make(kB);
+  Elect(&a, &b);
+
+  // Replicate the leader-change record and let B learn its committed offset.
+  for (int i = 0; i < 2; ++i) {
+    auto fetch = b.fetch.PrepareFetch(kA.id, 18, 0, 1024).value();
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, fetch.sequence, Handle(&a, fetch)).ok());
+  }
+  int applied_reports = 0;
+  a.fetch.SetDataApplyHooks({},
+                            [&](ReplicaKey, const auto&, int64_t, int64_t) { ++applied_reports; });
+  auto parked = b.fetch.PrepareFetch(kA.id, 18, 3000, 1024).value();
+  bool can_wait = false;
+  Handle(&a, parked, &can_wait);
+  ASSERT_TRUE(can_wait);
+  ASSERT_EQ(applied_reports, 1);
+  const int64_t last_contact = now_;
+
+  auto batch = Batch(1, 5);
+  ASSERT_TRUE(a.fetch.Append(batch, 5).ok());
+  now_ += 1000;
+  FetchResponse completed;
+  ASSERT_TRUE(a.fetch
+                  .HandleFetch(parked.request, parked.version, nullopt, now_ + 1000000, &completed,
+                               &can_wait)
+                  .ok());
+  ASSERT_FALSE(can_wait);
+  EXPECT_EQ(completed.responses[0].partitions[0].records.data.value(), batch);
+  EXPECT_EQ(applied_reports, 1);
+
+  vector<EpochNotification> messages;
+  ASSERT_FALSE(a.epochs.Poll(last_contact + 1499, &messages));
+  EXPECT_EQ(a.campaign.state().role, QuorumRole::kLeader);
+  ASSERT_FALSE(a.epochs.Poll(last_contact + 1500, &messages));
+  EXPECT_EQ(a.campaign.state().role, QuorumRole::kResigned);
+}
+
 TEST_F(FetchReplicationTest, VersionedIdentityAndMalformedRequestsDoNotCountAsVoters) {
   auto a = Make(kA), b = Make(kB);
   Elect(&a, &b);

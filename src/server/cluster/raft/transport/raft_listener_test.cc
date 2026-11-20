@@ -9,9 +9,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
+
 #include "server/cluster/raft/transport/peer_connection.h"
 #include "util/accept_server.h"
 #include "util/fibers/pool.h"
+#include "util/fibers/synchronization.h"
 
 namespace dfly::cluster::raft {
 namespace {
@@ -19,9 +22,6 @@ namespace {
 class RaftListenerTest : public testing::Test {
  protected:
   void SetUp() override {
-    pool_.reset(util::fb2::Pool::Epoll(1));
-    pool_->Run();
-    server_ = std::make_unique<util::AcceptServer>(pool_.get(), false);
     auto handler = [](int16_t version, const protocol::VoteRequest& request,
                       protocol::VoteResponse* response) {
       if (request.voter_id == 7 && version >= 1) {
@@ -32,7 +32,14 @@ class RaftListenerTest : public testing::Test {
     };
     protocol::RpcHandlers handlers;
     handlers.vote = handler;
-    auto* listener = new RaftListener(4096, std::move(handlers));
+    StartListener(std::move(handlers));
+  }
+
+  void StartListener(protocol::RpcHandlers handlers, std::function<void()> on_pre_shutdown = {}) {
+    pool_.reset(util::fb2::Pool::Epoll(1));
+    pool_->Run();
+    server_ = std::make_unique<util::AcceptServer>(pool_.get(), false);
+    auto* listener = new RaftListener(4096, std::move(handlers), std::move(on_pre_shutdown));
     ASSERT_FALSE(server_->AddListener("127.0.0.1", 0, listener));
     port_ = listener->socket()->LocalEndpoint().port();
     server_->Run();
@@ -51,7 +58,8 @@ class RaftListenerTest : public testing::Test {
   void TearDown() override {
     if (fd_ >= 0)
       close(fd_);
-    server_->Stop(true);
+    if (server_)
+      server_->Stop(true);
     pool_->Stop();
   }
 
@@ -126,6 +134,31 @@ TEST_F(RaftListenerTest, StorageFailureClosesWithoutAcknowledgement) {
   ASSERT_EQ(write(fd_, wire.data(), wire.size()), static_cast<ssize_t>(wire.size()));
   char byte;
   EXPECT_EQ(read(fd_, &byte, 1), 0);
+}
+
+class ParkedFetchListenerTest : public RaftListenerTest {
+ protected:
+  void SetUp() override {
+    protocol::RpcHandlers handlers;
+    handlers.fetch = [this](int16_t, const protocol::FetchRequest&, protocol::FetchResponse*) {
+      parked_.Notify();
+      EXPECT_TRUE(shutdown_.WaitFor(std::chrono::seconds(5)));
+      return std::make_error_code(std::errc::operation_canceled);
+    };
+    StartListener(std::move(handlers), [this] { shutdown_.Notify(); });
+  }
+
+  util::fb2::Done parked_, shutdown_;
+};
+
+TEST_F(ParkedFetchListenerTest, ShutdownReleasesFetchBeforeDrainingConnections) {
+  std::string wire;
+  ASSERT_EQ(protocol::EncodeRequestFrame({}, protocol::FetchRequest{}, 18, &wire),
+            protocol::CodecError::kOk);
+  ASSERT_EQ(write(fd_, wire.data(), wire.size()), static_cast<ssize_t>(wire.size()));
+  ASSERT_TRUE(parked_.WaitFor(std::chrono::seconds(5)));
+  server_->Stop(true);
+  server_.reset();
 }
 
 }  // namespace

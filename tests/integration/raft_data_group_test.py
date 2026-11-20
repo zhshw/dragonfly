@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+from threading import Barrier
 import time
 import unittest
 
@@ -318,9 +319,26 @@ class RaftDataGroupTest(RaftDataGroupFixture):
         slots = self.wait_for(self.slots)
         master, follower = slots[0][2:4]
         key = self.key_for_range(*slots[0][:2])
+        values = [f"writer-{i}".encode() for i in range(8)]
+        ready = Barrier(len(values))
+
+        def compete(value):
+            with redis.Redis(
+                host=HOST, port=master[1], single_connection_client=True, socket_timeout=7
+            ) as writer:
+                writer.ping()
+                ready.wait(timeout=7)
+                result = writer.set(key, value, nx=True)
+                if result is True:
+                    self.assertEqual(writer.wait(1, 2500), 1)
+                return result
+
         with redis.Redis(host=HOST, port=master[1], single_connection_client=True) as client:
             self.assertIsNone(client.set(key, "missing", xx=True))
-            self.assertTrue(client.set(key, "first", nx=True))
+            with ThreadPoolExecutor(max_workers=len(values)) as workers:
+                results = list(workers.map(compete, values))
+            self.assertCountEqual(results, [True] + [None] * (len(values) - 1))
+            self.assertEqual(client.get(key), values[results.index(True)])
             self.assertIsNone(client.set(key, "ignored", nx=True))
             self.assertTrue(client.set(key, "last", xx=True))
             self.assertEqual(client.get(key), b"last")
