@@ -69,7 +69,7 @@
 | 部署 | 首次建群 | 重启 |
 | --- | --- | --- |
 | `--cluster_mode=yes` | 启动数据节点，外部 manager 通过 `DFLYCLUSTER CONFIG` 下发槽表，通过 `REPLICAOF` 建立主从复制 | manager 向重启节点重新下发当前配置。[manager 管理流程](../cluster-mode.md) |
-| `--cluster_mode=raft` | 为每个节点格式化独立目录，启动 controller 和数据组。控制组首次提交数据组成员、地址和槽范围，各数据组选出 leader | 保留各节点的目录及身份，controller 回放已提交的拓扑，数据组从本组日志恢复 KV。[节点身份与恢复](../../src/server/cluster/raft/bootstrap/raft_directory.cc) |
+| `--cluster_mode=raft` | 为每个节点格式化独立目录，启动 controller 和数据组。控制组首次提交数据组成员、地址和槽范围，各数据组选出 leader | 保留各节点的目录及身份，controller 回放已提交的拓扑，数据组从本组快照和后续已提交日志恢复 KV，首次快照前从日志回放。[节点身份与恢复](../../src/server/cluster/raft/bootstrap/raft_directory.cc) |
 
 构建 `dragonfly` 和 `raft_storage` 后，在各 Raft 节点用 `build-dbg/raft_storage format <新目录> <cluster-id> <整数节点ID>` 初始化身份。用相同参数将 `format` 换成 `verify` 可核对身份。
 

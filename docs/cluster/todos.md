@@ -24,7 +24,7 @@
 - [x] 请求已受理且迁移未完成时终止 active controller。新 active 可以查到相同操作 ID 和原文，并接续完成迁移。另以八个进程验证动态加入的 C4 当选，原数据节点发现 C4 后完成迁槽，重启的数据副本能向 C4 重新注册。[换主与 C4 发现测试](../../tests/integration/raft_data_group_test.py)
 - [x] 终止全部进程，保留七个节点的磁盘，删除引导文件后重新启动。检查槽 42 的归属、`finished` 状态和迁移后的新写入，确认槽 43 的数据仍由组 10 提供。[整群重启测试](../../tests/integration/raft_data_group_test.py)
 
-Dragonfly 在 Linux Debug 上通过 controller 集成测试 6/6、数据组集成测试 7/7。数据组套件中的 Java 客户端真实连接元数据组和两个数据组的 leader，调用 `ApiVersions` v4 和 `DescribeQuorum` v2，检查 leader、HW 和 voter 数量。[控制组用例](../../tests/integration/raft_controller_test.py) · [数据组用例](../../tests/integration/raft_data_group_test.py) · [Java 探针](../../src/server/cluster/raft/protocol/testdata/LiveQuorum.java)
+Dragonfly 在 Linux Debug 上通过 controller 集成测试 6/6、数据组集成测试 8/8。数据组套件中的 Java 客户端真实连接元数据组和两个数据组的 leader，调用 `ApiVersions` v4 和 `DescribeQuorum` v2，检查 leader、HW 和 voter 数量。[控制组用例](../../tests/integration/raft_controller_test.py) · [数据组用例](../../tests/integration/raft_data_group_test.py) · [Java 探针](../../src/server/cluster/raft/protocol/testdata/LiveQuorum.java)
 
 同级 Kafka 仓库 `5b648ca9` 的上游对照测试通过 704 项。raft 模块的 593 项覆盖选举、Fetch、快照和 voter 变更，对应 Dragonfly 的组内协议。metadata 模块的 111 项覆盖 controller 激活、broker 心跳和元数据回放，对应 Dragonfly 的控制面。[上游 Raft 测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft) · [上游元数据测试](../../../kafka/metadata/src/test/java/org/apache/kafka) · [Dragonfly quorum 测试](../../src/server/cluster/raft/quorum) · [Dragonfly 元数据测试](../../src/server/cluster/raft/metadata)
 
@@ -32,19 +32,22 @@ Dragonfly 在 Linux Debug 上通过 controller 集成测试 6/6、数据组集�
 
 KRaft 用排他 offset 和 leader epoch 标识快照。副本缺少可读日志前缀时，leader 在 Fetch 响应中给出快照 ID，副本按字节位置执行 FetchSnapshot，安装后从该 offset 继续 Fetch。Dragonfly 在这套传输中保存本组的 KV 和迁槽状态。[Kafka 快照测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/KafkaRaftClientSnapshotTest.java) · [数据组复制设计](raft-replication-design.md)
 
-- [ ] **状态机**　在已提交并应用的完整批次边界保存各 DB 的 KV、实际持有的槽及 generation、冻结与导入进度。恢复同一 cut 后，旧 generation 继续受限，已应用记录不重复执行。
-- [ ] **本地快照与日志清理**　按新提交的日志字节数或时间生成快照，持久化成功后推进可读日志起点。保留快照及其后的日志，重启时先恢复快照，再回放已提交的后缀。
-- [ ] **落后副本追赶**　落后位置仍在日志内时沿用普通 Fetch，早于保留起点时通过 FetchSnapshot 分块补齐。检查快照身份、大小和内容，安装后继续复制新写入。
-- [ ] **进程验收**　让一台 voter 离线至组内清掉旧前缀，验证它追平、能接任 leader 并读回快照和后缀中的值。迁槽冻结期间重启数据节点，再验证操作恢复、归属和邻槽数据。
+- [x] **状态机**　在已提交并应用的完整批次边界保存各 DB 的 KV、实际持有的槽及 generation、冻结与导入进度。恢复同一 cut 后，旧 generation 继续受限，已应用记录不重复执行。[状态机测试](../../src/server/cluster/raft/data/set_effect_test.cc)
+- [x] **本地快照与日志清理**　按新提交的日志字节数或时间生成快照，持久化成功后推进可读日志起点。保留快照及其后的日志，重启时先恢复快照，再回放已提交的后缀。[快照运行时](../../src/server/cluster/raft/runtime/data_snapshot.cc) · [RDB 恢复测试](../../src/server/cluster/raft/data/kv_rdb_test.cc)
+- [x] **落后副本追赶**　落后位置仍在日志内时沿用普通 Fetch，早于保留起点时通过 FetchSnapshot 分块补齐。检查快照身份、大小和内容，安装后继续复制新写入。[FetchSnapshot 测试](../../src/server/cluster/raft/quorum/snapshot_transfer_test.cc)
+- [x] **进程验收**　让一台 voter 离线至组内清掉旧前缀，验证它追平、能接任 leader 并读回快照和后缀中的值。迁槽冻结期间重启数据节点，再验证操作恢复、归属和邻槽数据。[进程测试](../../tests/integration/raft_data_group_test.py)
+
+双引擎分片的进程用例逐字节比较了 leader 与落后 voter 的快照，文件超过 1 MiB，需要多次 FetchSnapshot。尾部新写达到 `WAIT 2` 后，让恢复的 voter 当选并再次重启，验证两个引擎分片上的值和增量写入。七节点用例还验证了冻结时两个源 voter 从快照恢复、随后迁槽完成及整群重启。Kafka 对照执行了 `MockLogTest` 和 `KafkaRaftClientSnapshotTest` 中的快照提示、分块响应与监听器通知用例。[上游日志测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/MockLogTest.java) · [上游快照测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/KafkaRaftClientSnapshotTest.java)
 
 ## 复现命令
 
-在 Linux 的仓库根目录执行。测试需要 `redis-cli` 和 Python 的 `redis` 包。多进程用例自行分配本地端口，并用与 `dragonfly` 同目录的 `raft_storage` 格式化临时节点目录。运行完整的 7 项数据组用例时，需设置 `KAFKA_TEST_CLASSPATH`，包含编译后的 `LiveQuorum.class` 所在目录、Kafka 客户端及其运行依赖。省略这个变量会跳过 Java 联调用例。[Python 依赖](../../tests/dragonfly/requirements.txt) · [Java 探针源码](../../src/server/cluster/raft/protocol/testdata/LiveQuorum.java)
+在 Linux 的仓库根目录执行。测试需要 `redis-cli` 和 Python 的 `redis` 包。多进程用例自行分配本地端口，并用与 `dragonfly` 同目录的 `raft_storage` 格式化临时节点目录。运行完整的 8 项数据组用例时，需设置 `KAFKA_TEST_CLASSPATH`，包含编译后的 `LiveQuorum.class` 所在目录、Kafka 客户端及其运行依赖。省略这个变量会跳过 Java 联调用例。[Python 依赖](../../tests/dragonfly/requirements.txt) · [Java 探针源码](../../src/server/cluster/raft/protocol/testdata/LiveQuorum.java)
 
 ```sh
 ./helio/blaze.sh -DWITH_GCP=OFF
-ninja -C build-dbg dragonfly raft_storage bootstrap_topology_test admin_command_test slot_migration_test
-ctest --test-dir build-dbg --output-on-failure -R '^(bootstrap_topology|admin_command|slot_migration)_test$'
+ninja -C build-dbg dragonfly raft_storage bootstrap_topology_test admin_command_test slot_migration_test \
+  set_effect_test kv_snapshot_test kv_rdb_test snapshot_transfer_test partition_snapshot_test
+ctest --test-dir build-dbg --output-on-failure -R '^(bootstrap_topology|admin_command|slot_migration|set_effect|kv_snapshot|kv_rdb|snapshot_transfer|partition_snapshot)_test$'
 export DRAGONFLY_PATH=build-dbg/dragonfly
 python3 tests/integration/raft_controller_test.py -v
 python3 tests/integration/raft_data_group_test.py -v

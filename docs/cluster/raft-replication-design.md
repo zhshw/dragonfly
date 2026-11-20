@@ -4,7 +4,7 @@
 
 ## 1. 复制状态机
 
-原图跟踪主节点上的复制会话。Raft 图跟踪组 10 的一个 follower。组内换主时，follower 根据新 leader 的 epoch 和本地日志末端查找共同前缀。当前数据节点沿图中的日志路径恢复，图中的整组 KV 快照安装路径属于后续设计。
+原图跟踪主节点上的复制会话。Raft 图跟踪组 10 的一个 follower。组内换主时，follower 根据新 leader 的 epoch 和本地日志末端查找共同前缀。本地仍有共同日志前缀时继续增量 Fetch；落后位置早于 leader 的日志起点时，follower 安装整组 KV 快照后续拉。
 
 ![副本加载分配、恢复共同前缀或安装快照后进入 Fetch](figures/replica-states.svg)
 
@@ -42,7 +42,7 @@ flowchart LR
 
 ## 2. 握手、全量恢复与增量拉取
 
-`yes` 的副本与主节点协商每线程的 flow，完成同步后接收主节点推送的 journal。`raft` 的副本从元数据发现数据组的入口，由本组协议确认 leader 和 term，按日志位置拉取。两端历史一致时直接进入 Fetch 循环。图中“所需前缀已清理”分支描述接入整组 KV 快照后的追赶流程。
+`yes` 的副本与主节点协商每线程的 flow，完成同步后接收主节点推送的 journal。`raft` 的副本从元数据发现数据组的入口，由本组协议确认 leader 和 term，按日志位置拉取。两端历史一致时直接进入 Fetch 循环。图中“所需前缀已清理”分支走 KRaft FetchSnapshot。leader 在 Fetch 中给出快照 ID，follower 从字节位置 0 开始分块拉取，安装后从快照的排他 offset 继续 Fetch。
 
 ![按组 Fetch、截断分歧与安装 KV 快照](figures/replica-fetch.svg)
 
@@ -110,9 +110,15 @@ sequenceDiagram
 | --- | --- |
 | 控制组元数据 | controller 按大小或时间阈值在稳定 offset 生成快照，恢复时从快照和后续已提交记录重建元数据。[控制器](../../src/server/cluster/raft/runtime/controller.cc) · [元数据快照](../../src/server/cluster/raft/metadata/metadata_snapshot.cc) |
 | 迁槽中的单槽 RDB | 源组冻结该槽后生成 RDB，将分块和摘要写入源组日志。目标组按块拉取、在本组日志中提交并应用安装记录。恢复时重放迁槽记录即可接续。[迁槽驱动](../../src/server/cluster/raft/runtime/slot_migration_driver.cc) · [单槽 RDB](../../src/server/cluster/raft/data/kv_rdb.cc) |
-| 整个数据组的 KV | 已有快照格式与分块安装的单元测试。运行中的数据节点尚未接入整组快照生成、装载及据此截断旧日志前缀的流程。当前重启依靠本组持久日志，按 offset 重放已提交的 SET 效果和迁槽记录。因此磁盘要容纳保留的日志，重启回放量随日志增长。[数据组回放](../../src/server/cluster/raft/data/set_effect.cc) · [整组快照格式测试](../../src/server/cluster/raft/data/kv_snapshot_test.cc) |
+| 整个数据组的 KV | 每个数据副本从本组已提交、已应用的完整批次取 cut，记录 DB 中的值、已物化槽的 generation、冻结与导入进度。快照落在该副本的 `--dir/__dragonfly_data-<group_id>/` 中，文件名记录排他 offset 和 epoch。重启时先装载已提交的本组快照，再从 cut 回放后续日志。尚无快照的旧目录仍可从保留日志恢复。[快照运行时](../../src/server/cluster/raft/runtime/data_snapshot.cc) · [数据组回放](../../src/server/cluster/raft/data/set_effect.cc) |
 
-下图是整组快照的设计，沿用原图的遍历 fiber、bucket 和写 fiber。各执行线程须在同一个已应用位置建立快照，保存对应的 slot generation、冻结状态及暂存迁移数据。所有线程捕获完成后，才可发布该位置的镜像。
+数据节点默认在新增已应用日志达到 20 MiB 或距上次快照达到一小时且有新提交时生成快照。可通过 `--raft_data_snapshot_bytes` 和 `--raft_data_snapshot_interval_ms` 调整，时间阈值为 0 时仅按字节数触发。各执行线程在同一 cut 注册写前保存回调，随后恢复 apply，快照 fiber 继续遍历。槽及 generation 来自本组已应用的写入和迁槽记录，能覆盖控制器已发布新归属、本副本仍在回放旧记录的情况。
+
+快照发布并持久化后，副本推进日志起点，清理已覆盖的旧段。跨过 cut 的物理段保留其末尾可读的批次。下载中断时，未发布的文件可丢弃并重新拉取。接收端在替换日志前检查成员配置、组身份、cut、分块内容和 SHA-256、迁槽进度及 RDB；恢复整个数据进程时还会清除该副本先前持有而当前镜像已移出的槽。快照捕获及装载期间会在内存中持有整组 RDB，应用层还需容纳迁槽暂存数据。写盘、校验和装载占用本组 worker，大镜像可能延迟心跳或触发重新选主。若实际装载时内存不足，节点停止对该组提供服务；释放资源并重启后，会从已持久化的快照重新装载。[日志保留](../../src/server/cluster/raft/log/partition_snapshot.cc) · [快照接收](../../src/server/cluster/raft/quorum/snapshot_transfer.cc)
+
+已清理数据日志前缀的副本需要能装载整组快照的版本才能重启；落后于该起点的副本需要支持数据组 FetchSnapshot。
+
+下图沿用原图的遍历 fiber、bucket 和写 fiber，展示在 cut 后继续应用写入时怎样保留旧值。
 
 ![组快照与并发 apply 的 bucket 保存顺序](figures/replica-snapshot.svg)
 
