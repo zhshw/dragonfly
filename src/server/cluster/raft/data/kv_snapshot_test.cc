@@ -40,6 +40,10 @@ TEST(KvSnapshotTest, CarriesScopeDataAndFrozenImportsAcrossChunkTransferAndResta
     auto chunk = log->ReadSnapshot(scope.cut, writer->position(), 71'000).value();
     ASSERT_TRUE(writer->Append(writer->position(), chunk.bytes).ok());
   }
+  auto pending = ReadKvSnapshot(*writer, "cluster1", 10);
+  ASSERT_TRUE(pending.ok()) << pending.status();
+  EXPECT_EQ(pending->rdb, rdb);
+  EXPECT_FALSE(ReadKvSnapshot(*writer, "cluster1", 20).ok());
   ASSERT_TRUE(replica->InstallSnapshot(writer.get(), 0).ok());
   writer.reset();
   replica.reset();

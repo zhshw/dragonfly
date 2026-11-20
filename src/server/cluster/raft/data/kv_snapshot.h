@@ -38,4 +38,8 @@ absl::Status WriteKvSnapshot(const KvSnapshotScope& scope, std::string_view rdb,
 absl::StatusOr<KvSnapshot> ReadKvSnapshot(const PartitionLog& log, LogPosition id,
                                           std::string_view cluster_id, int32_t group_id);
 
+// Validate a completed download before publishing it or changing the retained log.
+absl::StatusOr<KvSnapshot> ReadKvSnapshot(const SnapshotWriter& writer, std::string_view cluster_id,
+                                          int32_t group_id);
+
 }  // namespace dfly::cluster::raft

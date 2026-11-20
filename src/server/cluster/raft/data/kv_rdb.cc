@@ -26,12 +26,26 @@ void ScheduleGlobal(Service& service, std::string_view command, Transaction::Run
   tx->ScheduleSingleHop(cb);
 }
 
+absl::Status LoadKvRdb(Service& service, const SlotSet& slots, std::string_view bytes,
+                       bool validate) {
+  io::BytesSource source(bytes);
+  RdbLoadContext context;
+  RdbLoader loader(&service, &context);
+  loader.SetSlotImage(slots, validate);
+  loader.set_source_limit(bytes.size());
+  if (auto ec = loader.Load(&source); ec)
+    return absl::DataLossError(absl::StrCat("Invalid slot RDB: ", ec.message()));
+  if (loader.bytes_read() - loader.Leftover().size() != bytes.size())
+    return absl::DataLossError("Trailing bytes in KV RDB");
+  return absl::OkStatus();
+}
+
 }  // namespace
 
 absl::Status SaveKvRdb(Service& service, const SlotSet& slots, io::Sink* destination,
                        absl::FunctionRef<void()> on_cut) {
-  if (!destination || slots.Empty())
-    return absl::InvalidArgumentError("KV RDB requires a destination and assigned slots");
+  if (!destination)
+    return absl::InvalidArgumentError("KV RDB requires a destination");
   RdbSaver saver(destination, SaveMode::RDB, false, {}, DflyVersion::CURRENT_VER);
   ExecutionState state;
   if (auto ec = saver.SaveHeader({}); ec)
@@ -69,22 +83,24 @@ absl::Status InstallKvRdb(Service* service, const SlotRanges& ranges, std::strin
       return absl::InvalidArgumentError("Invalid KV RDB slot range");
   }
   SlotSet slots(ranges);
-  auto load = [&](bool validate) {
-    io::BytesSource source(bytes);
-    RdbLoadContext context;
-    RdbLoader loader(service, &context);
-    loader.SetSlotImage(slots, validate);
-    loader.set_source_limit(bytes.size());
-    if (auto ec = loader.Load(&source); ec)
-      return absl::DataLossError(absl::StrCat("Invalid slot RDB: ", ec.message()));
-    if (loader.bytes_read() - loader.Leftover().size() != bytes.size())
-      return absl::DataLossError("Trailing bytes in KV RDB");
-    return absl::OkStatus();
-  };
-  if (auto s = load(true); !s.ok())
+  if (auto s = ValidateKvRdb(*service, slots, bytes); !s.ok())
     return s;
   ClearKvSlots(*service, ranges);
-  return load(false);
+  return LoadKvRdb(*service, slots, bytes, false);
+}
+
+absl::Status ValidateKvRdb(Service& service, const SlotSet& slots, std::string_view bytes) {
+  return LoadKvRdb(service, slots, bytes, true);
+}
+
+absl::Status RestoreGroupKvRdb(Service& service, const SlotSet& slots, std::string_view bytes) {
+  if (auto s = ValidateKvRdb(service, slots, bytes); !s.ok())
+    return s;
+
+  // Each data process owns one group. A snapshot also replaces keys in slots which this
+  // replica has lost since its last applied offset.
+  ClearKvSlots(service, SlotRanges({{0, kMaxSlotNum}}));
+  return LoadKvRdb(service, slots, bytes, false);
 }
 
 }  // namespace dfly::cluster::raft

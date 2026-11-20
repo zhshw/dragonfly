@@ -2658,7 +2658,7 @@ auto RdbLoader::LoadImpl(io::Source* src) -> Error {
   auto cleanup = absl::Cleanup([&] { FinishLoad(start, &keys_loaded); });
 
   // Increment local one if it exists
-  if (EngineShard* es = EngineShard::tlocal(); es) {
+  if (!validate_image_ && EngineShard::tlocal()) {
     GetCurrentDbSlice().IncrLoadInProgress();
   }
 
@@ -2981,7 +2981,7 @@ void RdbLoader::FinishLoad(absl::Time start_time, size_t* keys_loaded) {
   if (!shards_drained_)  // early-return paths skip the in-Load drain
     FlushAndWaitShards();
   // Decrement local one if it exists
-  if (EngineShard* es = EngineShard::tlocal(); es) {
+  if (!validate_image_ && EngineShard::tlocal()) {
     GetCurrentDbSlice().DecrLoadInProgress();
   }
 
@@ -3363,9 +3363,11 @@ void RdbLoader::FlushShardAsync(ShardId sid) {
     // Before we start loading, increment LoadInProgress.
     // This is required because FlushShardAsync dispatches to multiple shards, and those shards
     // might have not yet have their state (load in progress) incremented.
-    db_slice.IncrLoadInProgress();
+    if (!validate_image_)
+      db_slice.IncrLoadInProgress();
     this->LoadItemsBuffer(ib);
-    db_slice.DecrLoadInProgress();
+    if (!validate_image_)
+      db_slice.DecrLoadInProgress();
   };
 
   bool preempted = shard_set->Add(sid, std::move(cb));
@@ -3485,6 +3487,11 @@ void RdbLoader::CreateObjectOnShard(const DbContext& db_cntx, const Item* item, 
     return;
   }
 
+  // Validation constructs the complete object on its shard, including continuation chunks.
+  // Discard it here before accessing the destination DB, which may not exist yet.
+  if (validate_image_)
+    return;
+
   if (item->expire_ms > 0 && db_cntx.time_now_ms >= item->expire_ms) {
     VLOG(2) << "Expire key on load: " << item->key;
     return;
@@ -3543,7 +3550,8 @@ void RdbLoader::LoadItemsBuffer(const ItemsBuf& ib) {
 
   // Inserts may garbage-collect expired keys. We run outside a transaction callback, so
   // OnCbFinishBlocking will not send their expired events.
-  db_slice.SendQueuedExpiredKeyEvents();
+  if (!validate_image_)
+    db_slice.SendQueuedExpiredKeyEvents();
 
   for (auto* item : ib) {
     item_queue_.Push(item);
@@ -3666,7 +3674,7 @@ auto RdbLoader::ReadAndDispatchObject(int object_type, std::string& key,
     return finalized;
   }
 
-  if (validate_image_ || (!image_slots_ && GetFlag(FLAGS_rdb_load_dry_run))) {
+  if (!image_slots_ && GetFlag(FLAGS_rdb_load_dry_run)) {
     return finalized;
   }
 
@@ -3679,6 +3687,7 @@ auto RdbLoader::ReadAndDispatchObject(int object_type, std::string& key,
       // finalize is the post-read state and tells the caller whether this call finished reading
       // the object or has remaining data to read.
       .finalize = finalized,
+      .deep_integrity = validate_image_,
   };
   pending_read_.reserve = 0;
 
@@ -3700,8 +3709,10 @@ auto RdbLoader::ReadAndDispatchObject(int object_type, std::string& key,
     const DbContext db_cntx{&namespaces->GetDefaultNamespace(), db_index, GetCurrentTimeMs()};
     DbSlice& db_slice = db_cntx.GetDbSlice(sid);
     CreateObjectOnShard(db_cntx, item, &db_slice);
+
     // See LoadItemsBuffer: no transaction callback will send GC expired events for us.
-    db_slice.SendQueuedExpiredKeyEvents();
+    if (!validate_image_)
+      db_slice.SendQueuedExpiredKeyEvents();
   } else {
     auto& out_buf = shard_buf_[sid];
     out_buf.emplace_back(item);

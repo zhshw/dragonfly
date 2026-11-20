@@ -28,8 +28,8 @@ struct Manifest {
 
 bool Valid(const Manifest& m) {
   if (m.scope.cluster_id.empty() || m.scope.group_id < 0 || m.scope.cut.epoch < 0 ||
-      m.scope.cut.end_offset <= 0 || m.scope.slots.empty() || m.rdb_size < 9 ||
-      m.rdb_hash.size() != SHA256_DIGEST_LENGTH || m.migrations_hash.size() != SHA256_DIGEST_LENGTH)
+      m.scope.cut.end_offset <= 0 || m.rdb_size < 9 || m.rdb_hash.size() != SHA256_DIGEST_LENGTH ||
+      m.migrations_hash.size() != SHA256_DIGEST_LENGTH)
     return false;
   int previous = -1;
   for (const auto& r : m.scope.slots) {
@@ -144,20 +144,23 @@ absl::Status WriteKvSnapshot(const KvSnapshotScope& scope, string_view rdb, stri
   return log->InstallSnapshot(writer->get(), hw);
 }
 
-absl::StatusOr<KvSnapshot> ReadKvSnapshot(const PartitionLog& log, LogPosition id,
-                                          string_view cluster_id, int32_t group_id) {
+namespace {
+using ReadChunk = absl::FunctionRef<absl::StatusOr<SnapshotChunk>(int64_t, size_t)>;
+
+absl::StatusOr<KvSnapshot> DecodeKvSnapshot(LogPosition id, string_view cluster_id,
+                                            int32_t group_id, ReadChunk read) {
   optional<Manifest> manifest;
   KvSnapshot snapshot;
   int64_t pos = 0, size;
   do {
-    auto prefix = log.ReadSnapshot(id, pos, 12);
+    auto prefix = read(pos, 12);
     if (!prefix.ok())
       return prefix.status();
     size = prefix->total_size;
     auto len = RecordBatchSize(prefix->bytes);
     if (!len.ok())
       return len.status();
-    auto frame = log.ReadSnapshot(id, pos, *len);
+    auto frame = read(pos, *len);
     if (!frame.ok())
       return frame.status();
     vector<RecordView> records;
@@ -193,6 +196,20 @@ absl::StatusOr<KvSnapshot> ReadKvSnapshot(const PartitionLog& log, LogPosition i
     return absl::DataLossError("KV snapshot length or SHA256 mismatch");
   snapshot.scope = std::move(manifest->scope);
   return snapshot;
+}
+
+}  // namespace
+
+absl::StatusOr<KvSnapshot> ReadKvSnapshot(const PartitionLog& log, LogPosition id,
+                                          string_view cluster_id, int32_t group_id) {
+  return DecodeKvSnapshot(id, cluster_id, group_id,
+                          [&](int64_t pos, size_t len) { return log.ReadSnapshot(id, pos, len); });
+}
+
+absl::StatusOr<KvSnapshot> ReadKvSnapshot(const SnapshotWriter& writer, string_view cluster_id,
+                                          int32_t group_id) {
+  return DecodeKvSnapshot(writer.id(), cluster_id, group_id,
+                          [&](int64_t pos, size_t len) { return writer.Read(pos, len); });
 }
 
 }  // namespace dfly::cluster::raft
