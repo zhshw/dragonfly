@@ -125,6 +125,12 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
       Advertise<DescribeQuorumRequest>(&response);
     if (handlers.fetch_snapshot)
       Advertise<FetchSnapshotRequest>(&response);
+    if (handlers.add_voter)
+      Advertise<AddRaftVoterRequest>(&response);
+    if (handlers.remove_voter)
+      Advertise<RemoveRaftVoterRequest>(&response);
+    if (handlers.update_voter)
+      Advertise<UpdateRaftVoterRequest>(&response);
   } else {
     response.error_code = kInvalidRequest;
   }
@@ -237,6 +243,15 @@ FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
     case FetchSnapshotRequest::kApiKey:
       dispatched = Dispatch(version, correlation_id, &reader, handlers.fetch_snapshot, response);
       break;
+    case AddRaftVoterRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.add_voter, response);
+      break;
+    case RemoveRaftVoterRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.remove_voter, response);
+      break;
+    case UpdateRaftVoterRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.update_voter, response);
+      break;
     default:
       return {FrameStatus::kUnknownApi};
   }
@@ -328,6 +343,41 @@ CodecError EncodeRequestFrame(const RequestMetadata& metadata, const FetchSnapsh
 
 FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
                                 int32_t correlation_id, FetchSnapshotResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata, const AddRaftVoterRequest& request,
+                              int16_t version, std::string* output) {
+  return WriteRequest(metadata, request, version, AddRaftVoterRequest::HeaderVersion(version),
+                      output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, AddRaftVoterResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata,
+                              const RemoveRaftVoterRequest& request, int16_t version,
+                              std::string* output) {
+  return WriteRequest(metadata, request, version, RemoveRaftVoterRequest::HeaderVersion(version),
+                      output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, RemoveRaftVoterResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata,
+                              const UpdateRaftVoterRequest& request, int16_t version,
+                              std::string* output) {
+  return WriteRequest(metadata, request, version, UpdateRaftVoterRequest::HeaderVersion(version),
+                      output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, UpdateRaftVoterResponse* response) {
   return ReadResponse(input, max_payload_size, version, correlation_id, response);
 }
 

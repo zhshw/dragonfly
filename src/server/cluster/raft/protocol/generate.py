@@ -180,9 +180,10 @@ def header_constants(headers, flexible):
     return constants
 
 
-def generate(schema_dir, names, stem):
+def generate(schema_dir, names, stem, source="Kafka message schemas"):
+    notice = NOTICE.replace("Kafka message schemas", source)
     header = [
-        NOTICE,
+        notice,
         "#pragma once",
         "",
         "#include <optional>",
@@ -195,7 +196,7 @@ def generate(schema_dir, names, stem):
         "",
     ]
     impl = [
-        NOTICE,
+        notice,
         f'#include "server/cluster/raft/protocol/{stem}.h"',
         "",
         '#include "server/cluster/raft/protocol/flexible_message.h"',
@@ -215,17 +216,22 @@ def generate(schema_dir, names, stem):
         versions = schema["validVersions"].split("-")
         low, high = int(versions[0]), int(versions[-1])
         constants = [
-            f"static constexpr int16_t kApiKey = {schema['apiKey']};",
             f"static constexpr int16_t kMinVersion = {low};",
             f"static constexpr int16_t kMaxVersion = {high};",
             f"static constexpr int16_t kFirstFlexibleVersion = {flexible};",
         ]
+        if "apiKey" in schema:
+            constants.insert(0, f"static constexpr int16_t kApiKey = {schema['apiKey']};")
         if "headerVersions" in schema:
             constants.extend(header_constants(schema["headerVersions"], flexible))
         constants.append("")
         common = {struct["name"]: struct for struct in schema.get("commonStructs", [])}
         emit_struct(name, schema["fields"], constants, header, impl, flexible, common)
-        if schema["type"] == "metadata":
+        if schema["type"] == "data":
+            header.append(
+                "// Encode or decode one control record value, including its embedded version."
+            )
+        elif schema["type"] == "metadata":
             header.append("// Encode or decode one metadata record body without its serde header.")
         else:
             header.append(
@@ -266,12 +272,20 @@ if __name__ == "__main__":
         ("Fetch", "fetch"),
         ("DescribeQuorum", "describe_quorum"),
         ("FetchSnapshot", "fetch_snapshot"),
+        ("AddRaftVoter", "add_voter"),
+        ("RemoveRaftVoter", "remove_voter"),
+        ("UpdateRaftVoter", "update_voter"),
     ]:
         generate(
             kafka / "clients/src/main/resources/common/message",
             [api + "Request", api + "Response"],
             stem,
         )
+    generate(
+        kafka / "clients/src/main/resources/common/message",
+        ["KRaftVersionRecord", "VotersRecord"],
+        "voter_records",
+    )
     generate(
         kafka / "metadata/src/main/resources/common/metadata",
         [

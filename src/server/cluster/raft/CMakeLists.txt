@@ -10,6 +10,7 @@ add_library(dfly_raft
             log/snapshot_file.cc
             metadata/metadata_image.cc
             metadata/record_serde.cc
+            protocol/add_voter.cc
             protocol/api_versions.cc
             protocol/begin_epoch.cc
             protocol/describe_quorum.cc
@@ -17,8 +18,11 @@ add_library(dfly_raft
             protocol/fetch.cc
             protocol/fetch_snapshot.cc
             protocol/metadata_records.cc
+            protocol/remove_voter.cc
             protocol/rpc_frame.cc
+            protocol/update_voter.cc
             protocol/vote.cc
+            protocol/voter_records.cc
             quorum/campaign.cc
             quorum/describe.cc
             quorum/election.cc

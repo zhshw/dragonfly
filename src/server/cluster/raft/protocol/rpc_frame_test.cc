@@ -401,6 +401,68 @@ TEST(RpcFrameTest, KafkaJavaDescribeQuorumVersions) {
   }
 }
 
+TEST(RpcFrameTest, JavaVoterReconfigurationFrames) {
+  // VoterVectors.java uses RequestUtils.serialize for these complete, length-prefixed frames.
+  constexpr std::string_view requests[] = {
+      "00000032005000000102030400016b000263000001f400000001000000000000000000000000000000020205"
+      "52414654026223290000",
+      "00000033005000010102030400016b000263000001f400000001000000000000000000000000000000020205"
+      "5241465402622329000000",
+      "00000023005100000102030400016b000263000000010000000000000000000000000000000200",
+      "00000037005200000102030400016b0002630000000300000001000000000000000000000000000000020205"
+      "524146540262232900000000010000",
+  };
+  constexpr std::string_view replies[] = {
+      "00000016010203040000000000007e0a6475706c696361746500",
+      "00000016010203040000000000007e0a6475706c696361746500",
+      "0000000d010203040000000000007f0100",
+      "0000001d010203040000000000000001000f000000020000000302610000232800",
+  };
+  RpcHandlers handlers;
+  size_t index = 0;
+  auto roundtrip = [&](int16_t version, const auto& request) {
+    std::string bytes;
+    EXPECT_EQ(EncodeRequestFrame({kCorrelationId, "k", {}}, request, version, &bytes),
+              CodecError::kOk);
+    EXPECT_EQ(bytes, FromHex(requests[index]));
+    EXPECT_EQ(request.voter_id, 1);
+    EXPECT_EQ(request.voter_directory_id.back(), 2);
+  };
+  handlers.add_voter = [&](int16_t version, const AddRaftVoterRequest& request,
+                           AddRaftVoterResponse* out) {
+    roundtrip(version, request);
+    EXPECT_EQ(request.ack_when_committed, version == 0);
+    EXPECT_EQ(request.listeners.at(0).port, 9001);
+    out->error_code = 126;
+    out->error_message = "duplicate";
+    return std::error_code{};
+  };
+  handlers.remove_voter = [&](int16_t version, const RemoveRaftVoterRequest& request,
+                              RemoveRaftVoterResponse* out) {
+    roundtrip(version, request);
+    out->error_code = 127;
+    return std::error_code{};
+  };
+  handlers.update_voter = [&](int16_t version, const UpdateRaftVoterRequest& request,
+                              UpdateRaftVoterResponse* out) {
+    roundtrip(version, request);
+    EXPECT_EQ(request.k_raft_version_feature.max_supported_version, 1);
+    out->current_leader.leader_id = 2;
+    out->current_leader.leader_epoch = 3;
+    out->current_leader.host = "a";
+    out->current_leader.port = 9000;
+    return std::error_code{};
+  };
+  for (index = 0; index < std::size(requests); ++index) {
+    std::string reply;
+    auto request = FromHex(requests[index]);
+    ASSERT_EQ(DispatchRpcFrame(request, kMaxFrame, {}, &reply).status, FrameStatus::kUnknownApi);
+    ASSERT_EQ(DispatchRpcFrame(request, kMaxFrame, handlers, &reply).status,
+              FrameStatus::kComplete);
+    EXPECT_EQ(reply, FromHex(replies[index]));
+  }
+}
+
 TEST(RpcFrameTest, KafkaJavaApiVersionsFeatureTags) {
   auto frame = FromHex(
       "000000450102030400000100000000040014020e6b726166742e76657273696f6e00000001000108"

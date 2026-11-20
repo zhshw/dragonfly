@@ -7,12 +7,15 @@
 #include <functional>
 #include <system_error>
 
+#include "server/cluster/raft/protocol/add_voter.h"
 #include "server/cluster/raft/protocol/api_versions.h"
 #include "server/cluster/raft/protocol/begin_epoch.h"
 #include "server/cluster/raft/protocol/describe_quorum.h"
 #include "server/cluster/raft/protocol/end_epoch.h"
 #include "server/cluster/raft/protocol/fetch.h"
 #include "server/cluster/raft/protocol/fetch_snapshot.h"
+#include "server/cluster/raft/protocol/remove_voter.h"
+#include "server/cluster/raft/protocol/update_voter.h"
 #include "server/cluster/raft/protocol/vote.h"
 
 namespace dfly::cluster::raft::protocol {
@@ -42,6 +45,9 @@ inline constexpr int16_t kMinRaftFetchVersion = 13;
 
 struct RpcHandlers {
   VoteHandler vote;
+  RpcHandler<AddRaftVoterRequest, AddRaftVoterResponse> add_voter;
+  RpcHandler<RemoveRaftVoterRequest, RemoveRaftVoterResponse> remove_voter;
+  RpcHandler<UpdateRaftVoterRequest, UpdateRaftVoterResponse> update_voter;
   RpcHandler<BeginQuorumEpochRequest, BeginQuorumEpochResponse> begin_epoch;
   RpcHandler<EndQuorumEpochRequest, EndQuorumEpochResponse> end_epoch;
   RpcHandler<DescribeQuorumRequest, DescribeQuorumResponse> describe_quorum;
@@ -121,5 +127,26 @@ struct RequestMetadata {
 [[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
                                               int16_t version, int32_t correlation_id,
                                               FetchSnapshotResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const AddRaftVoterRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              AddRaftVoterResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const RemoveRaftVoterRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              RemoveRaftVoterResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const UpdateRaftVoterRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              UpdateRaftVoterResponse* response);
 
 }  // namespace dfly::cluster::raft::protocol
