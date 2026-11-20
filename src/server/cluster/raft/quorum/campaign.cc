@@ -157,6 +157,11 @@ error_code ElectionCampaign::OnElectionTimeout() {
     return make_error_code(errc::operation_not_permitted);
   if (state_.role == QuorumRole::kProspective)
     return LosePreVote();
+  if (state_.role == QuorumRole::kResigned) {
+    if (state_.election.epoch == numeric_limits<int32_t>::max())
+      return make_error_code(errc::value_too_large);
+    return FollowLeader(state_.election.epoch + 1, nullopt, {});
+  }
   return StartRound(VoteType::kPreVote);
 }
 
@@ -205,7 +210,8 @@ error_code ElectionCampaign::FollowLeader(int32_t epoch, optional<int32_t> leade
                  (epoch == current.epoch && current.leader_id && current.leader_id != leader)))
     return make_error_code(errc::protocol_error);
 
-  if (epoch == current.epoch && (!leader || current.leader_id == leader))
+  if (epoch == current.epoch &&
+      (!leader || (current.leader_id == leader && (leader_endpoint_ || endpoints.empty()))))
     return {};
 
   optional<Endpoint> endpoint;
@@ -297,6 +303,36 @@ error_code ElectionCampaign::ReceiveVote(const protocol::VoteRequest& request, i
              previous_vote != state_.election.voted_key) {
     return StartRound(VoteType::kPreVote);
   }
+  return {};
+}
+
+error_code ElectionCampaign::ObserveLeader(int32_t epoch, std::optional<int32_t> leader_id,
+                                           optional<QuorumEndpoint> address) {
+  if (state_.storage_error)
+    return state_.storage_error;
+  if (!recovered_ || (leader_id && *leader_id < 0) || epoch < state_.election.epoch)
+    return make_error_code(errc::invalid_argument);
+  if (state_.role == QuorumRole::kLeader && leader_id == target_.local_replica.id &&
+      epoch == state_.election.epoch)
+    return {};
+  vector<Endpoint> endpoints;
+  if (address && leader_id) {
+    auto& endpoint = endpoints.emplace_back();
+    endpoint.node_id = *leader_id;
+    endpoint.host = std::move(address->host);
+    endpoint.port = address->port;
+  }
+  return FollowLeader(epoch, leader_id, endpoints);
+}
+
+error_code ElectionCampaign::Resign(int32_t epoch) {
+  if (state_.storage_error)
+    return state_.storage_error;
+  if (state_.role != QuorumRole::kLeader || epoch != state_.election.epoch)
+    return make_error_code(errc::operation_not_permitted);
+  state_.role = QuorumRole::kResigned;
+  pending_.clear();
+  round_.reset();
   return {};
 }
 

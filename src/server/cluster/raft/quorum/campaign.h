@@ -49,6 +49,21 @@ class ElectionCampaign {
   [[nodiscard]] std::error_code ReceiveVote(const protocol::VoteRequest& request, int16_t version,
                                             LogPosition log_end, protocol::VoteResponse* response);
 
+  // Follow an elected leader learned from epoch notifications or Fetch. A missing
+  // advertised endpoint is resolved through this quorum's voter configuration.
+  [[nodiscard]] std::error_code ObserveLeader(int32_t epoch, std::optional<int32_t> leader_id,
+                                              std::optional<QuorumEndpoint> address);
+
+  // Resignation is volatile. Restarting from the stored leader record also resumes resigned.
+  [[nodiscard]] std::error_code Resign(int32_t epoch);
+
+  const VoteTarget& target() const {
+    return target_;
+  }
+  const std::vector<CampaignVoter>& voters() const {
+    return voters_;
+  }
+
   // Called only when Fetch succeeds from the current leader in the specified epoch.
   void MarkFetchedFromLeader(int32_t leader_id, int32_t epoch);
 
