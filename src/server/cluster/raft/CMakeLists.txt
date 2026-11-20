@@ -24,6 +24,7 @@ add_library(dfly_raft
             quorum/epoch_control.cc
             quorum/fetch_replication.cc
             quorum/replica_progress.cc
+            quorum/snapshot_transfer.cc
             quorum/vote_handler.cc
             replication/high_watermark.cc
             storage/file_quorum_state_store.cc)
@@ -48,6 +49,7 @@ helio_cxx_test(quorum/describe_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/election_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/epoch_control_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/fetch_replication_test dfly_raft LABELS DFLY)
+helio_cxx_test(quorum/snapshot_transfer_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/vote_handler_test dfly_raft LABELS DFLY)
 helio_cxx_test(replication/high_watermark_test dfly_raft LABELS DFLY)
 helio_cxx_test(storage/file_quorum_state_store_test dfly_raft LABELS DFLY)

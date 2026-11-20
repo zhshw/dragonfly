@@ -57,8 +57,16 @@ class FetchReplication {
   [[nodiscard]] absl::Status ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
                                                   const protocol::FetchResponse& response,
                                                   bool* reset_fetch_timeout = nullptr);
-  const auto& RequestedSnapshot() const {
+  std::optional<LogPosition> RequestedSnapshot() const {
+    const auto& state = campaign_.state();
+    if (state.role != QuorumRole::kFollower || state.election.epoch != request_epoch_ ||
+        state.storage_error)
+      return std::nullopt;
     return requested_snapshot_;
+  }
+  void AbandonSnapshot(LogPosition snapshot_id) {
+    if (requested_snapshot_ == snapshot_id)
+      requested_snapshot_.reset();
   }
 
   // Resume polling after the owner has atomically installed the requested snapshot.
