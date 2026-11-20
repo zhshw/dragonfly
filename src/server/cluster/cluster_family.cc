@@ -368,62 +368,55 @@ void ClusterFamily::ClusterNodes(SinkReplyBuilder* builder, ConnectionContext* c
 }
 
 namespace {
-void ClusterInfoImpl(const ClusterShardInfos& config, SinkReplyBuilder* builder) {
+struct ClusterInfoStats {
+  unsigned slots_assigned = 0;
+  unsigned slots_ok = 0;
+  size_t known_nodes = 0;
+  size_t cluster_size = 0;
+};
+
+void ClusterInfoImpl(ClusterInfoStats stats, bool raft, SinkReplyBuilder* builder) {
   std::string msg;
   auto append = [&msg](absl::AlphaNum a1, absl::AlphaNum a2) {
     // Separate lines with \r\n, not \n, see #2726
     absl::StrAppend(&msg, a1, ":", a2, "\r\n");
   };
 
-  // Initialize response variables to emulated mode.
-  string_view state = "ok"sv;
-  SlotId slots_assigned = kMaxSlotNum + 1;
-  size_t known_nodes = 1;
-  long epoch = 1;
-  size_t cluster_size = 1;
-
-  if (config.empty()) {
-    state = "fail"sv;
-    slots_assigned = 0;
-    cluster_size = 0;
-    known_nodes = 0;
-  } else {
-    known_nodes = 0;
-    cluster_size = 0;
-    for (const auto& shard_config : config) {
-      known_nodes += 1;  // For master
-      known_nodes += shard_config.replicas.size();
-
-      if (!shard_config.slot_ranges.Empty()) {
-        ++cluster_size;
-      }
-    }
-  }
-
-  append("cluster_state", state);
-  append("cluster_slots_assigned", slots_assigned);
-  append("cluster_slots_ok", slots_assigned);  // We do not support other failed nodes.
+  append("cluster_state", stats.slots_ok == kMaxSlotNum + 1 ? "ok" : "fail");
+  append("cluster_slots_assigned", stats.slots_assigned);
+  append("cluster_slots_ok", stats.slots_ok);
   append("cluster_slots_pfail", 0);
-  append("cluster_slots_fail", 0);
-  append("cluster_known_nodes", known_nodes);
-  append("cluster_size", cluster_size);
-  append("cluster_current_epoch", epoch);
-  append("cluster_my_epoch", 1);
-  append("cluster_stats_messages_ping_sent", 1);
-  append("cluster_stats_messages_pong_sent", 1);
-  append("cluster_stats_messages_sent", 1);
-  append("cluster_stats_messages_ping_received", 1);
-  append("cluster_stats_messages_pong_received", 1);
+  append("cluster_slots_fail", stats.slots_assigned - stats.slots_ok);
+  append("cluster_known_nodes", stats.known_nodes);
+  append("cluster_size", stats.cluster_size);
+
+  // Raft groups have independent terms and do not exchange Redis cluster-bus messages.
+  const unsigned legacy_value = raft ? 0 : 1;
+  append("cluster_current_epoch", legacy_value);
+  append("cluster_my_epoch", legacy_value);
+  append("cluster_stats_messages_ping_sent", legacy_value);
+  append("cluster_stats_messages_pong_sent", legacy_value);
+  append("cluster_stats_messages_sent", legacy_value);
+  append("cluster_stats_messages_ping_received", legacy_value);
+  append("cluster_stats_messages_pong_received", legacy_value);
   append("cluster_stats_messages_meet_received", 0);
-  append("cluster_stats_messages_received", 1);
+  append("cluster_stats_messages_received", legacy_value);
   auto* rb = static_cast<RedisReplyBuilder*>(builder);
   rb->SendBulkString(msg);
 }
 }  // namespace
 
 void ClusterFamily::ClusterInfo(SinkReplyBuilder* builder, ConnectionContext* cntx) {
+  ClusterInfoStats stats;
   auto shard_infos = GetShardInfos(cntx);
-  return ClusterInfoImpl(shard_infos.value_or(ClusterShardInfos{}), builder);
+  if (shard_infos && !shard_infos->empty()) {
+    stats.slots_assigned = stats.slots_ok = kMaxSlotNum + 1;
+    for (const auto& shard : *shard_infos) {
+      stats.known_nodes += 1 + shard.replicas.size();
+      stats.cluster_size += !shard.slot_ranges.Empty();
+    }
+  }
+  return ClusterInfoImpl(stats, false, builder);
 }
 
 void ClusterFamily::KeySlot(facade::ParsedArgs args, SinkReplyBuilder* builder) {
@@ -468,7 +461,14 @@ void ClusterFamily::Cluster(CmdArgParser parser, CommandContext* cmd_cntx) {
       return ClusterShardsImpl(std::move(topology->shards), builder);
     if (sub_cmd == "NODES")
       return ClusterNodesImpl(topology->shards, topology->local_node_id, builder);
-    return ClusterInfoImpl(topology->shards, builder);
+    ClusterInfoStats stats{.slots_assigned = kMaxSlotNum + 1,
+                           .known_nodes = topology->known_nodes,
+                           .cluster_size = topology->assigned_groups};
+    for (const auto& shard : topology->shards) {
+      for (const auto& range : shard.slot_ranges)
+        stats.slots_ok += range.end - range.start + 1;
+    }
+    return ClusterInfoImpl(stats, true, builder);
   }
 
   auto* cntx = cmd_cntx->server_conn_cntx();

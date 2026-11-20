@@ -13,6 +13,7 @@
 #include "facade/parsed_command.h"
 #include "facade/reply_mode.h"
 #include "server/acl/acl_commands_def.h"
+#include "server/cluster/raft/data/write_position.h"
 #include "server/common.h"
 #include "server/tx_base.h"
 #include "server/version.h"
@@ -339,6 +340,7 @@ struct ConnectionState {
 
  public:
   DbIndex db_index = 0;
+  std::optional<cluster::raft::DataWritePosition> raft_last_write;
 
   ExecInfo exec_info;
   ReplicationInfo replication_info;

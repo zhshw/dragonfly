@@ -58,6 +58,7 @@ extern "C" {
 #include "server/acl/jwt_validator.h"
 #include "server/acl/user_registry.h"
 #include "server/blocking_controller.h"
+#include "server/cluster/raft/data/command_handler.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/debugcmd.h"
@@ -3476,6 +3477,39 @@ string ServerFamily::FormatInfoMetrics(
   };
 
   auto add_repl_info = [&] {
+    if (auto* handler = service_.raft_data_commands()) {
+      auto state = handler->ReplicationState();
+      if (!state.ok()) {
+        append("role", "unknown");
+        append("master_link_status", "down");
+        return;
+      }
+      if (state->is_leader) {
+        append("role", "master");
+        append("master_repl_offset", state->local_applied_offset);
+        size_t connected = 0;
+        for (const auto& replica : state->replicas) {
+          if (!replica.applied_offset)
+            continue;
+          if (show_managed_info)
+            append(StrCat("slave", connected),
+                   StrCat("ip=", replica.node.ip, ",port=", replica.node.port,
+                          ",state=online,offset=", *replica.applied_offset, ",lag=",
+                          max<int64_t>(0, state->local_applied_offset - *replica.applied_offset)));
+          ++connected;
+        }
+        append("connected_slaves", connected);
+      } else {
+        append("role", GetFlag(FLAGS_info_replication_valkey_compatible) ? "slave" : "replica");
+        append("master_host", state->leader.ip);
+        append("master_port", state->leader.port);
+        append("master_link_status", state->connected_to_leader ? "up" : "down");
+        append("slave_repl_offset", state->local_applied_offset);
+        append("slave_read_only", 1);
+      }
+      return;
+    }
+
     if (!m.replica_side_info) {
       vector<ReplicaRoleInfo> replicas_info = dfly_cmd_->GetReplicasRoleInfo();
       append("role", "master");
@@ -4065,7 +4099,8 @@ void ServerFamily::Wait(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   const auto start = chrono::steady_clock::now();
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
 
-  if (!ServerState::IsMaster()) {
+  auto* raft = service_.raft_data_commands();
+  if (!raft && !ServerState::IsMaster()) {
     return cmd_cntx->SendError("WAIT cannot be used with replica instances.");
   }
 
@@ -4084,6 +4119,34 @@ void ServerFamily::Wait(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
   const auto max_timeout =
       chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::time_point::max() - start);
   const auto deadline = start + min(timeout, max_timeout);
+
+  if (raft) {
+    auto* context = cmd_cntx->server_conn_cntx();
+    auto target = context->conn_state.raft_last_write;
+    while (true) {
+      auto state = raft->ReplicationState();
+      if (!state.ok())
+        return cmd_cntx->SendError(state.status().message());
+      if (!state->is_leader)
+        return cmd_cntx->SendError("WAIT cannot be used with replica instances.");
+      if (!target)
+        target = cluster::raft::DataWritePosition{state->group_id, state->epoch, 0};
+      if (state->group_id != target->group_id || state->epoch != target->epoch)
+        return cmd_cntx->SendError("-TRYAGAIN Data group leadership changed during WAIT");
+
+      int64_t count = 0;
+      for (const auto& replica : state->replicas) {
+        if (replica.applied_offset && *replica.applied_offset >= target->end_offset)
+          ++count;
+      }
+      auto now = chrono::steady_clock::now();
+      if (count >= num_replicas || static_cast<size_t>(count) == state->replicas.size() ||
+          now >= deadline || context->conn_closing ||
+          ServerState::tlocal()->gstate() != GlobalState::ACTIVE)
+        return rb->SendLong(count);
+      ThisFiber::SleepUntil(min(deadline, now + 100ms));
+    }
+  }
 
   auto replicas = dfly_cmd_->GetReplicaInfoSnapshot();
   if (replicas.empty())
@@ -4151,6 +4214,34 @@ void ServerFamily::Wait(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
 void ServerFamily::Role(facade::CmdArgParser /*parser*/, CommandContext* cmd_cntx) {
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
 
+  if (auto* handler = service_.raft_data_commands()) {
+    auto state = handler->ReplicationState();
+    if (!state.ok())
+      return cmd_cntx->SendError(state.status().message());
+    if (state->is_leader) {
+      rb->StartArray(2);
+      rb->SendBulkString("master");
+      rb->StartArray(rng::count_if(state->replicas,
+                                   [](const auto& r) { return r.applied_offset.has_value(); }));
+      for (const auto& replica : state->replicas) {
+        if (!replica.applied_offset)
+          continue;
+        rb->StartArray(3);
+        rb->SendBulkString(replica.node.ip);
+        rb->SendBulkString(StrCat(replica.node.port));
+        rb->SendBulkString("online");
+      }
+    } else {
+      bool valkey = GetFlag(FLAGS_info_replication_valkey_compatible);
+      rb->StartArray(4);
+      rb->SendBulkString(valkey ? "slave" : "replica");
+      rb->SendBulkString(state->leader.ip);
+      rb->SendBulkString(StrCat(state->leader.port));
+      rb->SendBulkString(state->connected_to_leader ? (valkey ? "online" : "stable_sync")
+                                                    : "connecting");
+    }
+    return;
+  }
   // is_master alone is insufficient here: the summary is taken under the replica manager lock.
   auto replica_info = replica_manager_->GetSummary();
   if (!replica_info) {

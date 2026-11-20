@@ -1473,14 +1473,18 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
       return reject("Raft data groups currently support SET key value");
     if (name == "SET" && ServerState::tlocal()->ShouldDenyOnOOM())
       return reject(kOutOfMemory);
-    auto status = name == "SET" ? raft_data_commands_->Set(cntx->db_index(), args[0], args[1])
-                                : raft_data_commands_->CheckRead(cntx->db_index(), args[0]);
-    if (!status.ok())
-      return reject(status.message());
     if (name == "SET") {
+      cluster::raft::DataWritePosition position;
+      auto status = raft_data_commands_->Set(cntx->db_index(), args[0], args[1], &position);
+      if (position.end_offset >= 0)
+        cntx->conn_state.raft_last_write = position;
+      if (!status.ok())
+        return reject(status.message());
       cmd->SendSimpleString("OK");
       return DispatchResult::OK;
     }
+    if (auto status = raft_data_commands_->CheckRead(cntx->db_index(), args[0]); !status.ok())
+      return reject(status.message());
 
     // Continue GET through the ordinary shard transaction after the group read barrier.
     return nullopt;
@@ -1489,8 +1493,9 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
     cmd->SendSimpleString("OK");
     return DispatchResult::OK;
   }
-  if (name == "CLUSTER" || name == "AUTH" || name == "HELLO" || name == "PING" || name == "ECHO" ||
-      name == "QUIT" || name == "RESET" || name == "SELECT" || name == "COMMAND" || name == "INFO")
+  if (name == "WAIT" || name == "ROLE" || name == "CLUSTER" || name == "AUTH" || name == "HELLO" ||
+      name == "PING" || name == "ECHO" || name == "QUIT" || name == "RESET" || name == "SELECT" ||
+      name == "COMMAND" || name == "INFO")
     return nullopt;
   if (name == "CLIENT" && !args.empty()) {
     auto sub = absl::AsciiStrToUpper(args[0]);
@@ -2038,6 +2043,7 @@ void Service::Reset(CmdArgParser, CommandContext* cmd_cntx) {
   conn_state.tracking_info_.SetClientTracking(false);
 
   conn_state.db_index = 0;
+  conn_state.raft_last_write.reset();
 
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
   rb->SetRespVersion(RespVersion::kResp2);
