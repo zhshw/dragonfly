@@ -60,6 +60,7 @@
 #include "io/proc_reader.h"
 #include "server/cluster/raft/bootstrap/raft_directory.h"
 #include "server/cluster/raft/runtime/controller.h"
+#include "server/cluster/raft/runtime/data_node.h"
 #include "server/common.h"
 #include "server/generic_family.h"
 #include "server/main_service.h"
@@ -84,6 +85,7 @@ using namespace std;
 ABSL_DECLARE_FLAG(std::string, dir);
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_FLAG(string, raft_role, "", "");
+ABSL_FLAG(string, raft_listen, "", "Internal data quorum host:port.");
 ABSL_FLAG(string, raft_bootstrap_topology, "", "Initial metadata controller topology file.");
 ABSL_FLAG(string, raft_cluster_id, "", "Cluster ID recorded by raft_storage format.");
 ABSL_FLAG(int32_t, raft_node_id, -1, "Node ID recorded by raft_storage format.");
@@ -347,11 +349,13 @@ const char* DefaultBindAddress() {
 
 void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
   const auto& dir = absl::GetFlag(FLAGS_dir);
-  if (GetFlag(FLAGS_cluster_mode) == "raft") {
-    if (GetFlag(FLAGS_raft_role) != "controller") {
-      LOG(ERROR) << "Set --raft_role=controller to start a dedicated metadata voter";
-      exit(1);
-    }
+  const bool raft_mode = GetFlag(FLAGS_cluster_mode) == "raft";
+  const auto role = GetFlag(FLAGS_raft_role);
+  if (raft_mode && role != "controller" && role != "data") {
+    LOG(ERROR) << "Expected --raft_role=controller or data";
+    exit(1);
+  }
+  if (raft_mode && role == "controller") {
 #ifdef __linux__
     const auto& user = GetFlag(FLAGS_user);
     if (!user.empty() && !DropPrivilegesToUser(user, dir))
@@ -374,8 +378,20 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
     exit(1);
   }
 
-  if (auto status = cluster::raft::CheckLegacyDirectory(dir.empty() ? "." : dir); !status.ok()) {
-    LOG(ERROR) << status;
+  if (raft_mode) {
+    if (auto s = cluster::raft::VerifyRaftDirectory(
+            dir.empty() ? "." : dir,
+            {GetFlag(FLAGS_raft_cluster_id), GetFlag(FLAGS_raft_node_id), nullopt});
+        !s.ok()) {
+      LOG(ERROR) << s;
+      exit(1);
+    }
+    if (GetFlag(FLAGS_port) == 0 || GetFlag(FLAGS_memcached_port) != 0) {
+      LOG(ERROR) << "Raft data nodes require a RESP port and support RESP clients only";
+      exit(1);
+    }
+  } else if (auto s = cluster::raft::CheckLegacyDirectory(dir.empty() ? "." : dir); !s.ok()) {
+    LOG(ERROR) << s;
     exit(1);
   }
 
@@ -533,7 +549,22 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
   }
 #endif
 
+  unique_ptr<cluster::raft::DataNode> data_node;
+  if (raft_mode) {
+    auto opened = cluster::raft::DataNode::Open(
+        dir.empty() ? "." : dir, GetFlag(FLAGS_raft_cluster_id), GetFlag(FLAGS_raft_node_id),
+        GetFlag(FLAGS_raft_quorum_voters), GetFlag(FLAGS_raft_listen), GetFlag(FLAGS_port),
+        &service, pool, acceptor);
+    if (!opened.ok()) {
+      LOG(ERROR) << opened.status();
+      exit(1);
+    }
+    data_node = *std::move(opened);
+    service.SetRaftDataCommands(data_node.get());
+  }
   service.Init(acceptor, listeners);
+  if (data_node)
+    data_node->Start();
 
   VersionMonitor version_monitor;
 
@@ -548,6 +579,8 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
 
   acceptor->Wait();
 
+  if (data_node)
+    data_node->Stop();
   version_monitor.Shutdown();
   service.Shutdown();
 }
