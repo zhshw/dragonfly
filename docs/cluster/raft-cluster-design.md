@@ -1,6 +1,6 @@
 # Dragonfly 集群设计：KRaft 元数据与按复制组运行的 Raft
 
-设计提案。Kafka 基线为同级仓库的 `5b648ca9cbeed3cebe553fba86c516b08bcaeb40`，Dragonfly 基线为 `fbc5370234e38bd983ffdd6238b4512ba47182c6`。文中的 Kafka 行为以这两个 checkout 中可核对的源码和测试为准；当前分支已运行静态元数据 quorum。数据组与 Redis 客户端的验收进度见[模块任务](todos.md)。链接按两仓库同级放置。
+设计提案。Kafka 基线为同级仓库的 `5b648ca9cbeed3cebe553fba86c516b08bcaeb40`，Dragonfly 基线为 `fbc5370234e38bd983ffdd6238b4512ba47182c6`。文中的 Kafka 行为以这两个 checkout 中可核对的源码和测试为准；当前分支已运行原图的三个 controller 和两个数据组。数据组与 Redis 客户端的验收进度见[模块任务](todos.md)。链接按两仓库同级放置。
 
 ## 1. 两层 Raft 管什么
 
@@ -74,10 +74,22 @@
 ```sh
 build-dbg/dragonfly --cluster_mode=raft --raft_role=controller \
   --dir=/var/lib/dragonfly/c1 --raft_cluster_id=HIJ1rG6XThu4T7D5Jg8xIg --raft_node_id=1 \
-  --raft_quorum_voters=1@c1:9093,2@c2:9093,3@c3:9093
+  --raft_quorum_voters=1@c1:9093,2@c2:9093,3@c3:9093 \
+  --raft_bootstrap_topology=/etc/dragonfly/topology.json
 ```
 
 在 Linux 构建目录包含 `dragonfly` 和 `raft_storage` 后，从仓库根目录运行 `DRAGONFLY_PATH=build-dbg/dragonfly python3 tests/integration/raft_controller_test.py -v`。用例通过内部 DescribeQuorum 检查 leader、epoch、HW 和各 voter 日志位置，覆盖单 voter 重启、三进程换主、单票退位和多数恢复后的已提交前缀。[多进程验收](../../tests/integration/raft_controller_test.py)
+
+数据节点复用原配置的 `slot_ranges`、`master`、`replicas`、Redis 节点 ID 和服务端口。在每个旧 shard 增加 `group_id`，在每个节点增加唯一的 `broker_id` 和内部 `raft_port`。三台 controller 的初始 topology 文件内容相同。原图中的组 10 使用 A=11、A-r1=12，组 20 使用 B=21、B-r1=22。按对应 ID 格式化四个独立目录后，下面的命令启动 A。其余节点替换本机目录、node ID、监听地址及端口。完整的两组 JSON 和七个进程的启动参数可从集成测试直接复用。[七节点配置与测试](../../tests/integration/raft_data_group_test.py)
+
+```sh
+build-dbg/dragonfly --cluster_mode=raft --raft_role=data \
+  --dir=/var/lib/dragonfly/a --raft_cluster_id=HIJ1rG6XThu4T7D5Jg8xIg --raft_node_id=11 \
+  --raft_quorum_voters=1@c1:9093,2@c2:9093,3@c3:9093 \
+  --raft_listen=a:7100 --port=6379
+```
+
+已在 Linux Debug 下用 redis-py 5.2.1 和 redis-cli 7 验证二进制 SET/GET、NX/XX、MOVED 和 WAIT。原图的 2/2 数据组失去一票后无法确认新写；另一组仍可写。七节点同时断电后，两组从持久日志恢复已确认值。另一个用例先把 A-r2 作为 observer 追平，再用 AddRaftVoter 加为第三票；原 leader 失效后，同一 slot 范围从新 leader 读回故障前确认的数据。未适配的写命令返回错误。[客户端和故障用例](../../tests/integration/raft_data_group_test.py)
 
 实现时把“是否启用真实集群路由”和“由谁管理拓扑及复制”分开判断。`yes` 和 `raft` 共用 key → slot、拓扑响应编码和 `MOVED`；只有 `yes` 允许旧 manager 直接改 slot 或指定复制源。`raft` 从已提交元数据生成拓扑，由数据组确认普通写。模式在启动时确定，`CONFIG SET` 不提供在线切换；恢复时校验持久化的集群身份和模式，配置不符时拒绝对外服务。[现有模式判断](../../src/server/cluster_support.h) · [现有管理入口](../../src/server/cluster/cluster_family.cc)
 

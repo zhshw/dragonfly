@@ -247,6 +247,9 @@ class ControllerProcessTest(unittest.TestCase):
             ),
             0,
         )
+
+        # Kafka acknowledges Update on append. A following membership change requires its commit.
+        self.committed(promoted.hw)
         self.assertEqual(
             change_voter(port, 81, self.cluster_id, before.leader, bytes([before.leader]) * 16), 0
         )
