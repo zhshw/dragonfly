@@ -271,6 +271,8 @@ if __name__ == "__main__":
         ("EndQuorumEpoch", "end_epoch"),
         ("Fetch", "fetch"),
         ("DescribeQuorum", "describe_quorum"),
+        ("BrokerRegistration", "broker_registration"),
+        ("BrokerHeartbeat", "broker_heartbeat"),
         ("FetchSnapshot", "fetch_snapshot"),
         ("AddRaftVoter", "add_voter"),
         ("RemoveRaftVoter", "remove_voter"),

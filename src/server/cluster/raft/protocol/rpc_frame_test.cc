@@ -463,6 +463,85 @@ TEST(RpcFrameTest, JavaVoterReconfigurationFrames) {
   }
 }
 
+TEST(RpcFrameTest, KafkaJavaBrokerRegistrationAndHeartbeatFrames) {
+  // BrokerVectors.java exercises every version, including the nullable v2 heartbeat tag.
+  constexpr std::string_view requests[] = {
+      "00000036003e00000102030400016b000000000702630000000000000000000000000000007b020272026823"
+      "8400000002026600010003000000",
+      "00000037003e00010102030400016b000000000702630000000000000000000000000000007b020272026823"
+      "840000000202660001000300000100",
+      "00000048003e00020102030400016b000000000702630000000000000000000000000000007b020272026823"
+      "8400000002026600010003000001020000000000000000000000000000007b00",
+      "00000050003e00030102030400016b000000000702630000000000000000000000000000007b020272026823"
+      "8400000002026600010003000001020000000000000000000000000000007b000000000000000900",
+      "00000050003e00040102030400016b000000000702630000000000000000000000000000007b020272026823"
+      "8400000002026600010003000001020000000000000000000000000000007b000000000000000900",
+      "00000023003f00000102030400016b000000000700000000000000180000000000000019010000",
+      "00000036003f00010102030400016b0000000007000000000000001800000000000000190100010011020000"
+      "000000000000000000000000007b",
+      "00000039003f00020102030400016b0000000007000000000000001800000000000000190100020011020000"
+      "000000000000000000000000007b010101",
+  };
+  constexpr std::string_view registration_reply =
+      "000000140102030400000000000000000000000000001800";
+  constexpr std::string_view heartbeat_reply = "0000000f010203040000000000004d00010000";
+  RpcHandlers handlers;
+  size_t index = 0;
+  auto roundtrip = [&](int16_t version, const auto& request) {
+    std::string encoded;
+    EXPECT_EQ(CodecError::kOk,
+              EncodeRequestFrame({kCorrelationId, "k", {}}, request, version, &encoded));
+    EXPECT_EQ(FromHex(requests[index]), encoded);
+    EXPECT_EQ(request.broker_id, 7);
+  };
+  handlers.broker_registration = [&](int16_t version, const BrokerRegistrationRequest& req,
+                                     BrokerRegistrationResponse* res) {
+    roundtrip(version, req);
+    EXPECT_EQ(req.incarnation_id.back(), 123);
+    EXPECT_FALSE(req.rack.has_value());
+    EXPECT_EQ(req.listeners.at(0).port, 9092);
+    EXPECT_EQ(req.features.at(0).max_supported_version, 3);
+    EXPECT_EQ(req.is_migrating_zk_broker, version >= 1);
+    EXPECT_EQ(req.log_dirs.size(), version >= 2 ? 1u : 0u);
+    EXPECT_EQ(req.previous_broker_epoch, version >= 3 ? 9 : -1);
+    res->broker_epoch = 24;
+    return std::error_code{};
+  };
+  handlers.broker_heartbeat = [&](int16_t version, const BrokerHeartbeatRequest& req,
+                                  BrokerHeartbeatResponse* res) {
+    roundtrip(version, req);
+    EXPECT_EQ(req.broker_epoch, 24);
+    EXPECT_EQ(req.current_metadata_offset, 25);
+    EXPECT_TRUE(req.want_fence);
+    EXPECT_EQ(req.offline_log_dirs.size(), version >= 1 ? 1u : 0u);
+    EXPECT_EQ(req.cordoned_log_dirs.has_value(), version >= 2);
+    if (req.cordoned_log_dirs)
+      EXPECT_TRUE(req.cordoned_log_dirs->empty());
+    res->error_code = 77;
+    return std::error_code{};
+  };
+  for (index = 0; index < std::size(requests); ++index) {
+    std::string reply;
+    ASSERT_EQ(DispatchRpcFrame(FromHex(requests[index]), kMaxFrame, handlers, &reply).status,
+              FrameStatus::kComplete);
+    if (index <= BrokerRegistrationRequest::kMaxVersion) {
+      EXPECT_EQ(reply, FromHex(registration_reply));
+      BrokerRegistrationResponse res;
+      EXPECT_EQ(DecodeResponseFrame(reply, kMaxFrame, index, kCorrelationId, &res).status,
+                FrameStatus::kComplete);
+      EXPECT_EQ(res.broker_epoch, 24);
+    } else {
+      EXPECT_EQ(reply, FromHex(heartbeat_reply));
+      BrokerHeartbeatResponse res;
+      int16_t version = index - BrokerRegistrationRequest::kMaxVersion - 1;
+      EXPECT_EQ(DecodeResponseFrame(reply, kMaxFrame, version, kCorrelationId, &res).status,
+                FrameStatus::kComplete);
+      EXPECT_EQ(res.error_code, 77);
+      EXPECT_TRUE(res.is_fenced);
+    }
+  }
+}
+
 TEST(RpcFrameTest, KafkaJavaApiVersionsFeatureTags) {
   auto frame = FromHex(
       "000000450102030400000100000000040014020e6b726166742e76657273696f6e00000001000108"
@@ -479,6 +558,30 @@ TEST(RpcFrameTest, KafkaJavaApiVersionsFeatureTags) {
   std::string body;
   ASSERT_EQ(CodecError::kOk, Encode(decoded, 4, &body));
   EXPECT_EQ(std::string_view(frame).substr(8), body);
+}
+
+TEST(RpcFrameTest, DynamicQuorumAdvertisesKraftVersionFromApiVersionsV4) {
+  RpcHandlers handlers;
+  auto handler = [](int16_t, const auto&, auto*) { return std::error_code{}; };
+  handlers.add_voter = handler;
+  handlers.remove_voter = handler;
+  handlers.update_voter = handler;
+  for (int16_t version : {3, 4, 5}) {
+    std::string reply;
+    ASSERT_EQ(DispatchRpcFrame(FromHex(kRequest[version]), kMaxFrame, handlers, &reply).status,
+              FrameStatus::kComplete);
+    ApiVersionsResponse response;
+    ASSERT_EQ(DecodeResponseFrame(reply, kMaxFrame, version, kCorrelationId, &response).status,
+              FrameStatus::kComplete);
+    if (version == 3) {
+      EXPECT_TRUE(response.supported_features.empty());
+    } else {
+      ASSERT_EQ(response.supported_features.size(), 1u);
+      EXPECT_EQ(response.supported_features[0].name, "kraft.version");
+      EXPECT_EQ(response.supported_features[0].min_version, 0);
+      EXPECT_EQ(response.supported_features[0].max_version, 1);
+    }
+  }
 }
 
 }  // namespace

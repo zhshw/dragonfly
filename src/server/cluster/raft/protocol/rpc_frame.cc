@@ -123,6 +123,10 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
       Advertise<EndQuorumEpochRequest>(&response);
     if (handlers.describe_quorum)
       Advertise<DescribeQuorumRequest>(&response);
+    if (handlers.broker_registration)
+      Advertise<BrokerRegistrationRequest>(&response);
+    if (handlers.broker_heartbeat)
+      Advertise<BrokerHeartbeatRequest>(&response);
     if (handlers.fetch_snapshot)
       Advertise<FetchSnapshotRequest>(&response);
     if (handlers.add_voter)
@@ -131,6 +135,10 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
       Advertise<RemoveRaftVoterRequest>(&response);
     if (handlers.update_voter)
       Advertise<UpdateRaftVoterRequest>(&response);
+
+    // Kafka omits features with minimum version zero in ApiVersions responses before v4.
+    if (version >= 4 && handlers.add_voter && handlers.remove_voter && handlers.update_voter)
+      response.supported_features.push_back({"kraft.version", 0, 1, {}});
   } else {
     response.error_code = kInvalidRequest;
   }
@@ -239,6 +247,13 @@ FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
       break;
     case DescribeQuorumRequest::kApiKey:
       dispatched = Dispatch(version, correlation_id, &reader, handlers.describe_quorum, response);
+      break;
+    case BrokerRegistrationRequest::kApiKey:
+      dispatched =
+          Dispatch(version, correlation_id, &reader, handlers.broker_registration, response);
+      break;
+    case BrokerHeartbeatRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.broker_heartbeat, response);
       break;
     case FetchSnapshotRequest::kApiKey:
       dispatched = Dispatch(version, correlation_id, &reader, handlers.fetch_snapshot, response);
@@ -378,6 +393,27 @@ CodecError EncodeRequestFrame(const RequestMetadata& metadata,
 
 FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
                                 int32_t correlation_id, UpdateRaftVoterResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& header,
+                              const BrokerRegistrationRequest& request, int16_t version,
+                              std::string* output) {
+  return WriteRequest(header, request, version, BrokerRegistrationRequest::HeaderVersion(version),
+                      output);
+}
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, BrokerRegistrationResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& header, const BrokerHeartbeatRequest& request,
+                              int16_t version, std::string* output) {
+  return WriteRequest(header, request, version, BrokerHeartbeatRequest::HeaderVersion(version),
+                      output);
+}
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, BrokerHeartbeatResponse* response) {
   return ReadResponse(input, max_payload_size, version, correlation_id, response);
 }
 

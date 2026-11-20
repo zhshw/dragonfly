@@ -14,6 +14,8 @@ add_library(dfly_raft
             protocol/add_voter.cc
             protocol/api_versions.cc
             protocol/begin_epoch.cc
+            protocol/broker_heartbeat.cc
+            protocol/broker_registration.cc
             protocol/describe_quorum.cc
             protocol/end_epoch.cc
             protocol/fetch.cc

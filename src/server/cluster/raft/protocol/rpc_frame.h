@@ -10,6 +10,8 @@
 #include "server/cluster/raft/protocol/add_voter.h"
 #include "server/cluster/raft/protocol/api_versions.h"
 #include "server/cluster/raft/protocol/begin_epoch.h"
+#include "server/cluster/raft/protocol/broker_heartbeat.h"
+#include "server/cluster/raft/protocol/broker_registration.h"
 #include "server/cluster/raft/protocol/describe_quorum.h"
 #include "server/cluster/raft/protocol/end_epoch.h"
 #include "server/cluster/raft/protocol/fetch.h"
@@ -45,6 +47,8 @@ inline constexpr int16_t kMinRaftFetchVersion = 13;
 
 struct RpcHandlers {
   VoteHandler vote;
+  RpcHandler<BrokerRegistrationRequest, BrokerRegistrationResponse> broker_registration;
+  RpcHandler<BrokerHeartbeatRequest, BrokerHeartbeatResponse> broker_heartbeat;
   RpcHandler<AddRaftVoterRequest, AddRaftVoterResponse> add_voter;
   RpcHandler<RemoveRaftVoterRequest, RemoveRaftVoterResponse> remove_voter;
   RpcHandler<UpdateRaftVoterRequest, UpdateRaftVoterResponse> update_voter;
@@ -148,5 +152,19 @@ struct RequestMetadata {
 [[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
                                               int16_t version, int32_t correlation_id,
                                               UpdateRaftVoterResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const BrokerRegistrationRequest& request,
+                                            int16_t version, std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              BrokerRegistrationResponse* response);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const BrokerHeartbeatRequest& request, int16_t version,
+                                            std::string* output);
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              BrokerHeartbeatResponse* response);
 
 }  // namespace dfly::cluster::raft::protocol
