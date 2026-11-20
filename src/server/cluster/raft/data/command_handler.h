@@ -52,7 +52,7 @@ class DataCommandHandler {
                            DataWritePosition* position) = 0;
   virtual absl::StatusOr<bool> SetIf(DbIndex db, std::string_view key, std::string_view value,
                                      SetCondition condition, DataWritePosition* position) = 0;
-  virtual absl::Status CheckRead(DbIndex db, std::string_view key) = 0;
+  virtual absl::StatusOr<std::optional<std::string>> Get(DbIndex db, std::string_view key) = 0;
 
   virtual absl::StatusOr<DataReplicationState> ReplicationState() {
     return absl::UnavailableError("-CLUSTERDOWN Data group has no known leader");

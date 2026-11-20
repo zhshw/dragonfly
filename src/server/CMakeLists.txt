@@ -10,7 +10,8 @@ if(APPLE)
     set(WITH_TIERING OFF CACHE BOOL "Compile for macos" FORCE)
 endif()
 
-add_executable(dragonfly dfly_main.cc version_monitor.cc cluster/raft/runtime/data_node.cc)
+add_executable(dragonfly dfly_main.cc version_monitor.cc cluster/raft/runtime/data_node.cc
+               cluster/raft/runtime/slot_migration_driver.cc)
 add_custom_target(check_dfly WORKING_DIRECTORY .. COMMAND ctest -L DFLY)
 cxx_link(dragonfly base dragonfly_lib cloud_lib dfly_raft_transport)
 

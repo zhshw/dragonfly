@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import json
 import os
@@ -26,6 +27,7 @@ GROUPS = {10: (11, 12), 20: (21, 22)}
 
 class RaftDataGroupFixture(unittest.TestCase):
     learner = None
+    controller_admin = False
 
     def setUp(self):
         self.bin = Path(os.environ.get("DRAGONFLY_PATH", "build-dbg/dragonfly")).resolve()
@@ -35,6 +37,8 @@ class RaftDataGroupFixture(unittest.TestCase):
         self.proc = {}
         self.raft = {}
         self.resp = {}
+        self.admin = {}
+        self.admin_password = os.urandom(16).hex()
         self.cluster_id = "HIJ1rG6XThu4T7D5Jg8xIg"
         with ExitStack() as sockets:
 
@@ -50,6 +54,8 @@ class RaftDataGroupFixture(unittest.TestCase):
                 self.raft[node] = port()
                 if node > 3:
                     self.resp[node] = port()
+                elif self.controller_admin:
+                    self.admin[node] = port()
             for node in nodes:
                 options = []
                 if self.learner and (node in GROUPS[10] or node == self.learner):
@@ -130,6 +136,12 @@ class RaftDataGroupFixture(unittest.TestCase):
             ]
             if self.config is not None:
                 flags.append(f"--raft_bootstrap_topology={self.config}")
+            if node in self.admin:
+                flags += [
+                    f"--admin_port={self.admin[node]}",
+                    f"--admin_bind={HOST}",
+                    f"--requirepass={self.admin_password}",
+                ]
         with (self.root / f"{node}.log").open("ab") as log:
             self.proc[node] = subprocess.Popen(
                 [self.bin, *flags], stdout=log, stderr=log, cwd=self.root / str(node)
@@ -311,6 +323,145 @@ class RaftDataGroupTest(RaftDataGroupFixture):
             leader = next(n for n in members if self.resp[n] == row[2][1])
             result = probe(leader, "__dragonfly_data", gid, len(members))
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ControllerAdminTest(RaftDataGroupFixture):
+    controller_admin = True
+
+    def test_submit_query_and_recover_management_request(self):
+        slots = self.wait_for(self.slots)
+        clients = {
+            node: redis.Redis(host=HOST, port=port, password=self.admin_password, socket_timeout=8)
+            for node, port in self.admin.items()
+        }
+        for client in clients.values():
+            self.addCleanup(client.close)
+
+        def active():
+            for node, client in clients.items():
+                if node in self.proc:
+                    try:
+                        if client.hmget("ctl:slot:42", "owner")[0] in (b"10", b"20"):
+                            return node
+                    except redis.exceptions.RedisError:
+                        pass
+
+        node = self.wait_for(active)
+        admin = clients[node]
+        request_key = "ctl:req:move-42-001"
+        op_key = "ctl:op:move-42-001"
+        value = b'{ "slot": 42, "from": 10, "to": 20, "generation": 1 }'
+        self.assertEqual(admin.hmget("ctl:slot:42", "owner", "generation"), [b"10", b"1"])
+
+        with redis.Redis(host=HOST, port=self.admin[node]) as unauthenticated:
+            with self.assertRaises(redis.exceptions.AuthenticationError):
+                unauthenticated.get(request_key)
+        with self.assertRaises(redis.exceptions.ResponseError):
+            admin.hset("ctl:slot:42", "owner", "20")
+        standby = next(client for peer, client in clients.items() if peer != node)
+        with self.assertRaises(redis.exceptions.ResponseError):
+            standby.set(request_key, value, nx=True)
+
+        # Incompressible values exceed one transfer chunk, while individual SETs fit a batch.
+        keys = [b"{12561}:item:" + bytes([i]) for i in range(6)]
+        values = [os.urandom(256 * 1024) for _ in keys]
+        neighbor = b"{104856}:neighbor"
+        source_port = slots[0][2][1]
+        with redis.Redis(host=HOST, port=source_port) as source:
+            self.assertEqual(source.execute_command("CLUSTER", "KEYSLOT", keys[0]), 42)
+            self.assertEqual(source.execute_command("CLUSTER", "KEYSLOT", neighbor), 43)
+            self.assertTrue(source.set(neighbor, b"unmoved"))
+            for key, payload in zip(keys, values):
+                self.assertTrue(source.set(key, payload))
+        with redis.Redis(host=HOST, port=source_port, db=1) as source:
+            self.assertTrue(source.set(keys[0], b"db1\x00\xff"))
+
+        # Stop a target voter so acceptance and completion can be observed independently.
+        target_follower = next(node for node in GROUPS[20] if self.resp[node] == slots[1][3][1])
+        seed = next(iter(self.resp.values()))
+        with redis.RedisCluster(host=HOST, port=seed, socket_timeout=7) as business:
+            self.assertTrue(business.set(request_key, b"business value"))
+            self.assertIsNone(admin.get(request_key))
+            self.stop(target_follower, crash=True)
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                replies = list(
+                    workers.map(lambda _: admin.set(request_key, value, nx=True), range(2))
+                )
+            self.assertCountEqual(replies, [True, None])
+
+        status = admin.hgetall(op_key)
+        self.assertIn(status[b"phase"], (b"preparing", b"frozen"))
+        self.assertEqual(status[b"slot"], b"42")
+        self.assertEqual(admin.get(request_key), value)
+        self.assertEqual(admin.hmget("ctl:slot:42", "owner", "generation"), [b"10", b"1"])
+
+        self.stop(node, crash=True)
+        successor = clients[self.wait_for(active)]
+        self.assertIsNone(successor.set(request_key, b"retry with another value", nx=True))
+        self.assertEqual(successor.get(request_key), value)
+        self.assertEqual(successor.hgetall(op_key)[b"migration_id"], status[b"migration_id"])
+        self.wait_for(lambda: successor.hgetall(op_key).get(b"phase") == b"frozen")
+        with redis.Redis(host=HOST, port=source_port) as source:
+            for args in (("GET", keys[0]), ("SET", keys[0], b"frozen write")):
+                with self.assertRaises(redis.exceptions.ResponseError) as rejected:
+                    source.execute_command(*args)
+                error = rejected.exception
+                self.assertTrue(
+                    isinstance(error, redis.exceptions.TryAgainError)
+                    or str(error).startswith("TRYAGAIN "),
+                    str(error),
+                )
+            self.assertTrue(source.set(neighbor, b"written while frozen"))
+            self.assertEqual(source.get(neighbor), b"written while frozen")
+        self.start(target_follower)
+        self.wait_for(lambda: successor.hgetall(op_key).get(b"phase") == b"finished")
+
+        def completed_routes():
+            routes = [sorted(self.client(n).execute_command("CLUSTER", "SLOTS")) for n in self.resp]
+            if any(r != routes[0] for r in routes):
+                return None
+            expected = [(0, 41), (42, 42), (43, 8191), (8192, 16383)]
+            if [tuple(row[:2]) for row in routes[0]] != expected:
+                return None
+            return routes[0] if all(len(row) == 4 for row in routes[0]) else None
+
+        def check_completed():
+            admin = clients[self.wait_for(active)]
+            self.assertEqual(admin.get(request_key), value)
+            self.assertEqual(admin.hgetall(op_key)[b"phase"], b"finished")
+            self.assertEqual(admin.hmget("ctl:slot:42", "owner", "generation"), [b"20", b"2"])
+            self.assertEqual(admin.hmget("ctl:slot:43", "owner", "generation"), [b"10", b"1"])
+            routes = self.wait_for(completed_routes)
+            for row, gid in zip(routes, (10, 20, 10, 20)):
+                self.assertEqual(
+                    {endpoint[1] for endpoint in row[2:]}, {self.resp[n] for n in GROUPS[gid]}
+                )
+            target_port = routes[1][2][1]
+            with redis.Redis(host=HOST, port=routes[2][2][1]) as source:
+                self.assertEqual(source.get(neighbor), b"written while frozen")
+                with self.assertRaises(redis.exceptions.ResponseError) as rejected:
+                    source.set(keys[0], b"stale write")
+                self.assertIn(f"{HOST}:{target_port}", str(rejected.exception))
+            with redis.Redis(host=HOST, port=target_port) as target:
+                for key, payload in zip(keys, values):
+                    self.assertEqual(target.get(key), payload)
+                self.assertEqual(target.get(request_key), b"business value")
+            with redis.Redis(host=HOST, port=target_port, db=1) as target:
+                self.assertEqual(target.get(keys[0]), b"db1\x00\xff")
+            return target_port
+
+        new_key = b"{12561}:after-cutover"
+        with redis.Redis(host=HOST, port=check_completed()) as target:
+            self.assertTrue(target.set(new_key, b"new owner write"))
+            self.assertEqual(target.get(new_key), b"new owner write")
+        for running in list(self.proc):
+            self.stop(running, crash=True)
+        self.config.unlink()
+        self.config = None
+        for member in self.raft:
+            self.start(member)
+        with redis.Redis(host=HOST, port=check_completed()) as target:
+            self.assertEqual(target.get(new_key), b"new owner write")
 
 
 class DynamicDataGroupTest(RaftDataGroupFixture):

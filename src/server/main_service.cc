@@ -1505,11 +1505,15 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
         static_cast<RedisReplyBuilder*>(cmd->rb())->SendNull();
       return DispatchResult::OK;
     }
-    if (auto status = raft_data_commands_->CheckRead(cntx->db_index(), args[0]); !status.ok())
-      return reject(status.message());
-
-    // Continue GET through the ordinary shard transaction after the group read barrier.
-    return nullopt;
+    auto value = raft_data_commands_->Get(cntx->db_index(), args[0]);
+    if (!value.ok())
+      return reject(value.status().message());
+    auto* rb = static_cast<RedisReplyBuilder*>(cmd->rb());
+    if (*value)
+      rb->SendBulkString(**value);
+    else
+      rb->SendNull();
+    return DispatchResult::OK;
   }
   if (name == "READWRITE" || name == "READONLY") {
     cmd->SendSimpleString("OK");

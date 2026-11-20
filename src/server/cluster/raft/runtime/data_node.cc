@@ -12,11 +12,13 @@
 
 #include "base/logging.h"
 #include "server/cluster/raft/data/apply_progress.h"
+#include "server/cluster/raft/data/kv_rdb.h"
 #include "server/cluster/raft/data/set_effect.h"
 #include "server/cluster/raft/data/set_executor.h"
 #include "server/cluster/raft/metadata/metadata_image.h"
 #include "server/cluster/raft/quorum/fetch_replication.h"
 #include "server/cluster/raft/runtime/group.h"
+#include "server/cluster/raft/runtime/slot_migration_driver.h"
 #include "server/cluster/raft/transport/peer_connection.h"
 #include "server/cluster/raft/transport/raft_listener.h"
 #include "server/journal/executor.h"
@@ -50,6 +52,7 @@ struct LocalPartition {
   CommittedEffects effects;
   DataApplyProgress progress;
   unique_ptr<RaftGroup> raft;
+  unique_ptr<SlotMigrationDriver> migrations;
   RpcHandlers handlers;
 };
 
@@ -93,6 +96,7 @@ class DataNodeImpl final : public DataNode {
     handlers.begin_epoch = Forward(&RpcHandlers::begin_epoch);
     handlers.end_epoch = Forward(&RpcHandlers::end_epoch);
     handlers.fetch = Forward(&RpcHandlers::fetch);
+    handlers.fetch_slot_image = Forward(&RpcHandlers::fetch_slot_image);
     handlers.describe_quorum = Forward(&RpcHandlers::describe_quorum);
     auto listener = make_unique<RaftListener>(kMaxRaftFrame, std::move(handlers));
     if (auto ec = acceptor->AddListener(listen_.host.c_str(), listen_.port, listener.get()); ec)
@@ -104,6 +108,7 @@ class DataNodeImpl final : public DataNode {
   void Start() override {
     observer_->Start(owner_);
     control_fiber_ = owner_->LaunchFiber([this] { BrokerLoop(); });
+    migration_fiber_ = owner_->LaunchFiber([this] { MigrationLoop(); });
   }
 
   void Stop() override {
@@ -111,6 +116,8 @@ class DataNodeImpl final : public DataNode {
     observer_->RequestStop();
     if (control_fiber_.IsJoinable())
       control_fiber_.Join();
+    if (migration_fiber_.IsJoinable())
+      migration_fiber_.Join();
     if (auto group = partition_.load())
       group->raft->Join();
     observer_->Join();
@@ -119,7 +126,7 @@ class DataNodeImpl final : public DataNode {
                    DataWritePosition* position) override;
   absl::StatusOr<bool> SetIf(DbIndex db, string_view key, string_view value, SetCondition condition,
                              DataWritePosition* position) override;
-  absl::Status CheckRead(DbIndex db, string_view key) override;
+  absl::StatusOr<optional<string>> Get(DbIndex db, string_view key) override;
   absl::StatusOr<DataTopology> Topology() override;
   absl::StatusOr<DataReplicationState> ReplicationState() override;
 
@@ -137,8 +144,9 @@ class DataNodeImpl final : public DataNode {
                                   optional<SetCondition> condition, DataWritePosition* position);
   absl::Status OpenPartition(const MetadataImage& image, const Broker& local);
   void BrokerLoop();
+  void MigrationLoop();
   void RegisterOrHeartbeat(PeerConnection& peer, const MetadataImage& image, const Broker& broker);
-  absl::StatusOr<RedisRoute> Route(SlotId slot) const;
+  absl::StatusOr<RedisRoute> Route(SlotId slot, const LocalPartition* partition) const;
 
   filesystem::path dir_;
   RaftDirectoryIdentity identity_;
@@ -156,6 +164,10 @@ class DataNodeImpl final : public DataNode {
   int64_t registered_epoch_ = -1;
   atomic_bool stopping_{false};
   fb2::Fiber control_fiber_;
+  fb2::Fiber migration_fiber_;
+
+  // Both loops run on owner_, each with a separate RPC connection.
+  int32_t controller_leader_ = -1;
 };
 
 absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broker& broker) {
@@ -177,13 +189,23 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
     }
     auto local = make_shared<LocalPartition>(id);
     auto apply = [this, replica = local.get()](const PartitionLog& log, int64_t hw) {
-      return replica->effects.ApplyTo(log, hw, [&](const SetEffect& effect) {
+      auto apply_set = [&](const SetEffect& effect) {
         // Re-enter the service on a proactor. Client writes wait outside shard transactions.
         return owner_->Await([&] {
           JournalExecutor executor(service_);
           return ExecuteSetEffect(executor, effect);
         });
-      });
+      };
+      auto apply_slot = [&](SlotId slot, optional<string_view> bytes, string_view digest) {
+        return owner_->Await([&] {
+          SlotRanges ranges({{slot, slot}});
+          if (bytes)
+            return InstallKvRdb(service_, ranges, *bytes, digest);
+          ClearKvSlots(*service_, ranges);
+          return absl::OkStatus();
+        });
+      };
+      return replica->effects.ApplyTo(log, hw, apply_set, apply_slot);
     };
     auto opened = opener_.Await([&] {
       return RaftGroup::Open(dir_, identity_, RaftGroup::Kind::kData, id, voters, false, apply);
@@ -204,6 +226,15 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
         !s.ok())
       return s;
     local->handlers = local->raft->Handlers();
+    local->migrations = make_unique<SlotMigrationDriver>(
+        id, identity_.node_id, identity_.cluster_id, incarnation_, *local->raft, local->effects,
+        [this] { return image_.load(); }, *service_);
+    local->handlers.fetch_slot_image = [driver = local->migrations.get()](
+                                           int16_t, const FetchSlotImageRequest& request,
+                                           FetchSlotImageResponse* response) {
+      driver->Fetch(request, response);
+      return error_code{};
+    };
     local->raft->Start(owner_);
     partition_.store(std::move(local));
     return absl::OkStatus();
@@ -259,7 +290,8 @@ void DataNodeImpl::BrokerLoop() {
           leader = state.election.state().election.leader_id.value_or(-1);
           return absl::OkStatus();
         });
-        if (s.ok() && controllers_.contains(leader)) {
+        controller_leader_ = s.ok() && controllers_.contains(leader) ? leader : -1;
+        if (controller_leader_ >= 0) {
           if (connected != leader) {
             if (peer)
               peer->Close();
@@ -276,7 +308,28 @@ void DataNodeImpl::BrokerLoop() {
     peer->Close();
 }
 
-absl::StatusOr<RedisRoute> DataNodeImpl::Route(SlotId slot) const {
+void DataNodeImpl::MigrationLoop() {
+  int32_t connected = -1;
+  unique_ptr<PeerConnection> peer;
+  while (!stopping_) {
+    auto local = partition_.load();
+    const auto leader = controller_leader_;
+    if (local && leader >= 0) {
+      if (connected != leader) {
+        if (peer)
+          peer->Close();
+        connected = leader;
+        peer = make_unique<PeerConnection>(controllers_.at(connected), 2000, kMaxRaftFrame);
+      }
+      local->migrations->Tick(*peer);
+    }
+    util::ThisFiber::SleepFor(milliseconds(25));
+  }
+  if (peer)
+    peer->Close();
+}
+
+absl::StatusOr<RedisRoute> DataNodeImpl::Route(SlotId slot, const LocalPartition* partition) const {
   auto image = image_.load();
   if (stopping_ || !image)
     return ClusterDown();
@@ -290,25 +343,58 @@ absl::StatusOr<RedisRoute> DataNodeImpl::Route(SlotId slot) const {
     return absl::FailedPreconditionError(
         absl::StrCat("-MOVED ", slot, " ", route->host, ":", route->port));
   const auto& broker = image->brokers.at(identity_.node_id);
-  if (broker.incarnation_id != incarnation_ || broker.fenced)
+  if (broker.incarnation_id != incarnation_ || broker.fenced || !partition ||
+      partition->id != route->owner.group_id)
     return ClusterDown();
+
+  // Fence the source before its freeze proposal can race the next client append.
+  const auto& migrations = image->migrations;
+  const auto& transfers = partition->effects.transfers();
+  auto active = migrations.active_slots().find(slot);
+  if (active != migrations.active_slots().end()) {
+    const auto& move = migrations.records().at(active->second);
+    if (move.source_group == partition->id && !move.source_finished)
+      return absl::UnavailableError("-TRYAGAIN Slot migration in progress");
+  }
+  if (transfers.BlocksAccess(slot, route->owner.generation))
+    return absl::UnavailableError("-TRYAGAIN Slot migration in progress");
+
+  // A broker may replay the new owner before its data quorum has replayed the import.
+  const auto* move = migrations.LatestCutover(slot);
+  if (move && move->target_group == partition->id &&
+      move->generation + 1 == route->owner.generation) {
+    const auto* progress = transfers.Find(move->migration_id);
+    if (!progress || progress->install != LogPosition{move->target_epoch, move->target_end_offset})
+      return absl::UnavailableError("-TRYAGAIN Slot import is catching up");
+  }
   return *route;
 }
 
-absl::Status DataNodeImpl::CheckRead(DbIndex, string_view key) {
+absl::StatusOr<optional<string>> DataNodeImpl::Get(DbIndex db, string_view key) {
+  auto slot = KeySlot(key);
   auto local = partition_.load();
-  auto route = Route(KeySlot(key));
-  if (!route.ok())
-    return route.status();
-  if (!local || local->id != route->owner.group_id)
-    return ClusterDown();
-  return local->raft->Visit([&](RaftGroup::State state) {
+  if (!local)
+    return Route(slot, nullptr).status();
+  optional<string> value;
+  auto status = local->raft->Visit([&](RaftGroup::State state) {
+    auto route = Route(slot, local.get());
+    if (!route.ok())
+      return route.status();
     auto hw = state.replication.HighWatermark();
     if (state.election.state().role != QuorumRole::kLeader || !hw ||
         local->effects.applied_offset() < *hw)
       return ClusterDown();
-    return absl::OkStatus();
+    return owner_->Await([&] {
+      JournalExecutor executor(service_);
+      auto result = ReadCommittedValue(executor, db, key);
+      if (result.ok())
+        value = *std::move(result);
+      return result.status();
+    });
   });
+  if (!status.ok())
+    return status;
+  return value;
 }
 
 absl::Status DataNodeImpl::Set(DbIndex db, string_view key, string_view value,
@@ -327,8 +413,7 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
   const auto slot = KeySlot(key);
   auto local = partition_.load();
   if (!local) {
-    auto route = Route(slot);
-    return route.ok() ? ClusterDown() : route.status();
+    return Route(slot, nullptr).status();
   }
 
   optional<LogPosition> ticket;
@@ -344,7 +429,7 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
         applied = local->effects.applied_offset() >= ticket->end_offset;
         return absl::OkStatus();
       }
-      auto route = Route(slot);
+      auto route = Route(slot, local.get());
       if (!route.ok())
         return route.status();
       auto hw = state.replication.HighWatermark();

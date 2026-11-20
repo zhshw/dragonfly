@@ -6,6 +6,8 @@
 
 #include <absl/status/statusor.h>
 
+#include <optional>
+#include <string>
 #include <string_view>
 
 #include "server/common_types.h"
@@ -22,6 +24,10 @@ absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffect& effect
 // Inspect a committed key through the normal shard transaction while the group's proposals
 // are serialized. EXISTS accepts every Redis value type.
 absl::StatusOr<bool> ExistsForSet(JournalExecutor& executor, DbIndex db, std::string_view key);
+
+// Read through a shard transaction before releasing the group's read barrier.
+absl::StatusOr<std::optional<std::string>> ReadCommittedValue(JournalExecutor& executor, DbIndex db,
+                                                              std::string_view key);
 
 }  // namespace cluster::raft
 }  // namespace dfly

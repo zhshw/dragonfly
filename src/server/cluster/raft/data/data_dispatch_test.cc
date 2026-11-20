@@ -51,9 +51,12 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
     return true;
   }
 
-  absl::Status CheckRead(DbIndex, string_view) override {
+  absl::StatusOr<optional<string>> Get(DbIndex db, string_view key) override {
     ++reads_;
-    return ready_ ? absl::OkStatus() : absl::UnavailableError("-MOVED 42 127.0.0.1:7002");
+    if (!ready_)
+      return absl::UnavailableError("-MOVED 42 127.0.0.1:7002");
+    JournalExecutor executor(service_.get());
+    return ReadCommittedValue(executor, db, key);
   }
 
   absl::StatusOr<DataTopology> Topology() override {
@@ -118,6 +121,13 @@ TEST_F(DataDispatchTest, GateRunsBeforeTransactionsAndBypassesOnlyInternalReplay
               facade::ArgType(facade::RespExpr::ERROR));
   EXPECT_EQ(Run({"GET", "k"}), "v");
   EXPECT_EQ(sets_, 2u);
+  EXPECT_EQ(Run({"SELECT", "1"}), "OK");
+  EXPECT_THAT(Run({"GET", "k"}), facade::ArgType(facade::RespExpr::NIL));
+  EXPECT_EQ(Run({"SET", "k", ""}), "OK");
+  EXPECT_EQ(Run({"GET", "k"}), "");
+  const string binary(2048, '\0');
+  EXPECT_EQ(Run({"SET", "k", binary}), "OK");
+  EXPECT_EQ(Run({"GET", "k"}).GetString(), binary);
 }
 
 TEST_F(DataDispatchTest, ConditionalSetReturnsNullOrOkWithoutOverwritingOnFailure) {
