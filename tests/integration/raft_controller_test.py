@@ -1,6 +1,7 @@
 """Run against a local build containing dragonfly and raft_storage (DRAGONFLY_PATH)."""
 
 import io
+import json
 import os
 from pathlib import Path
 import socket
@@ -47,6 +48,48 @@ def describe(port):
     return View(leader, epoch, hw, voters)
 
 
+def compact(value):
+    data = value.encode()
+    assert len(data) < 127
+    return bytes([len(data) + 1]) + data
+
+
+def broker_rpc(port, key, version, request):
+    # Flexible RequestHeader v2 and ResponseHeader v1, a single in-flight request.
+    correlation = 28
+    frame = struct.pack(">hhihB", key, version, correlation, -1, 0) + request
+    with socket.create_connection(("127.0.0.1", port), timeout=7) as sock, sock.makefile("rb") as r:
+        sock.sendall(struct.pack(">i", len(frame)) + frame)
+        size = struct.unpack(">i", r.read(4))[0]
+        assert 5 < size < 4096
+        result = r.read(size)
+    assert struct.unpack(">iB", result[:5]) == (correlation, 0)
+    return result[5:]
+
+
+def register(port, cluster, incarnation, resp_port, raft_port):
+    req = struct.pack(">i", 7) + compact(cluster) + bytes([incarnation]) * 16 + b"\x03"
+    for name, endpoint in (("RESP", resp_port), ("RAFT", raft_port)):
+        req += compact(name) + compact("127.0.0.1") + struct.pack(">HhB", endpoint, 0, 0)
+    req += b"\x03"
+    for name, level in (("metadata.version", 33), ("dragonfly.cluster", 1)):
+        req += compact(name) + struct.pack(">hhB", level, level, 0)
+    # null rack, isMigratingZkBroker=false, one non-reserved directory UUID, previousEpoch=-1.
+    req += b"\x00\x00\x02" + b"\x11" * 16 + struct.pack(">qB", -1, 0)
+    _, error, epoch, tags = struct.unpack(">ihqB", broker_rpc(port, 62, 4, req))
+    assert tags == 0
+    return error, epoch
+
+
+def heartbeat(port, epoch, applied_offset):
+    req = struct.pack(">iqqBBB", 7, epoch, applied_offset, 0, 0, 0)
+    _, error, caught, fenced, shutdown, tags = struct.unpack(
+        ">ihBBBB", broker_rpc(port, 63, 2, req)
+    )
+    assert tags == 0 and not shutdown
+    return error, bool(caught), bool(fenced)
+
+
 class ControllerProcessTest(unittest.TestCase):
     def setUp(self):
         self.server = Path(os.getenv("DRAGONFLY_PATH", "build-dbg/dragonfly")).resolve()
@@ -85,6 +128,7 @@ class ControllerProcessTest(unittest.TestCase):
             f"--raft_node_id={node}",
             f"--raft_quorum_voters={self.voters}",
             f"--dir={self.root / str(node)}",
+            *getattr(self, "bootstrap_flags", []),
             "--force_epoll",
             "--proactor_threads=1",
             "--port=0",
@@ -151,6 +195,56 @@ class ControllerProcessTest(unittest.TestCase):
         self.assertIn(b"Static voter IDs differ", rejected.stderr)
         self.start(1)
         self.assertGreater(self.committed(view.hw).epoch, view.epoch)
+
+    def test_bootstrap_broker_fencing_and_controller_failover(self):
+        self.configure(3)
+        with ExitStack() as stack:
+            ports = []
+            for _ in range(2):
+                sock = stack.enter_context(socket.socket())
+                sock.bind(("127.0.0.1", 0))
+                ports.append(sock.getsockname()[1])
+            resp_port, raft_port = ports
+            path = self.root / "bootstrap.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "group_id": 10,
+                            "master": {
+                                "id": "A",
+                                "ip": "127.0.0.1",
+                                "port": resp_port,
+                                "broker_id": 7,
+                                "raft_port": raft_port,
+                            },
+                            "replicas": [],
+                            "slot_ranges": [{"start": 0, "end": 16383}],
+                        }
+                    ]
+                )
+            )
+            self.bootstrap_flags = [f"--raft_bootstrap_topology={path}"]
+            for node in self.ports:
+                self.start(node)
+            initial = self.committed(1)
+            port = self.ports[initial.leader]
+            peer = next(n for n in self.nodes if n != initial.leader)
+            self.assertEqual(register(self.ports[peer], self.cluster_id, 1, *ports), (41, -1))
+            self.assertEqual(register(port, "wrong-cluster", 1, *ports), (104, -1))
+            error, epoch = register(port, self.cluster_id, 1, *ports)
+            self.assertEqual(error, 0)
+            self.assertEqual(heartbeat(port, epoch, epoch - 1), (0, False, True))
+            self.assertEqual(heartbeat(port, epoch, epoch), (0, True, False))
+            self.assertEqual(register(port, self.cluster_id, 2, *ports), (101, -1))
+            stable = self.committed(initial.hw)
+            self.assertGreater(stable.hw, epoch)
+            self.stop(initial.leader, crash=True)
+            next_view = self.committed(stable.hw)
+            new_port = self.ports[next_view.leader]
+            self.assertEqual(heartbeat(new_port, epoch, next_view.hw - 1), (0, True, False))
+            self.assertEqual(heartbeat(new_port, epoch - 1, next_view.hw - 1), (77, False, True))
+            self.assertEqual(register(new_port, self.cluster_id, 1, *ports), (0, epoch))
 
     def test_election_minority_and_durable_prefix(self):
         self.configure(3)

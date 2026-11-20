@@ -84,6 +84,7 @@ using namespace std;
 ABSL_DECLARE_FLAG(std::string, dir);
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_FLAG(string, raft_role, "", "");
+ABSL_FLAG(string, raft_bootstrap_topology, "", "Initial metadata controller topology file.");
 ABSL_FLAG(string, raft_cluster_id, "", "Cluster ID recorded by raft_storage format.");
 ABSL_FLAG(int32_t, raft_node_id, -1, "Node ID recorded by raft_storage format.");
 ABSL_FLAG(string, raft_quorum_voters, "",
@@ -358,7 +359,7 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
 #endif
     auto status = cluster::raft::RunController(
         dir.empty() ? "." : dir, GetFlag(FLAGS_raft_cluster_id), GetFlag(FLAGS_raft_node_id),
-        GetFlag(FLAGS_raft_quorum_voters), pool, acceptor);
+        GetFlag(FLAGS_raft_quorum_voters), pool, acceptor, GetFlag(FLAGS_raft_bootstrap_topology));
     if (!status.ok()) {
       LOG(ERROR) << status;
       exit(1);
