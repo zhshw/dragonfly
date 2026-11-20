@@ -118,7 +118,7 @@ if (WITH_GCP)
   add_definitions(-DWITH_GCP)
 endif()
 
-cxx_link(dragonfly_lib dfly_transaction dfly_facade dfly_tiering
+cxx_link(dragonfly_lib dfly_transaction dfly_facade dfly_tiering dfly_raft
          redis_lib ${AWS_LIB} ${GCP_LIB} azure_lib jsonpath ${DF_FILTER_LIB}
          strings_lib html_lib
          http_client_lib absl::random_random TRDP::jsoncons TRDP::zstd TRDP::lz4

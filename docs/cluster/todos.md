@@ -47,6 +47,7 @@
 - [ ] 04.1 在 proactor/fiber 上实现事件循环、请求超时及重试。给测试注入时钟、退避随机数、消息到达顺序和写盘完成事件。
 - [ ] 04.2 移植 pre-vote、正式投票、leader 通告和退位。按日志末端 epoch、offset 及 voter 身份检查候选者。覆盖重复请求、过期响应、重启后重投、observer 不计票。
 - [ ] 04.3 实现 follower 主动 Fetch、分歧检测和追赶。voter 持久化后在后续 Fetch 报告新 LEO；leader 按有效 voter 多数和当前任期记录推进 HW。覆盖仅复制旧任期记录、重复 Fetch 和失去多数后的退位。
+  - [x] 移植 LeaderState 的排他 HW 计算。覆盖当前 term 首条记录、1/2/3 个 voter、多数门槛变化和同 offset 的 segment 位置更新。[实现与测试](../../src/server/cluster/raft/replication/high_watermark_test.cc)
 - [ ] 04.4 实现元数据 FetchSnapshot 分块、校验、原子安装及从排他 endOffset 续拉。模拟传输中换主与重启，检查快照身份和保留前缀。
 - [ ] 04.5 实现 Add/Remove/UpdateRaftVoter。observer 追平后一次增删一个 voter，按 VotersRecord 的生效、提交、截断规则更新成员；覆盖未提交变更时换主、删除当前 leader 和 ackWhenCommitted。
 - [ ] 04.6 给 Java 和 C++ 输入同一事件序列，逐步比较角色、已投选票、输出 RPC、HW 和保留前缀。先移植 KafkaRaftClientPreVoteTest、LeaderStateTest，再移植 KafkaRaftClientReconfigTest 与 RaftEventSimulationTest。
