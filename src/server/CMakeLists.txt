@@ -11,7 +11,7 @@ if(APPLE)
 endif()
 
 add_executable(dragonfly dfly_main.cc version_monitor.cc cluster/raft/runtime/data_node.cc
-               cluster/raft/runtime/slot_migration_driver.cc)
+               cluster/raft/runtime/data_snapshot.cc cluster/raft/runtime/slot_migration_driver.cc)
 add_custom_target(check_dfly WORKING_DIRECTORY .. COMMAND ctest -L DFLY)
 cxx_link(dragonfly base dragonfly_lib cloud_lib dfly_raft_transport)
 

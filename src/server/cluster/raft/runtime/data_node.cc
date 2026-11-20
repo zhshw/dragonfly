@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 
+#include "base/flags.h"
 #include "base/logging.h"
 #include "server/cluster/raft/data/apply_progress.h"
 #include "server/cluster/raft/data/kv_rdb.h"
@@ -17,6 +18,7 @@
 #include "server/cluster/raft/data/set_executor.h"
 #include "server/cluster/raft/metadata/metadata_image.h"
 #include "server/cluster/raft/quorum/fetch_replication.h"
+#include "server/cluster/raft/runtime/data_snapshot.h"
 #include "server/cluster/raft/runtime/group.h"
 #include "server/cluster/raft/runtime/slot_migration_driver.h"
 #include "server/cluster/raft/transport/peer_connection.h"
@@ -25,6 +27,9 @@
 #include "util/accept_server.h"
 #include "util/fibers/fiberqueue_threadpool.h"
 #include "util/fibers/pool.h"
+
+ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_bytes);
+ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_interval_ms);
 
 namespace dfly::cluster::raft {
 namespace {
@@ -46,10 +51,13 @@ absl::Status ClusterDown() {
 }
 
 struct LocalPartition {
-  explicit LocalPartition(int32_t group) : id(group), effects(group) {
+  LocalPartition(int32_t group, const string& cluster_id, Service& service,
+                 fb2::ProactorBase* owner)
+      : id(group), effects(group), snapshots(cluster_id, group, service, owner) {
   }
   int32_t id;
   CommittedEffects effects;
+  DataSnapshotter snapshots;
   DataApplyProgress progress;
   unique_ptr<RaftGroup> raft;
   unique_ptr<SlotMigrationDriver> migrations;
@@ -96,6 +104,7 @@ class DataNodeImpl final : public DataNode {
     handlers.begin_epoch = Forward(&RpcHandlers::begin_epoch);
     handlers.end_epoch = Forward(&RpcHandlers::end_epoch);
     handlers.fetch = Forward(&RpcHandlers::fetch);
+    handlers.fetch_snapshot = Forward(&RpcHandlers::fetch_snapshot);
     handlers.fetch_slot_image = Forward(&RpcHandlers::fetch_slot_image);
     handlers.describe_quorum = Forward(&RpcHandlers::describe_quorum);
     auto listener = make_unique<RaftListener>(kMaxRaftFrame, std::move(handlers));
@@ -118,6 +127,8 @@ class DataNodeImpl final : public DataNode {
       control_fiber_.Join();
     if (migration_fiber_.IsJoinable())
       migration_fiber_.Join();
+    if (snapshot_fiber_.IsJoinable())
+      snapshot_fiber_.Join();
     if (auto group = partition_.load())
       group->raft->Join();
     observer_->Join();
@@ -165,6 +176,7 @@ class DataNodeImpl final : public DataNode {
   atomic_bool stopping_{false};
   fb2::Fiber control_fiber_;
   fb2::Fiber migration_fiber_;
+  fb2::Fiber snapshot_fiber_;
 
   // Both loops run on owner_, each with a separate RPC connection.
   optional<QuorumEndpoint> controller_leader_;
@@ -187,8 +199,10 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
         return absl::FailedPreconditionError("Data voter is missing a Raft endpoint");
       voters.emplace(member, *ep);
     }
-    auto local = make_shared<LocalPartition>(id);
+    auto local = make_shared<LocalPartition>(id, identity_.cluster_id, *service_, owner_);
     auto apply = [this, replica = local.get()](const PartitionLog& log, int64_t hw) {
+      if (auto s = replica->snapshots.Restore(log, hw, &replica->effects); !s.ok())
+        return s;
       auto apply_set = [&](const SetEffect& effect) {
         // Re-enter the service on a proactor. Client writes wait outside shard transactions.
         return owner_->Await([&] {
@@ -208,7 +222,10 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
       return replica->effects.ApplyTo(log, hw, apply_set, apply_slot);
     };
     auto opened = opener_.Await([&] {
-      return RaftGroup::Open(dir_, identity_, RaftGroup::Kind::kData, id, voters, false, apply);
+      return RaftGroup::Open(dir_, identity_, RaftGroup::Kind::kData, id, voters, false, apply,
+                             [replica = local.get()](const SnapshotWriter& w) {
+                               return replica->snapshots.Validate(w);
+                             });
     });
     if (!opened.ok())
       return opened.status();
@@ -236,6 +253,14 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
       return error_code{};
     };
     local->raft->Start(owner_);
+    snapshot_fiber_ = owner_->LaunchFiber([this, local] {
+      while (!stopping_) {
+        auto s = local->snapshots.MaybeSave(*local->raft, local->effects);
+        if (!s.ok() && !stopping_)
+          LOG(WARNING) << "Data group " << local->id << " snapshot: " << s;
+        util::ThisFiber::SleepFor(s.ok() ? milliseconds(100) : milliseconds(1000));
+      }
+    });
     partition_.store(std::move(local));
     return absl::OkStatus();
   }
@@ -584,6 +609,9 @@ absl::StatusOr<unique_ptr<DataNode>> DataNode::Open(const filesystem::path& dir,
                                                     uint16_t resp_port, Service* service,
                                                     util::ProactorPool* pool,
                                                     util::AcceptServer* acceptor) {
+  if (absl::GetFlag(FLAGS_raft_data_snapshot_bytes) < 1 ||
+      absl::GetFlag(FLAGS_raft_data_snapshot_interval_ms) < 0)
+    return absl::InvalidArgumentError("Invalid data snapshot size or interval");
   auto identity = ReadRaftDirectory(dir);
   if (!identity.ok())
     return identity.status();
