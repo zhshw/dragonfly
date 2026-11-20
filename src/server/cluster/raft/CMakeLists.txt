@@ -16,6 +16,7 @@ add_library(dfly_raft
             protocol/rpc_frame.cc
             protocol/vote.cc
             quorum/campaign.cc
+            quorum/describe.cc
             quorum/election.cc
             quorum/epoch_control.cc
             quorum/fetch_replication.cc
@@ -38,6 +39,7 @@ helio_cxx_test(protocol/fetch_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/rpc_frame_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/vote_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/campaign_test dfly_raft LABELS DFLY)
+helio_cxx_test(quorum/describe_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/election_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/epoch_control_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/fetch_replication_test dfly_raft LABELS DFLY)
