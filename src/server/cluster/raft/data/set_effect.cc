@@ -79,6 +79,32 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
 }
 
 absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, ApplySet apply) {
+  return ApplyTo(log, hw, apply, [](SlotId, optional<string_view>, string_view) {
+    return absl::FailedPreconditionError("No slot image installer is attached");
+  });
+}
+
+absl::Status CommittedEffects::ApplyRecord(string_view payload, LogPosition end, ApplySet apply,
+                                           ApplySlotImage apply_image) {
+  if (payload.starts_with(kSlotTransferMagic)) {
+    protocol::SlotTransferRecord record;
+    if (protocol::Decode(payload.substr(kSlotTransferMagic.size()), 0, &record) !=
+        protocol::CodecError::kOk)
+      return absl::DataLossError("Invalid Dragonfly slot transfer payload");
+    return transfers_.Replay(group_id_, record, end, apply_image);
+  }
+  auto effect = DecodeSetEffect(payload);
+  if (!effect.ok())
+    return effect.status();
+  if (effect->group_id != group_id_)
+    return absl::FailedPreconditionError("SET effect belongs to another replication group");
+  if (transfers_.BlocksAccess(effect->slot, effect->generation))
+    return absl::FailedPreconditionError("SET effect addresses a fenced slot generation");
+  return effect->action == SetEffect::Action::kReplace ? apply(*effect) : absl::OkStatus();
+}
+
+absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, ApplySet apply,
+                                       ApplySlotImage apply_image) {
   if (applied_ < log.StartOffset() || applied_ > log.End().end_offset)
     return absl::FailedPreconditionError(
         "KV image applied offset is outside the retained group log");
@@ -105,15 +131,8 @@ absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, Appl
     if (!batch->control) {
       if (records.size() != 1 || records.front().key || !records.front().value)
         return absl::DataLossError("Expected one Dragonfly KV effect in a data batch");
-      auto effect = DecodeSetEffect(*records.front().value);
-      if (!effect.ok())
-        return effect.status();
-      if (effect->group_id != group_id_)
-        return absl::FailedPreconditionError("SET effect belongs to another replication group");
-      if (effect->action == SetEffect::Action::kReplace) {
-        if (auto s = apply(*effect); !s.ok())
-          return s;
-      }
+      if (auto s = ApplyRecord(*records.front().value, batch->end, apply, apply_image); !s.ok())
+        return s;
     }
     applied_ = batch->end.end_offset;
   }

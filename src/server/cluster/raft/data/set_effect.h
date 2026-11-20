@@ -9,6 +9,7 @@
 
 #include <string>
 
+#include "server/cluster/raft/data/slot_transfer_state.h"
 #include "server/cluster/raft/log/partition_log.h"
 #include "server/common_types.h"
 
@@ -49,14 +50,24 @@ class CommittedEffects {
   }
   using ApplySet = absl::FunctionRef<absl::Status(const SetEffect&)>;
 
+  const SlotTransferState& transfers() const {
+    return transfers_;
+  }
+
   // Apply complete, committed batches in order. The callback checks historical slot ownership
   // and returns OK only after the replacement is visible on its engine shard.
   absl::Status ApplyTo(const PartitionLog& log, int64_t high_watermark, ApplySet apply);
+  absl::Status ApplyTo(const PartitionLog& log, int64_t high_watermark, ApplySet apply,
+                       ApplySlotImage apply_image);
 
  private:
+  absl::Status ApplyRecord(std::string_view payload, LogPosition end, ApplySet apply,
+                           ApplySlotImage apply_image);
+
   int32_t group_id_;
   int64_t applied_;
   bool applying_ = false;
+  SlotTransferState transfers_;
 };
 
 }  // namespace dfly::cluster::raft
