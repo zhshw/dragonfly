@@ -96,4 +96,13 @@ std::vector<ReplicaKey> EpochElection::UnrecordedVoters() const {
   return voters;
 }
 
+std::vector<int32_t> EpochElection::GrantingVoters() const {
+  std::vector<int32_t> voters;
+  for (const auto& [id, voter] : voters_) {
+    if (voter.granted.value_or(false))
+      voters.push_back(id);
+  }
+  return voters;
+}
+
 }  // namespace dfly::cluster::raft

@@ -68,6 +68,7 @@ class EpochElection {
   RecordResult RecordVote(int32_t voter_id, bool granted);
   Outcome GetOutcome() const;
   std::vector<ReplicaKey> UnrecordedVoters() const;
+  std::vector<int32_t> GrantingVoters() const;
 
  private:
   struct Voter {
