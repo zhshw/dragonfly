@@ -1,0 +1,62 @@
+// Copyright 2026, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+#include <absl/functional/function_ref.h>
+#include <absl/status/statusor.h>
+
+#include <filesystem>
+#include <memory>
+
+#include "server/cluster/raft/bootstrap/raft_directory.h"
+#include "server/cluster/raft/config/quorum_config.h"
+#include "server/cluster/raft/protocol/rpc_frame.h"
+
+namespace util::fb2 {
+class ProactorBase;
+}
+
+namespace dfly::cluster::raft {
+class ElectionCampaign;
+class FetchReplication;
+class PartitionLog;
+
+// All access to a partition's log, including application callbacks, runs on its disk worker.
+class RaftGroup {
+ public:
+  enum class Kind { kMetadata, kData };
+  struct State {
+    const ElectionCampaign& election;
+    FetchReplication& replication;
+    PartitionLog& log;
+  };
+  using Operation = absl::FunctionRef<absl::Status(State)>;
+  using ApplyCommitted = std::function<absl::Status(const PartitionLog&, int64_t)>;
+
+  // A metadata observer uses the controllers' voter set for discovery and never votes.
+  static absl::StatusOr<std::unique_ptr<RaftGroup>> Open(const std::filesystem::path& dir,
+                                                         const RaftDirectoryIdentity& identity,
+                                                         Kind kind, int32_t partition,
+                                                         const VoterConnections& voters,
+                                                         bool observer = false,
+                                                         ApplyCommitted apply = {});
+  ~RaftGroup();
+  void Start(util::fb2::ProactorBase* owner);
+  void RequestStop();
+  void Join();
+  protocol::RpcHandlers Handlers();
+  absl::Status Visit(Operation operation);
+
+ private:
+  class Impl;
+  explicit RaftGroup(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
+inline constexpr char kMetadataTopic[] = "__cluster_metadata";
+inline constexpr char kDataTopic[] = "__dragonfly_data";
+inline constexpr size_t kMaxRaftFrame = 16U << 20;
+
+}  // namespace dfly::cluster::raft

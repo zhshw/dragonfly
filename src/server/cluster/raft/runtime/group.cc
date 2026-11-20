@@ -1,0 +1,472 @@
+// Copyright 2026, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#include "server/cluster/raft/runtime/group.h"
+
+#include <absl/random/random.h>
+
+#include <atomic>
+#include <chrono>
+
+#include "base/logging.h"
+#include "server/cluster/raft/bootstrap/raft_directory.h"
+#include "server/cluster/raft/quorum/describe.h"
+#include "server/cluster/raft/quorum/fetch_replication.h"
+#include "server/cluster/raft/quorum/snapshot_transfer.h"
+#include "server/cluster/raft/transport/peer_connection.h"
+#include "util/fibers/fiberqueue_threadpool.h"
+#include "util/fibers/proactor_base.h"
+
+namespace dfly::cluster::raft {
+namespace {
+
+using namespace std;
+using namespace protocol;
+using namespace std::chrono;
+namespace fb2 = util::fb2;
+
+constexpr int32_t kElectionTimeoutMs = 1000;
+constexpr int32_t kFetchTimeoutMs = 2000;
+constexpr uint32_t kRequestTimeoutMs = 1000;
+constexpr int32_t kMaxFetchBytes = 1 << 20;
+
+int64_t NowMs() {
+  return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+int64_t WallMs() {
+  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+absl::Status Status(error_code ec, string_view operation) {
+  return ec ? absl::ErrnoToStatus(ec.value(), operation) : absl::OkStatus();
+}
+
+protocol::Uuid TopicId(RaftGroup::Kind kind) {
+  protocol::Uuid id{};
+  id.back() = kind == RaftGroup::Kind::kMetadata ? 1 : 2;
+  return id;
+}
+
+enum class Pull { kFetch, kSnapshot, kDiscover };
+using PeerTask = variant<monostate, OutboundVote, EpochNotification, Pull>;
+
+}  // namespace
+
+// The disk queue owns every election, log and timer mutation. Each peer's RPC runs
+// on its own fiber, so a disconnected voter cannot stall the majority or disk queue.
+class RaftGroup::Impl {
+ public:
+  Impl(VoteTarget target, vector<CampaignVoter> voters, const filesystem::path& dir,
+       unique_ptr<PartitionLog> log, Kind kind, bool observer, ApplyCommitted apply)
+      : log_(std::move(log)),
+        store_(dir),
+        campaign_(
+            std::move(target), std::move(voters),
+            [this](const ElectionState& state) { return store_.WriteElectionState(state, 0); }),
+        epochs_(campaign_, kind == Kind::kMetadata ? "CONTROLLER" : "RAFT", kFetchTimeoutMs, 1000),
+        replication_(campaign_, epochs_, *log_, TopicId(kind)),
+        snapshots_(campaign_, epochs_, replication_, *log_),
+        kind_(kind),
+        observer_(observer),
+        apply_(std::move(apply)) {
+  }
+
+  absl::Status Recover() {
+    optional<ElectionState> state;
+    if (auto ec = store_.ReadElectionState(&state); ec)
+      return Status(ec, "Reading quorum-state");
+    set<int32_t> configured;
+    for (const auto& voter : campaign_.voters())
+      configured.insert(voter.key.id);
+    if (state && state->voters != configured)
+      return absl::FailedPreconditionError("Static voter IDs differ from durable quorum-state");
+    if (!state && log_->End().end_offset != 0)
+      return absl::DataLossError("Missing quorum-state for a populated static quorum");
+    if (auto ec = campaign_.Recover(state.value_or(ElectionState{}), log_->End()); ec)
+      return Status(ec, "Recovering metadata quorum");
+    return Synchronize();
+  }
+
+  void Start(fb2::ProactorBase* owner) {
+    fibers_.push_back(owner->LaunchFiber([this] {
+      while (!stopping_) {
+        worker_.Await([this] { Tick(); });
+        ThisFiberSleep();
+      }
+    }));
+    for (const auto& voter : campaign_.voters()) {
+      if (voter.key.id != campaign_.target().local_replica.id)
+        fibers_.push_back(owner->LaunchFiber([this, voter] { RunPeer(voter); }));
+    }
+  }
+
+  void RequestStop() {
+    stopping_ = true;
+  }
+
+  void Join() {
+    RequestStop();
+    for (auto& fiber : fibers_)
+      fiber.Join();
+  }
+
+  RpcHandlers Handlers();
+  absl::Status Visit(Operation operation) {
+    return worker_.Await([&] {
+      Tick();
+      if (failed_ || stopping_)
+        return absl::UnavailableError("Quorum is unavailable");
+      return operation({campaign_, replication_, *log_});
+    });
+  }
+
+ private:
+  static void ThisFiberSleep() {
+    util::ThisFiber::SleepFor(chrono::milliseconds(25));
+  }
+
+  void ResetDeadline(int64_t now) {
+    deadline_ =
+        now + (campaign_.state().role == QuorumRole::kFollower
+                   ? kFetchTimeoutMs
+                   : kElectionTimeoutMs + absl::Uniform<int>(random_, 0, kElectionTimeoutMs));
+  }
+
+  absl::Status Synchronize() {
+    auto status = replication_.SyncRole(WallMs());
+    if (!status.ok())
+      return status;
+    snapshots_.SyncRole();
+    if (auto hw = replication_.HighWatermark(); hw && apply_ && *hw != applied_) {
+      if (auto s = apply_(*log_, *hw); !s.ok())
+        return s;
+      applied_ = *hw;
+    }
+    auto role = campaign_.state().role;
+    auto epoch = campaign_.state().election.epoch;
+    if (role != role_ || epoch != epoch_) {
+      notifications_.clear();
+      role_ = role;
+      epoch_ = epoch;
+      ResetDeadline(NowMs());
+      LOG(INFO) << campaign_.target().topic << " partition " << campaign_.target().partition
+                << " node " << campaign_.target().local_replica.id << " epoch " << epoch
+                << " leader " << campaign_.state().election.leader_id.value_or(-1) << " log end "
+                << log_->End().end_offset;
+    }
+    return absl::OkStatus();
+  }
+
+  void Tick() {
+    if (failed_)
+      return;
+    auto status = PollTimers();
+    if (!status.ok()) {
+      failed_ = true;
+      LOG(ERROR) << "Stopped quorum " << campaign_.target().topic << ": " << status;
+    }
+  }
+
+  absl::Status PollTimers() {
+    if (auto s = Synchronize(); !s.ok())
+      return s;
+    auto now = NowMs();
+    if (!observer_ && role_ != QuorumRole::kLeader && now >= deadline_) {
+      if (auto ec = campaign_.OnElectionTimeout(); ec)
+        return Status(ec, "Advancing election");
+      ResetDeadline(now);
+    }
+    vector<EpochNotification> outbound;
+    if (auto ec = epochs_.Poll(now, &outbound); ec)
+      return Status(ec, "Polling epoch notifications");
+    if (auto s = Synchronize(); !s.ok())
+      return s;
+    for (auto& message : outbound)
+      notifications_.insert_or_assign(message.recipient.id, std::move(message));
+    return absl::OkStatus();
+  }
+
+  PeerTask Next(ReplicaKey key) {
+    Tick();
+    if (failed_)
+      return {};
+    auto notification = notifications_.extract(key.id);
+    if (notification)
+      return std::move(notification.mapped());
+    if (auto vote = campaign_.PrepareVote(key, log_->End()))
+      return std::move(*vote);
+    if (observer_ && (role_ == QuorumRole::kUnattached || NowMs() >= deadline_) &&
+        NowMs() >= discovery_after_[key.id]) {
+      discovery_after_[key.id] = NowMs() + 250;
+      return Pull::kDiscover;
+    }
+    if (role_ == QuorumRole::kFollower && campaign_.state().election.leader_id == key.id)
+      return replication_.RequestedSnapshot() ? Pull::kSnapshot : Pull::kFetch;
+    return {};
+  }
+
+  template <typename F> error_code OnWorker(F&& f) {
+    return worker_.Await([&] {
+      Tick();
+      if (failed_ || stopping_)
+        return make_error_code(errc::state_not_recoverable);
+      return f();
+    });
+  }
+
+  void RunPeer(const CampaignVoter& voter) {
+    PeerConnection peer(voter.endpoint, kRequestTimeoutMs, kMaxRaftFrame);
+    while (!stopping_) {
+      auto task = worker_.Await([&] { return Next(voter.key); });
+      if (auto* vote = get_if<OutboundVote>(&task)) {
+        VoteResponse response;
+        bool pre_vote = vote->request.topics[0].partitions[0].pre_vote;
+        auto ec = peer.Call(vote->request, pre_vote ? 2 : 0, &response);
+        if (pre_vote && ec == errc::protocol_not_supported) {
+          response.error_code = 35;
+          ec.clear();
+        }
+        if (!ec)
+          ec = OnWorker(
+              [&] { return campaign_.ReceiveVoteResponse(voter.key, vote->sequence, response); });
+        if (ec)
+          VLOG(1) << "Vote to node " << voter.key.id << ": " << ec.message();
+      } else if (auto* notification = get_if<EpochNotification>(&task)) {
+        auto ec = SendEpoch(peer, *notification);
+        if (ec)
+          VLOG(1) << "Epoch notification for node " << voter.key.id << ": " << ec.message();
+      } else if (auto* pull = get_if<Pull>(&task)) {
+        switch (*pull) {
+          case Pull::kDiscover:
+            Discover(peer, voter);
+            break;
+          case Pull::kFetch:
+            FetchFrom(peer, voter.key.id);
+            break;
+          case Pull::kSnapshot:
+            FetchSnapshotFrom(peer, voter.key.id);
+            break;
+        }
+      }
+      ThisFiberSleep();
+    }
+    peer.Close();
+  }
+
+  error_code SendEpoch(PeerConnection& peer, const EpochNotification& n) {
+    if (auto* begin = get_if<BeginQuorumEpochRequest>(&n.request)) {
+      BeginQuorumEpochResponse response;
+      if (auto ec = peer.Call(*begin, 0, &response); ec)
+        return ec;
+      return OnWorker([&] { return epochs_.ReceiveBeginResponse(n.recipient, n.epoch, response); });
+    }
+    EndQuorumEpochResponse response;
+    if (auto ec = peer.Call(get<EndQuorumEpochRequest>(n.request), 0, &response); ec)
+      return ec;
+    return OnWorker([&] { return epochs_.ReceiveEndResponse(n.recipient, n.epoch, response); });
+  }
+
+  void FetchFrom(PeerConnection& peer, int32_t leader) {
+    int16_t version;
+    if (peer.Negotiate<FetchRequest>(kMinRaftFetchVersion, &version))
+      return;
+    auto fetch = worker_.Await([&]() -> optional<OutboundFetch> {
+      if (failed_ || campaign_.state().role != QuorumRole::kFollower ||
+          campaign_.state().election.leader_id != leader)
+        return nullopt;
+      return replication_.PrepareFetch(leader, version, 100, kMaxFetchBytes);
+    });
+    if (!fetch)
+      return;
+    FetchResponse response;
+    if (peer.Call(fetch->request, version, &response))
+      return;
+    worker_.Await([&] {
+      bool reset = false;
+      auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, response, &reset);
+      if (!s.ok())
+        VLOG(1) << "Fetch from node " << leader << ": " << s;
+      if (reset)
+        ResetDeadline(NowMs());
+    });
+  }
+
+  void Discover(PeerConnection& peer, const CampaignVoter& voter) {
+    DescribeQuorumRequest req;
+    auto& topic = req.topics.emplace_back();
+    topic.topic_name = campaign_.target().topic;
+    topic.partitions.emplace_back().partition_index = campaign_.target().partition;
+    DescribeQuorumResponse res;
+    if (peer.Call(req, 0, &res) || res.error_code || res.topics.size() != 1 ||
+        res.topics[0].topic_name != topic.topic_name || res.topics[0].partitions.size() != 1)
+      return;
+    const auto& part = res.topics[0].partitions.front();
+    if (part.partition_index != campaign_.target().partition || part.error_code ||
+        part.leader_id != voter.key.id)
+      return;
+    worker_.Await([&] {
+      if (part.leader_epoch >= campaign_.state().election.epoch) {
+        if (auto ec = campaign_.ObserveLeader(part.leader_epoch, voter.key.id, voter.endpoint); ec)
+          VLOG(1) << "Metadata discovery: " << ec.message();
+      }
+    });
+  }
+
+  void FetchSnapshotFrom(PeerConnection& peer, int32_t leader) {
+    int16_t version;
+    if (kind_ != Kind::kMetadata || peer.Negotiate<FetchSnapshotRequest>(0, &version))
+      return;
+    auto fetch = worker_.Await([&] { return snapshots_.Prepare(version, kMaxFetchBytes); });
+    if (!fetch || fetch->peer_id != leader)
+      return;
+    FetchSnapshotResponse response;
+    if (peer.Call(fetch->request, version, &response))
+      return;
+    worker_.Await([&] {
+      bool reset = false;
+      auto s = snapshots_.ReceiveResponse(leader, fetch->sequence, response, &reset);
+      if (!s.ok())
+        VLOG(1) << "Snapshot from node " << leader << ": " << s;
+      if (reset)
+        ResetDeadline(NowMs());
+    });
+  }
+
+  error_code Fetch(int16_t version, const FetchRequest& request, FetchResponse* response);
+
+  unique_ptr<PartitionLog> log_;
+  FileQuorumStateStore store_;
+  ElectionCampaign campaign_;
+  EpochControl epochs_;
+  FetchReplication replication_;
+  SnapshotTransfer snapshots_;
+  const Kind kind_;
+  const bool observer_;
+  ApplyCommitted apply_;
+  int64_t applied_ = -1;
+  map<int32_t, int64_t> discovery_after_;
+  fb2::FiberQueueThreadPool worker_{1};
+  absl::BitGen random_;
+  int64_t deadline_ = 0;
+  QuorumRole role_ = QuorumRole::kUnattached;
+  int32_t epoch_ = -1;
+  bool failed_ = false;
+  map<int32_t, EpochNotification> notifications_;
+  atomic_bool stopping_{false};
+  vector<fb2::Fiber> fibers_;
+};
+
+RpcHandlers RaftGroup::Impl::Handlers() {
+  RpcHandlers handlers;
+  handlers.vote = [this](int16_t v, const auto& req, auto* res) {
+    return OnWorker([&] { return campaign_.ReceiveVote(req, v, log_->End(), res); });
+  };
+  handlers.begin_epoch = [this](int16_t v, const auto& req, auto* res) {
+    return OnWorker([&] { return epochs_.ReceiveBegin(req, v, res); });
+  };
+  handlers.end_epoch = [this](int16_t v, const auto& req, auto* res) {
+    return OnWorker([&] {
+      optional<int32_t> timeout;
+      auto ec = epochs_.ReceiveEnd(req, v, res, &timeout);
+      if (!ec && timeout) {
+        if (!Synchronize().ok())
+          return make_error_code(errc::io_error);
+        deadline_ = NowMs() + *timeout;
+      }
+      return ec;
+    });
+  };
+  handlers.fetch = [this](int16_t v, const auto& req, auto* res) { return Fetch(v, req, res); };
+  if (kind_ == Kind::kMetadata)
+    handlers.fetch_snapshot = [this](int16_t v, const auto& req, auto* res) {
+      return OnWorker([&] {
+        auto s = snapshots_.HandleRequest(req, v, NowMs(), res);
+        return s.ok() ? error_code{} : make_error_code(errc::io_error);
+      });
+    };
+  handlers.describe_quorum = [this](int16_t v, const auto& req, auto* res) {
+    return OnWorker([&] { return DescribeQuorum(campaign_, replication_, v, req, WallMs(), res); });
+  };
+  return handlers;
+}
+
+error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
+                                  FetchResponse* response) {
+  // Delay an empty Fetch until data or the commit boundary changes, or until maxWaitMs.
+  // Checking the watched values must not count a parked request as repeated voter contact.
+  using Watch = tuple<QuorumRole, int32_t, LogPosition, optional<int64_t>>;
+  optional<Watch> previous;
+  bool can_wait = false;
+  const auto deadline = steady_clock::now() + milliseconds(request.max_wait_ms);
+  do {
+    if (auto ec = OnWorker([&] {
+          Watch current(role_, epoch_, log_->End(), replication_.HighWatermark());
+          if (previous == current)
+            return error_code{};
+          const bool completing = previous.has_value();
+          previous = current;
+          auto s =
+              replication_.HandleFetch(request, version, NowMs(), WallMs(), response, &can_wait);
+          if (completing)
+            can_wait = false;
+          return s.ok() ? error_code{} : make_error_code(errc::io_error);
+        });
+        ec)
+      return ec;
+    if (!can_wait || steady_clock::now() >= deadline)
+      return {};
+    util::ThisFiber::SleepUntil(min(deadline, steady_clock::now() + milliseconds(25)));
+  } while (!stopping_);
+  return make_error_code(errc::operation_canceled);
+}
+
+RaftGroup::RaftGroup(unique_ptr<Impl> impl) : impl_(std::move(impl)) {
+}
+RaftGroup::~RaftGroup() = default;
+
+absl::StatusOr<unique_ptr<RaftGroup>> RaftGroup::Open(const filesystem::path& dir,
+                                                      const RaftDirectoryIdentity& identity,
+                                                      Kind kind, int32_t partition,
+                                                      const VoterConnections& voters, bool observer,
+                                                      ApplyCommitted apply) {
+  if (partition < 0 || voters.empty() || (kind == Kind::kMetadata && partition != 0) ||
+      (observer && kind != Kind::kMetadata) || voters.contains(identity.node_id) == observer)
+    return absl::InvalidArgumentError("Invalid quorum partition, local role or voter set");
+  vector<CampaignVoter> members;
+  for (const auto& [id, ep] : voters) {
+    if (id < 0 || ep.host.empty() || ep.port == 0 || ep.host == "::")
+      return absl::InvalidArgumentError("Invalid static voter endpoint");
+    members.push_back({ReplicaKey{id}, ep});
+  }
+  const string topic = kind == Kind::kMetadata ? kMetadataTopic : kDataTopic;
+  auto group_dir = dir / (topic + "-" + to_string(partition));
+  auto log = PartitionLog::Open(group_dir);
+  if (!log.ok())
+    return log.status();
+  VoteTarget target{
+      identity.cluster_id, topic, partition, {identity.node_id, identity.directory_id}};
+  auto core = make_unique<Impl>(std::move(target), std::move(members), group_dir, *std::move(log),
+                                kind, observer, std::move(apply));
+  if (auto s = core->Recover(); !s.ok())
+    return s;
+  return unique_ptr<RaftGroup>(new RaftGroup(std::move(core)));
+}
+void RaftGroup::Start(fb2::ProactorBase* owner) {
+  impl_->Start(owner);
+}
+void RaftGroup::RequestStop() {
+  impl_->RequestStop();
+}
+void RaftGroup::Join() {
+  impl_->Join();
+}
+RpcHandlers RaftGroup::Handlers() {
+  return impl_->Handlers();
+}
+absl::Status RaftGroup::Visit(Operation operation) {
+  return impl_->Visit(operation);
+}
+
+}  // namespace dfly::cluster::raft
