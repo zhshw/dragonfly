@@ -282,6 +282,8 @@ sequenceDiagram
 
 ## 7. 数据组复制对比实测
 
+本节保留提交 `0855b991` 上的原始对照结果。事件驱动调度改动前后的同口径数据见[第 9 节](#9-事件驱动复制的复测)。
+
 两套集群使用同一个 Linux aarch64 Debug 二进制，在 4 vCPU 的 Colima 虚拟机中通过回环网络通信。组 10 有一个主节点和两个副本，组 20 有一个主节点和一个副本，每个数据进程使用两个引擎分片。旧版通过 `DFLYCLUSTER CONFIG` 和 `REPLICAOF` 建群。Raft 另起三个 controller，节点 13 追平后加入组 10 成为第三个 voter。两种模式依次运行，客户端始终在发送 SET 的同一条 Redis 连接上执行 WAIT。[旧版集群 fixture](../../tests/integration/async_replication_fixture.py) · [配对测试](../../tests/integration/replication_comparison_test.py)
 
 ### 落后一个副本时写入及恢复
@@ -367,4 +369,58 @@ cd ../kafka
   --tests KafkaRaftClientSnapshotTest.testLeaderImmediatelySendsSnapshotId \
   --tests KafkaRaftClientSnapshotTest.testFetchSnapshotResponsePartialData \
   --tests KafkaRaftClientSnapshotTest.testFollowerListenerNotified
+```
+
+## 8. 串行写入和副本追平的时间花在哪里
+
+旧版主节点按引擎分片把变更记入内存 journal，并向每个副本的对应 flow 推送。输出默认攒到 1,500 B 即可异步发送，小包由 10 ms 周期任务检查刷新。副本执行成功后推进 LSN，独立 fiber 批量报告 ACK。普通 SET 可以在 ACK 前返回，WAIT 会催发 ACK。慢副本仍能产生反压，稳定复制的待发送队列默认达到 1 MiB 时生产者会等待。旧版全量同步另走每个分片的 RDB 流，从主节点 socket 直接送到副本的 loader。[journal 推送](../../src/server/journal/streamer.cc) · [排队与反压](../../src/server/journal/buffered_socket_writer.cc) · [全量发送](../../src/server/dflycmd.cc) · [加载与 ACK](../../src/server/replica.cc)
+
+KRaft 的 follower 在下一次 Fetch 携带本地日志末端，leader 按 voter 的位置推进 HW。上游 leader 可以合并多笔记录，在一轮 drain 后刷盘。空 Fetch 可挂起，有新记录或 HW 推进时由 `fetchPurgatory` 唤醒。第 7 节所测 Dragonfly 基线则为每个 SET 追加一个批次，每次 peer 拉取后休眠 25 ms，空 Fetch 每 25 ms 检查一次变化，SET 每 5 ms 检查本地已应用位置。只有一个在途写时，一次取走该批、下一次报告其位置，这些间隔便进入客户端等待路径。[Kafka Raft 客户端](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java) · [Kafka 多数位置](../../../kafka/raft/src/main/java/org/apache/kafka/raft/LeaderState.java) · [Dragonfly 拉取循环](../../src/server/cluster/raft/runtime/group.cc) · [数据组 SET](../../src/server/cluster/raft/runtime/data_node.cc)
+
+用同一 Linux Debug 构建单独诊断一次 64 MiB、256 笔串行 SET。写入时跟踪组 10 的 leader，恢复前解除跟踪。以下时间来自这次诊断。
+
+| 观测窗口 | 直接测量 | 能解释的成本 |
+| --- | --- | --- |
+| 首笔 SET 发出至末笔 OK | 共 14.464 s，SET P50 / P95 为 55.74 / 60.78 ms。日志段、临时恢复边界文件、组目录各成功执行 256 次 `fsync`，累计分别为 228、170、137 ms | 768 次调用合计 0.535 s，占写入窗口 3.70%。除此之外还有 follower 持久化、网络与调度、leader 应用和客户端开销，本次只采集了 leader 的同步调用。第 7 节未跟踪的同规模写入为 14.162 s，两次单次运行相差 2.1%。[分区追加](../../src/server/cluster/raft/log/partition_log.cc) · [恢复边界发布](../../src/server/cluster/raft/log/log_files.cc) |
+| 节点 13 启动至同连接 `WAIT 2` 返回 2 | 共 3.009 s，持久化 LEO 从 5 到 261。前 85 次各前进 3，最后一次前进 1。首次推进在 0.137 s，最后推进在 2.955 s，相邻推进间隔 P50 / P95 为 32.55 / 38.17 ms | 256 KiB 的值加上记录头后，1 MiB Fetch 预算只能装下三个完整 SET 批次。follower 留下完整前缀，下轮重拉残缺批次。由 86 次推进和基线的 25 ms 间隔推算，轮间休眠至少占 2.125 s，约为本轮恢复窗口的 71%。[读取字节预算](../../src/server/cluster/raft/log/partition_log.cc) · [批次边界对照](../../src/server/cluster/raft/quorum/fetch_replication_test.cc) |
+
+复现时使用基线提交 `0855b991` 的配对测试，在首笔 SET 前向 leader 附加 `strace -f -ttt -T -yy -e trace=fsync,fdatasync -o /tmp/leader-sync.trace -p "$leader_pid"`。按首笔发出至末笔 OK 的时间戳和 `__dragonfly_data-10/` 下的文件或该目录自身筛选，排除元数据组调用。启动节点 13 前另起采样线程，每 1 ms 重新打开其 `__dragonfly_data-10/dragonfly-log-end`，直至 WAIT 完成。校验文件长度 44 和开头 `DFE2`，以 `int.from_bytes(data[32:40], "big")` 读取排他 LEO，用单调时钟记录每次变化。本轮实际采样间隔最长 3.53 ms，短于最短的 29.70 ms 推进间隔。[配对负载](../../tests/integration/replication_comparison_test.py) · [边界文件编码](../../src/server/cluster/raft/log/log_files.cc)
+
+## 9. 事件驱动复制的复测
+
+leader 收到合法的空 Fetch 时，在 RPC fiber 上等本组的日志末端、HW 或领导权变化。leader 持久化新记录后唤醒等待的 Fetch，超时则发送原空响应。只在收到新的副本请求时登记副本位置和联系时间。follower 持久化记录后立即发送下一次 Fetch 报告 LEO，有快照分块进展时也立即续拉。每个 peer 同时只发一个请求，错误或异常的无进展响应仍有退避。一轮正常的空长轮询等满后可以立即重新挂起。[组内事件和调度](../../src/server/cluster/raft/runtime/group.cc) · [Fetch 处理](../../src/server/cluster/raft/quorum/fetch_replication.cc)
+
+SET 追加后，客户端 fiber 等待本组的 HW 或领导权变化，磁盘 worker 可以继续处理副本请求。每次唤醒先应用已提交前缀，再检查原写入的 epoch 和排他 offset。NX/XX 在前序记录应用后重新求值。8 条独立连接同时对同键执行 SET NX，恰有一条成功，读回值与胜者一致。监听器在停机排空连接前也会唤醒挂起的请求。[SET 确认路径](../../src/server/cluster/raft/runtime/data_node.cc) · [条件写与并发唤醒测试](../../tests/integration/raft_data_group_test.py)
+
+**同机对照。** 以下为第 7 节同一负载，每笔仍只有一条在途 SET。Raft 的优化前后各测三轮，另两轮交换新旧二进制的测试顺序。表中各 Raft 指标取三轮中位数，P50、P95 分别取每轮对应分位数的中位数。异步数据取本次单轮重测，有效吞吐量只计业务 value 字节。重启到 WAIT 的计时包含进程启动和客户端的轮询。
+
+| 载荷 | 复制模式 | 写入总耗时 | 有效 MiB/s | SET P50 / P95 | 日志或全量追平至 WAIT 2 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 64 MiB | 异步，本轮重测 | 0.382 s | 167.53 | 1.48 / 2.35 ms | 0.307 s |
+| 64 MiB | Raft，原实现 | 14.162 s | 4.52 | 55.15 / 60.25 ms | 2.908 s |
+| 64 MiB | Raft，事件唤醒 | 2.541 s | 25.19 | 9.47 / 12.75 ms | 1.104 s |
+| 128 MiB | 异步，本轮重测 | 0.719 s | 178.00 | 1.46 / 1.98 ms | 0.408 s |
+| 128 MiB | Raft，原实现 | 28.319 s | 4.52 | 54.85 / 60.07 ms | 5.718 s |
+| 128 MiB | Raft，事件唤醒 | 5.282 s | 24.23 | 9.61 / 13.39 ms | 2.008 s |
+
+**恢复走快照时。** 在独立的中断测试中，128 MiB 快照下载到 3 MiB 时暂停目标 voter，健康多数在 4.98 ms 内确认新写，`WAIT 2 500` 等了 500.78 ms 后返回 1。强杀并重启目标后，从启动到 WAIT 返回 2 的时间从基线的 4.983 s 降到 1.321 s。相同测试在 64 MiB 时从 2.486 s 降到 0.718 s。两种规模的快照摘要、目标节点的每个值和增量写入均通过校验。[中断与恢复测试](../../tests/integration/raft_snapshot_stall_test.py)
+
+**剩余时间。** 对优化版另外做了一轮 64 MiB 双端跟踪，健康 follower 和 leader 分别执行了 768 次数据组 `fsync`。按每条请求配对，客户端发出到 leader 完成目录同步的中位数为 5.74 ms，随后到 follower 完成目录同步为 7.28 ms，再到客户端收到 OK 为 5.25 ms。这些区间还包含调度、数据传输或应用。双端 ptrace 将这一轮的写入总耗时拉长到 4.807 s，表中的延迟与吞吐均取自无跟踪运行。恢复前解除跟踪后，仍观察到 86 次 LEO 前进，相邻推进的中位间隔从 32.55 ms 降至 10.60 ms。
+
+本轮旧版 SET 在主节点执行后即可确认。Raft 还要等两个节点的持久化以及 leader 的本地应用。Kafka 的合批刷盘可以摊薄多个并发写的磁盘成本，本表的串行负载在每笔收到回复后才产生下一个请求，没有可合并的客户端写入。高并发合批的收益要用多连接负载单独测量。[KRaft 批次累积](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/BatchAccumulator.java) · [KRaft 日志刷盘和提交](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java)
+
+etcd/raft v3.6.0 提供了另一个实现参照。follower 把追加响应挂到持久化完成之后。leader 给每个副本设置在途消息数和字节数窗口，可以提前发送后续日志，收到确认才推进该副本的 `Match`。Dragonfly 若给并发 SET 做合批，可以沿用这种有界队列和落盘后确认的约束。KRaft 的 Fetch offset 还向 leader 报告已经持久化的位置，继续单飞拉取时须使用实际 LEO，不能用计划发送的位置代替。两者的共同点是清楚区分已经发出的字节和可以计入多数派的字节。[etcd 落盘后释放响应](https://github.com/etcd-io/raft/blob/f35a02212416d045c574e30aa59d4b07c4b8d732/raft.go#L544-L575) · [在途窗口](https://github.com/etcd-io/raft/blob/f35a02212416d045c574e30aa59d4b07c4b8d732/tracker/inflights.go#L42-L46) · [确认后推进 Match](https://github.com/etcd-io/raft/blob/f35a02212416d045c574e30aa59d4b07c4b8d732/raft.go#L1510-L1546)
+
+复现优化前后结果时，分别构建 `0855b991` 和 `000fbfae`，沿用第 7 节的 Dragonfly 命令。对每个构建分别设置 `REPLICATION_TEST_MIB=64` 和 `128`。两名副本暂停时，SET 已追加但未提交，GET 读到旧值。恢复一名副本后同一请求可以完成。持续失联的请求仍返回结果未知。对应的 Kafka 长轮询回归涵盖追加唤醒、超时、HW 和退位，9 个方法共 14 个参数实例全部通过。Dragonfly 另验证了重算挂起响应只登记一次 voter 联系，以原接触时间检查多数派超时。[监听器停机回归](../../src/server/cluster/raft/transport/raft_listener_test.cc) · [Fetch 回归](../../src/server/cluster/raft/quorum/fetch_replication_test.cc)
+
+```sh
+cd ../kafka
+./gradlew :raft:test --rerun \
+  --tests 'KafkaRaftClientTest.testPurgatoryFetch*' \
+  --tests KafkaRaftClientTest.testResignWillCompleteFetchPurgatory \
+  --tests KafkaRaftClientTest.testLeaderShouldResignLeadershipIfNotGetFetchRequestFromMajorityVoters \
+  --tests KafkaRaftClientFetchTest.testUnknownHwmDeferredWhenLeaderDoesNotKnowHwm \
+  --tests KafkaRaftClientFetchTest.testOutdatedHwmCompletedWhenLeaderKnowsHwm \
+  --tests KafkaRaftClientFetchTest.testUnchangedHighWatermarkDeferred \
+  --tests KafkaRaftClientFetchTest.testUpdatedHighWatermarkCompleted
 ```
