@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <limits>
 #include <string>
 
 namespace dfly::cluster::raft::log_files {
@@ -35,6 +36,16 @@ int SelectedSlot(off_t file_size) {
   if (file_size == kSelectSecond)
     return 1;
   return -1;
+}
+
+// DFE4 keeps its checksummed checkpoint immutable. A bounded sparse suffix encodes how many
+// additional log offsets have been published in this segment. Its low nibble detects any
+// single-bit change to the length. These lengths are disjoint from all legacy formats.
+constexpr int64_t kMinLength = 1 << 16;
+constexpr int64_t kMaxDelta = 4095;
+
+int64_t PublishedLength(int64_t delta) {
+  return kMinLength + 16 * delta + ((delta ^ (delta >> 4) ^ (delta >> 8)) & 15);
 }
 }  // namespace
 absl::Status DiskError(string_view op) {
@@ -89,9 +100,12 @@ absl::StatusOr<optional<DurableEnd>> RecoveryMarker::Read(int dir_fd) {
   if (fstat(fd, &st) != 0)
     return DiskError("Stat quorum log recovery marker");
   int slot = SelectedSlot(st.st_size);
-  if (!S_ISREG(st.st_mode) || (slot < 0 && st.st_size != kOldSize && st.st_size != kSize))
+  bool encoded = st.st_size >= kMinLength && st.st_size < kMinLength + 16 * (kMaxDelta + 1);
+  int64_t delta = encoded ? (st.st_size - kMinLength) / 16 : 0;
+  if (!S_ISREG(st.st_mode) || (encoded && st.st_size != PublishedLength(delta)) ||
+      (!encoded && slot < 0 && st.st_size != kOldSize && st.st_size != kSize))
     return absl::DataLossError("Invalid quorum log recovery marker length");
-  string marker(slot >= 0 ? kSize : st.st_size, '\0');
+  string marker(st.st_size == kOldSize ? kOldSize : kSize, '\0');
   if (auto status = ReadAt(fd, slot >= 0 ? slot * kSlotStride : 0, marker.data(), marker.size());
       !status.ok())
     return status;
@@ -103,7 +117,8 @@ absl::StatusOr<optional<DurableEnd>> RecoveryMarker::Read(int dir_fd) {
   if (marker.size() == kOldSize && marker.starts_with("DFE1")) {
     end.file_end = static_cast<int64_t>(be::Load64(marker.data() + 4));
     end.offset = static_cast<int64_t>(be::Load64(marker.data() + 12));
-  } else if (marker.size() == kSize && marker.starts_with(slot >= 0 ? "DFE3" : "DFE2")) {
+  } else if (marker.size() == kSize &&
+             marker.starts_with(encoded ? "DFE4" : (slot >= 0 ? "DFE3" : "DFE2"))) {
     end.start.end_offset = static_cast<int64_t>(be::Load64(marker.data() + 4));
     end.start.epoch = static_cast<int32_t>(be::Load32(marker.data() + 12));
     end.segment_base = static_cast<int64_t>(be::Load64(marker.data() + 16));
@@ -113,19 +128,58 @@ absl::StatusOr<optional<DurableEnd>> RecoveryMarker::Read(int dir_fd) {
     return absl::DataLossError("Unknown quorum log recovery marker");
   }
   if (end.start.epoch < 0 || end.start.end_offset < 0 || end.segment_base < 0 || end.file_end < 0 ||
-      end.offset < end.start.end_offset || end.offset < end.segment_base)
+      end.offset < end.start.end_offset || end.offset < end.segment_base ||
+      end.offset > numeric_limits<int64_t>::max() - delta)
     return absl::DataLossError("Invalid quorum log recovery boundary");
-  if (slot >= 0) {
-    fd_ = openat(dir_fd, kDurableEnd, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd_ == -1)
+  if (encoded || slot >= 0) {
+    int writable = openat(dir_fd, kDurableEnd, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (writable == -1)
       return DiskError("Opening writable quorum log recovery marker");
+    absl::Cleanup close_writable = [writable] { close(writable); };
+
+    // A process crash can leave the selected length in the page cache between ftruncate and
+    // fsync. Make the recovered selection durable before the quorum can report this position.
+    if (fsync(writable) == -1)
+      return DiskError("Syncing recovered quorum log boundary");
+    if (encoded) {
+      fd_ = writable;
+      std::move(close_writable).Cancel();
+      checkpoint_ = end;
+      published_size_ = st.st_size;
+      end.additional_offsets = delta;
+    }
   }
+
+  // An interrupted checkpoint replacement can also leave the rename in cache. Persist the
+  // name, including for legacy formats, before recovery truncates or unlinks WAL extents.
+  if (fsync(dir_fd) == -1)
+    return DiskError("Syncing recovered quorum log checkpoint name");
   return end;
 }
 
-absl::Status RecoveryMarker::Publish(int dir_fd, const DurableEnd& end) {
+absl::Status RecoveryMarker::Publish(int dir_fd, const DurableEnd& end, bool append) {
+  if (fd_ != -1) {
+    struct stat st;
+    if (fstat(fd_, &st) != 0)
+      return DiskError("Stat quorum log recovery marker");
+    if (st.st_size != published_size_)
+      return absl::DataLossError("Invalid quorum log recovery marker length");
+
+    // The segment is already durable. Publishing only an inode size makes either the old or
+    // the new complete prefix recoverable, including if the process dies before fsync returns.
+    const int64_t delta = end.offset - checkpoint_.offset;
+    if (append && end.start == checkpoint_.start && end.segment_base == checkpoint_.segment_base &&
+        delta >= 0 && delta <= kMaxDelta) {
+      const int64_t length = PublishedLength(delta);
+      if (ftruncate(fd_, length) == -1 || fsync(fd_) == -1)
+        return DiskError("Publishing quorum log recovery boundary");
+      published_size_ = length;
+      return absl::OkStatus();
+    }
+  }
+
   string marker(kSize, '\0');
-  marker.replace(0, 4, "DFE3");
+  marker.replace(0, 4, "DFE4");
   be::Store64(marker.data() + 4, end.start.end_offset);
   be::Store32(marker.data() + 12, end.start.epoch);
   be::Store64(marker.data() + 16, end.segment_base);
@@ -133,37 +187,23 @@ absl::Status RecoveryMarker::Publish(int dir_fd, const DurableEnd& end) {
   be::Store64(marker.data() + 32, end.offset);
   be::Store32(marker.data() + 40,
               static_cast<uint32_t>(absl::ComputeCrc32c(string_view(marker).substr(0, 40))));
-  if (fd_ != -1) {
-    struct stat st;
-    if (fstat(fd_, &st) != 0)
-      return DiskError("Stat quorum log recovery marker");
-    int active = SelectedSlot(st.st_size);
-    if (active < 0)
-      return absl::DataLossError("Invalid quorum log recovery marker selector");
 
-    // Prepare the inactive record before switching the selector. A crash during either sync
-    // can expose the old or the new boundary, but never selects an incompletely written slot.
-    if (auto s = WriteAt(fd_, (1 - active) * kSlotStride, marker); !s.ok())
-      return s;
-    if (fsync(fd_) == -1)
-      return DiskError("Syncing prepared quorum log recovery marker");
-    if (ftruncate(fd_, active == 0 ? kSelectSecond : kSelectFirst) == -1 || fsync(fd_) == -1)
-      return DiskError("Selecting quorum log recovery marker");
-    return absl::OkStatus();
-  }
-
-  // Install the first checkpoint (or upgrade a legacy one) in one directory transaction.
+  // Publish an exact checkpoint when replacing log extents, exhausting the window, or upgrading.
   int fd = openat(dir_fd, kTemp, O_RDWR | O_TRUNC | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0644);
   if (fd == -1)
     return DiskError("Opening temporary quorum log recovery marker");
   absl::Cleanup cleanup = [fd] { close(fd); };
   if (auto status = WriteAt(fd, 0, marker); !status.ok())
     return status;
-  if (ftruncate(fd, kSelectFirst) == -1 || fsync(fd) == -1)
+  if (ftruncate(fd, kMinLength) == -1 || fsync(fd) == -1)
     return DiskError("Syncing initial quorum log recovery marker");
   if (renameat(dir_fd, kTemp, dir_fd, kDurableEnd) == -1 || fsync(dir_fd) == -1)
     return DiskError("Installing quorum log recovery marker");
+  if (fd_ != -1)
+    close(fd_);
   fd_ = fd;
+  checkpoint_ = end;
+  published_size_ = kMinLength;
   std::move(cleanup).Cancel();
   return absl::OkStatus();
 }

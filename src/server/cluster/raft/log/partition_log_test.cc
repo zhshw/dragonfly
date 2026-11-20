@@ -18,6 +18,17 @@ namespace {
 using namespace std;
 namespace fs = std::filesystem;
 
+string LegacyEnd(string_view magic, int64_t file_end, int64_t offset) {
+  string record(44, '\0');
+  record.replace(0, 4, magic);
+  absl::big_endian::Store64(record.data() + 24, file_end);
+  absl::big_endian::Store64(record.data() + 32, offset);
+  absl::big_endian::Store32(
+      record.data() + 40,
+      static_cast<uint32_t>(absl::ComputeCrc32c(string_view(record).substr(0, 40))));
+  return record;
+}
+
 class PartitionLogTest : public testing::Test {
  protected:
   void SetUp() override {
@@ -105,9 +116,10 @@ TEST_F(PartitionLogTest, TruncateOnlyUncommittedBatches) {
 
 TEST_F(PartitionLogTest, RecoveryDropsUnpublishedSuffix) {
   auto first = MakeDataBatch(0, 3, 1, values_).value();
+  auto next = MakeDataBatch(2, 3, 2, values_).value();
   ASSERT_TRUE(log_->Append(first, 3).ok());
   log_.reset();
-  ofstream(Segment(), ios::app | ios::binary).write("torn", 4);
+  ofstream(Segment(), ios::app | ios::binary) << next << "torn";
   Open();
   EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
   EXPECT_EQ(fs::file_size(Segment()), first.size());
@@ -143,32 +155,82 @@ TEST_F(PartitionLogTest, PartialDurabilityFailureRequiresReopen) {
   EXPECT_TRUE(log_->Append(batch, 1).ok());
 }
 
-TEST_F(PartitionLogTest, PreparedSlotIsInvisibleUntilSelectorIsDurable) {
+TEST_F(PartitionLogTest, RecoversSelectedLegacySlotAndUpgradesOnAppend) {
+  log_.reset();
+  constexpr size_t kStride = 64 * 1024;
   const auto marker = dir_ / "dragonfly-log-end";
-  auto empty = fs::file_size(marker);
-  fs::create_hard_link(marker, dir_ / "same-checkpoint");
-  auto batch = MakeDataBatch(0, 1, 1, values_).value();
-  ASSERT_TRUE(log_->Append(batch, 1).ok());
-  ASSERT_TRUE(fs::equivalent(marker, dir_ / "same-checkpoint"));
-  ASSERT_NE(fs::file_size(marker), empty);
-  log_.reset();
+  auto first = MakeDataBatch(0, 1, 1, values_).value();
+  auto next = MakeDataBatch(2, 1, 2, values_).value();
+  auto selected = LegacyEnd("DFE3", first.size(), 2);
+  auto prepared = LegacyEnd("DFE3", first.size() + next.size(), 4);
+  ofstream(Segment(), ios::binary) << first << next;
+  ofstream(marker, ios::binary) << prepared;
+  fstream(marker, ios::in | ios::out | ios::binary).seekp(kStride) << selected;
+  fs::resize_file(marker, 2 * kStride + 15);
 
-  // Model a crash after syncing the new record, with the previous selector still on disk.
-  fs::resize_file(marker, empty);
+  // A valid inactive record cannot replace a damaged selected record.
+  fstream(marker, ios::in | ios::out | ios::binary).seekp(kStride).put('!');
+  ASSERT_TRUE(absl::IsDataLoss(PartitionLog::Open(dir_).status()));
+  fstream(marker, ios::in | ios::out | ios::binary).seekp(kStride) << selected;
+
+  // The previous writer had synced both the next batch and its as-yet unselected record.
   Open();
-  EXPECT_EQ(log_->End().end_offset, 0);
-  EXPECT_EQ(fs::file_size(Segment()), 0u);
-
-  // Recovery also ignores a torn preparation in the inactive block.
+  EXPECT_EQ(log_->End(), (LogPosition{1, 2}));
+  EXPECT_EQ(fs::file_size(Segment()), first.size());
   log_.reset();
-  fstream(marker, ios::in | ios::out | ios::binary).seekp(64 * 1024).put('!');
+  fstream(marker, ios::in | ios::out | ios::binary).put('!');
   Open();
-  ASSERT_TRUE(log_->Append(batch, 1).ok());
+  ASSERT_TRUE(log_->Append(next, 1).ok());
+  string magic(4, '\0');
+  ASSERT_TRUE(ifstream(marker, ios::binary).read(magic.data(), magic.size()));
+  EXPECT_EQ(magic, "DFE4");
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->Read(0, 4, SIZE_MAX).value(), first + next);
+}
+
+TEST_F(PartitionLogTest, PublishedLengthMustSelectACompleteBatch) {
+  const auto marker = dir_ / "dragonfly-log-end";
+  auto one = MakeDataBatch(0, 1, 1, span(values_).first(1)).value();
+  ASSERT_TRUE(log_->Append(one, 1).ok());
+  const auto length_for_one = fs::file_size(marker);
+  ASSERT_TRUE(log_->TruncateTo(0, 0).ok());
+  auto two = MakeDataBatch(0, 1, 2, values_).value();
+  ASSERT_TRUE(log_->Append(two, 1).ok());
   log_.reset();
 
-  // Once selected, a damaged record is fatal even if the other slot is intact.
-  fstream(marker, ios::in | ios::out | ios::binary).seekp(64 * 1024 + 40).write("bad!", 4);
+  // Reject a damaged size checksum independently of the log contents.
+  fs::resize_file(marker, fs::file_size(marker) + 1);
   EXPECT_TRUE(absl::IsDataLoss(PartitionLog::Open(dir_).status()));
+
+  // This selector encodes a valid offset, but the segment has no batch ending there.
+  fs::resize_file(marker, length_for_one);
+  EXPECT_TRUE(absl::IsDataLoss(PartitionLog::Open(dir_).status()));
+}
+
+TEST_F(PartitionLogTest, ReplacingOffsetWindowPreservesBothCrashBoundaries) {
+  const auto marker = dir_ / "dragonfly-log-end";
+  const auto previous = dir_ / "previous-window";
+  fs::create_hard_link(marker, previous);
+  vector<string> values(4095, "a");
+  auto first = MakeDataBatch(0, 1, 1, values).value();
+  ASSERT_TRUE(log_->Append(first, 1).ok());
+  EXPECT_TRUE(fs::equivalent(marker, previous));
+  auto next = MakeDataBatch(4095, 1, 2, values_).value();
+  ASSERT_TRUE(log_->AppendAsFollower(next, 1).ok());
+  EXPECT_FALSE(fs::equivalent(marker, previous));
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{1, 4097}));
+  EXPECT_EQ(log_->Read(4095, 4097, SIZE_MAX).value(), next);
+  log_.reset();
+
+  // If the name switch did not survive a crash, the old entry still selects the old end.
+  fs::rename(previous, marker);
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{1, 4095}));
+  EXPECT_EQ(fs::file_size(Segment()), first.size());
+  EXPECT_EQ(log_->Read(0, 4095, SIZE_MAX).value(), first);
 }
 
 TEST_F(PartitionLogTest, RawKafkaSegmentMustBeContinuous) {
@@ -265,13 +327,7 @@ TEST_F(PartitionLogTest, FailedUpgradeKeepsSegmentedLegacyBoundary) {
   ASSERT_TRUE(log_->Append(first, 3).ok());
   log_.reset();
   const auto marker = dir_ / "dragonfly-log-end";
-  string legacy(44, '\0');
-  legacy.replace(0, 4, "DFE2");
-  absl::big_endian::Store64(legacy.data() + 24, first.size());
-  absl::big_endian::Store64(legacy.data() + 32, 2);
-  absl::big_endian::Store32(
-      legacy.data() + 40,
-      static_cast<uint32_t>(absl::ComputeCrc32c(string_view(legacy).substr(0, 40))));
+  auto legacy = LegacyEnd("DFE2", first.size(), 2);
   ofstream(marker, ios::binary) << legacy;
   Open();
 

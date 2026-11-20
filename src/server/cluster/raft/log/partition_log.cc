@@ -109,7 +109,7 @@ absl::Status PartitionLog::Recover() {
   sort(segment_bases_.begin(), segment_bases_.end());
   // The reset marker precedes segment replacement. Redo it after an interrupted reset.
   if (marker && marker->file_end == 0 && marker->segment_base == StartOffset() &&
-      marker->offset == StartOffset() && start_ != LogPosition{0, 0}) {
+      marker->EndOffset() == StartOffset() && start_ != LogPosition{0, 0}) {
     if (auto s = ResetToSnapshot(start_); !s.ok())
       return s;
   }
@@ -149,16 +149,14 @@ absl::Status PartitionLog::Recover() {
     if (auto s = SetActive(base, 0); !s.ok())
       return s;
     found_end = marker && marker->segment_base == base;
-    if (auto s = RecoverSegment(found_end ? optional<int64_t>(marker->file_end) : nullopt,
-                                &physical_end);
-        !s.ok())
+    if (auto s = RecoverSegment(found_end ? &*marker : nullptr, &physical_end); !s.ok())
       return s;
 
     // Raw Kafka segments may predate our first recovery marker.
     if (!marker && fsync(log_fd_) == -1)
       return DiskError("Syncing imported quorum segment");
   }
-  if (marker && marker->offset != End().end_offset)
+  if (marker && marker->EndOffset() != End().end_offset)
     return absl::DataLossError("Quorum log durable offset disagrees with batches");
   if (physical_end.end_offset < StartOffset()) {
     if (!marker && snapshots_.back() > physical_end)
@@ -187,18 +185,26 @@ absl::Status PartitionLog::RemoveSuffixSegments() {
   return absl::OkStatus();
 }
 
-absl::Status PartitionLog::RecoverSegment(optional<int64_t> durable_bytes,
-                                          LogPosition* physical_end) {
+absl::Status PartitionLog::RecoverSegment(const DurableEnd* marker, LogPosition* physical_end) {
   struct stat st;
   if (fstat(log_fd_, &st) != 0)
     return DiskError("Stat quorum log segment");
   if (!S_ISREG(st.st_mode))
     return absl::DataLossError("Quorum log segment is not a regular file");
-  int64_t file_end = durable_bytes.value_or(st.st_size);
-  if (file_end < 0 || file_end > st.st_size)
+  if (marker && marker->file_end > st.st_size)
     return absl::DataLossError("Quorum log shorter than its durable boundary");
   int64_t pos = 0;
-  while (pos < file_end) {
+  while (true) {
+    // Verify the exact checkpoint first. Its inode length can then select further *whole*
+    // batches. Bytes beyond the selected offset are unpublished, even if they pass CRC.
+    if (marker && pos == marker->file_end && physical_end->end_offset != marker->offset)
+      return absl::DataLossError("Quorum log checkpoint offset disagrees with batches");
+    if (marker && physical_end->end_offset > marker->EndOffset())
+      return absl::DataLossError("Quorum log recovery boundary splits a batch");
+    if (marker ? pos >= marker->file_end && physical_end->end_offset == marker->EndOffset()
+               : pos == st.st_size)
+      break;
+    const int64_t file_end = marker && pos < marker->file_end ? marker->file_end : st.st_size;
     char prefix[12];
     if (file_end - pos < static_cast<int64_t>(sizeof(prefix)))
       return absl::DataLossError("Incomplete durable batch prefix");
@@ -226,16 +232,16 @@ absl::Status PartitionLog::RecoverSegment(optional<int64_t> durable_bytes,
       return absl::DataLossError("Snapshot cut splits a batch or has a newer epoch than its tail");
     batches_.push_back({info->end, active_base_, pos - static_cast<int64_t>(*size), pos});
   }
-  if (st.st_size != file_end) {
-    if (ftruncate(log_fd_, file_end) == -1 || fsync(log_fd_) == -1)
+  if (st.st_size != pos) {
+    if (ftruncate(log_fd_, pos) == -1 || fsync(log_fd_) == -1)
       return DiskError("Removing incomplete quorum log append");
   }
-  active_bytes_ = file_end;
+  active_bytes_ = pos;
   return absl::OkStatus();
 }
 
-absl::Status PartitionLog::PublishEnd(int64_t file_end, int64_t offset) {
-  return marker_.Publish(dir_fd_, {start_, active_base_, file_end, offset});
+absl::Status PartitionLog::PublishEnd(int64_t file_end, int64_t offset, bool append) {
+  return marker_.Publish(dir_fd_, {start_, active_base_, file_end, offset}, append);
 }
 
 LogPosition PartitionLog::End() const {
@@ -322,7 +328,7 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
     (*written)(pending.front().file_end - pending.front().file_start);
   if (fsync(log_fd_) != 0)
     return io_failure_ = DiskError("Syncing quorum log append");
-  io_failure_ = PublishEnd(pos, end.end_offset);
+  io_failure_ = PublishEnd(pos, end.end_offset, true);
   if (io_failure_.ok()) {
     batches_.insert(batches_.end(), pending.begin(), pending.end());
     active_bytes_ = pos;

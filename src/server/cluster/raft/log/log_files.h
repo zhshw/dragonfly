@@ -24,9 +24,16 @@ struct DurableEnd {
   int64_t segment_base = 0;
   int64_t file_end = 0;
   int64_t offset = 0;
+
+  // DFE4 also publishes offsets beyond this exact byte/offset checkpoint using inode size.
+  uint32_t additional_offsets = 0;
+
+  int64_t EndOffset() const {
+    return offset + additional_offsets;
+  }
 };
 
-// One writer under the partition directory lock. Reads legacy DFE1/DFE2 checkpoints too.
+// One writer under the partition directory lock. Reads DFE1 through DFE4 checkpoints.
 class RecoveryMarker {
  public:
   RecoveryMarker() = default;
@@ -35,10 +42,12 @@ class RecoveryMarker {
   RecoveryMarker& operator=(const RecoveryMarker&) = delete;
 
   absl::StatusOr<std::optional<DurableEnd>> Read(int dir_fd);
-  absl::Status Publish(int dir_fd, const DurableEnd& end);
+  absl::Status Publish(int dir_fd, const DurableEnd& end, bool append = false);
 
  private:
   int fd_ = -1;
+  DurableEnd checkpoint_;
+  int64_t published_size_ = 0;
 };
 
 }  // namespace dfly::cluster::raft::log_files

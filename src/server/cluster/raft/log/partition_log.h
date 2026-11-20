@@ -93,7 +93,7 @@ class PartitionLog {
       : dir_(std::move(dir)), segment_bytes_(segment_bytes) {
   }
   absl::Status Recover();
-  absl::Status RecoverSegment(std::optional<int64_t> durable_bytes, LogPosition* physical_end);
+  absl::Status RecoverSegment(const log_files::DurableEnd* marker, LogPosition* physical_end);
   absl::Status ResetToSnapshot(LogPosition id);
   absl::Status RemovePrefix(int64_t first_base);
   bool IsLocalBoundary(LogPosition id) const;
@@ -101,7 +101,7 @@ class PartitionLog {
   absl::Status RemoveSuffixSegments();
   absl::Status AppendBatches(std::string_view batches, int32_t epoch, bool follower,
                              std::optional<DataWritten> written);
-  absl::Status PublishEnd(int64_t file_end, int64_t end_offset);
+  absl::Status PublishEnd(int64_t file_end, int64_t end_offset, bool append = false);
 
   std::filesystem::path dir_;
   int dir_fd_ = -1;
