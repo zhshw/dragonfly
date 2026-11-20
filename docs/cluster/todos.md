@@ -37,6 +37,7 @@
 日志索引和故障注入可与 02 并行，磁盘格式对照依赖 02。优先复用已有写盘和原子替换逻辑。[Dragonfly AOF 写入](../../src/server/journal/aof_segment_writer.cc) · [Kafka 日志](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/KafkaRaftLog.java) · [持久选票](../../../kafka/raft/src/main/java/org/apache/kafka/raft/FileQuorumStateStore.java)
 
 - [ ] 03.1 实现目录格式化和恢复，持久保存 cluster ID、node ID、directory ID。重复格式化、磁盘接错节点或用错误模式打开旧目录时保护已有数据。
+  - [x] 用离线工具初始化并核对 Kafka v1 节点身份。重复格式化同一身份保留 directory ID；旧模式打开已格式化的 Raft 目录会在监听前退出。[格式化与中断恢复用例](../../src/server/cluster/raft/bootstrap/raft_directory_test.cc)
 - [ ] 03.2 为每个 quorum 独立保存 epoch 和投票。原子更新后才应答正式 Vote；模拟更新前后断电，检查同一 term 不会投给两个候选者。
   - [x] 实现 quorum-state v0/v1 持久化和恢复，文件与目录同步完成后返回。覆盖重启、临时文件、写失败、损坏文件，以及和 Kafka 的双向读取。[存储测试](../../src/server/cluster/raft/storage/file_quorum_state_store_test.cc)
 - [ ] 03.3 实现批量追加、持久化、按 offset 读取、按 epoch 查找共同前缀、尾部截断和 segment 回收。区分日志末端 LEO、已持久化位置、HW 和已应用位置。

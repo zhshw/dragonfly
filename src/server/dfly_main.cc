@@ -35,7 +35,6 @@
 
 #include "util/fibers/uring_proactor.h"
 
-ABSL_DECLARE_FLAG(std::string, dir);
 #endif
 
 #include <mimalloc.h>
@@ -59,6 +58,7 @@ ABSL_DECLARE_FLAG(std::string, dir);
 #include "io/file.h"
 #include "io/file_util.h"
 #include "io/proc_reader.h"
+#include "server/cluster/raft/bootstrap/raft_directory.h"
 #include "server/common.h"
 #include "server/generic_family.h"
 #include "server/main_service.h"
@@ -80,6 +80,7 @@ extern char** environ;
 
 using namespace std;
 
+ABSL_DECLARE_FLAG(std::string, dir);
 ABSL_DECLARE_FLAG(int32_t, port);
 ABSL_DECLARE_FLAG(uint32_t, memcached_port);
 ABSL_DECLARE_FLAG(uint16_t, admin_port);
@@ -341,6 +342,12 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
   if (maxmemory > 0 && maxmemory < pool->size() * 256_MB) {
     LOG(ERROR) << "There are " << pool->size() << " threads, so "
                << HumanReadableNumBytes(pool->size() * 256_MB) << " are required. Exiting...";
+    exit(1);
+  }
+
+  const auto& dir = absl::GetFlag(FLAGS_dir);
+  if (auto status = cluster::raft::CheckLegacyDirectory(dir.empty() ? "." : dir); !status.ok()) {
+    LOG(ERROR) << status;
     exit(1);
   }
 

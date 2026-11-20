@@ -67,6 +67,8 @@
 | `--cluster_mode=yes` | 保持现有真实集群。外部 manager 下发 `DFLYCLUSTER CONFIG`，副本通过 `REPLICAOF` 跟随主节点。仅升级二进制时继续走这条路径。 |
 | `--cluster_mode=raft`（提案） | 启动时按已配置的集群身份和元数据 quorum 地址加入或恢复 Raft 集群。新建集群先初始化 quorum 和初始 slot 分配；已有 Raft 集群从自己的持久状态恢复。 |
 
+分支现有的离线工具可用 `ninja -C build-dbg raft_storage` 构建。运行 `build-dbg/raft_storage format <新目录> <cluster-id> <整数节点ID>` 初始化一个空目录，再用相同参数将 `format` 换成 `verify` 核对身份。元数据文件与 Kafka v1 的 `meta.properties` 兼容；Dragonfly 另持有模式标记，启动旧模式时据此识别误用目录。该步骤只初始化节点身份。
+
 实现时把“是否启用真实集群路由”和“由谁管理拓扑及复制”分开判断。`yes` 和 `raft` 共用 key → slot、拓扑响应编码和 `MOVED`；只有 `yes` 允许旧 manager 直接改 slot 或指定复制源。`raft` 从已提交元数据生成拓扑，由数据组确认普通写。模式在启动时确定，`CONFIG SET` 不提供在线切换；恢复时校验持久化的集群身份和模式，配置不符时拒绝对外服务。[现有模式判断](../../src/server/cluster_support.h) · [现有管理入口](../../src/server/cluster/cluster_family.cc)
 
 **已有数据的集群需要一次停写切换。** 新二进制可以先按 `yes` 部署。切到 `raft` 前，按下文的[存量集群切换步骤](#存量集群切换步骤)导入拓扑和数据。Raft voter 需要组日志、任期和选票，旧副本的每线程 LSN 无法充当初始 Raft offset。切换以整个逻辑集群为单位，旧节点不能作为新组的 voter。切换完成后，客户端用原 seed 地址重连并刷新拓扑。
