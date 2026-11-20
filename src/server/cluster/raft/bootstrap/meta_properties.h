@@ -11,7 +11,8 @@
 namespace dfly::cluster::raft {
 
 // Kafka v1 requires cluster.id and node.id. Formatter also populates directory.id.
-absl::StatusOr<RaftDirectoryConfig> DecodeMetaProperties(std::string_view bytes);
+absl::StatusOr<RaftDirectoryConfig> DecodeMetaProperties(std::string_view bytes,
+                                                         std::string* bootstrap_id = nullptr);
 absl::StatusOr<std::string> EncodeMetaProperties(const RaftDirectoryConfig& identity);
 
 }  // namespace dfly::cluster::raft

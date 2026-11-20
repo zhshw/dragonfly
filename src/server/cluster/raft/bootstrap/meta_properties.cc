@@ -154,11 +154,16 @@ std::string FormatDirectoryId(const DirectoryId& id) {
       string_view(reinterpret_cast<const char*>(id.data()), id.size()));
 }
 
-absl::StatusOr<RaftDirectoryConfig> DecodeMetaProperties(std::string_view bytes) {
+absl::StatusOr<RaftDirectoryConfig> DecodeMetaProperties(std::string_view bytes,
+                                                         std::string* bootstrap_id) {
   auto properties = ParseProperties(bytes);
   if (!properties.ok())
     return properties.status();
   const auto& props = *properties;
+  if (bootstrap_id) {
+    auto it = props.find("dragonfly.bootstrap");
+    *bootstrap_id = it == props.end() ? std::string{} : it->second;
+  }
   if (!props.contains("version") ||
       ParseInt32(absl::StripAsciiWhitespace(props.at("version"))) != 1)
     return absl::FailedPreconditionError("Expected KRaft meta.properties version 1");

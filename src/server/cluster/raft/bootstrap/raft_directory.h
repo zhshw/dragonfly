@@ -15,6 +15,8 @@
 
 namespace dfly::cluster::raft {
 
+struct QuorumBootstrap;
+
 struct RaftDirectoryIdentity {
   std::string cluster_id;
   int32_t node_id;
@@ -33,8 +35,9 @@ struct RaftDirectoryConfig {
 
 // Offline format of an empty directory, or create the last path component. Retrying the
 // same identity after an interruption finishes publication and returns the original ID.
-absl::StatusOr<RaftDirectoryIdentity> FormatRaftDirectory(const std::filesystem::path& dir,
-                                                          const RaftDirectoryConfig& config);
+absl::StatusOr<RaftDirectoryIdentity> FormatRaftDirectory(
+    const std::filesystem::path& dir, const RaftDirectoryConfig& config,
+    const QuorumBootstrap* bootstrap = nullptr);
 
 // Reads an initialized Dragonfly Raft directory. Never initializes or repairs it.
 absl::StatusOr<RaftDirectoryIdentity> ReadRaftDirectory(const std::filesystem::path& dir);
@@ -46,5 +49,6 @@ absl::Status CheckLegacyDirectory(const std::filesystem::path& dir);
 
 absl::StatusOr<DirectoryId> ParseDirectoryId(std::string_view encoded);
 std::string FormatDirectoryId(const DirectoryId& id);
+bool IsReservedDirectoryId(const DirectoryId& id);
 
 }  // namespace dfly::cluster::raft

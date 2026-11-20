@@ -264,14 +264,16 @@ absl::StatusOr<std::string> MakeLeaderChangeBatch(int64_t offset, int32_t epoch,
 }
 
 absl::StatusOr<std::string> MakeSnapshotHeaderBatch(int32_t epoch, int64_t timestamp_ms,
-                                                    int64_t last_contained_log_timestamp) {
+                                                    int64_t last_contained_log_timestamp,
+                                                    span<const ControlRecordValue> trailing) {
   string value;
   protocol::detail::Writer writer(0, &value);
   writer.Field(int16_t{0});
   writer.Field(last_contained_log_timestamp);
   writer.Tags({});
-  const ControlRecordValue header{3, value};
-  return MakeControlBatch(0, epoch, timestamp_ms, span(&header, 1));
+  vector<ControlRecordValue> controls{{3, value}};
+  controls.insert(controls.end(), trailing.begin(), trailing.end());
+  return MakeControlBatch(0, epoch, timestamp_ms, controls);
 }
 
 absl::StatusOr<std::string> MakeSnapshotFooterBatch(int64_t offset, int32_t epoch,

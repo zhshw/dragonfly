@@ -14,6 +14,7 @@
 #include "server/cluster/raft/quorum/describe.h"
 #include "server/cluster/raft/quorum/fetch_replication.h"
 #include "server/cluster/raft/quorum/snapshot_transfer.h"
+#include "server/cluster/raft/quorum/voter_changes.h"
 #include "server/cluster/raft/transport/peer_connection.h"
 #include "util/fibers/fiberqueue_threadpool.h"
 #include "util/fibers/proactor_base.h"
@@ -62,26 +63,35 @@ class RaftGroup::Impl {
        unique_ptr<PartitionLog> log, Kind kind, bool observer, ApplyCommitted apply)
       : log_(std::move(log)),
         store_(dir),
-        campaign_(
-            std::move(target), std::move(voters),
-            [this](const ElectionState& state) { return store_.WriteElectionState(state, 0); }),
+        bootstrap_(voters),
+        campaign_(std::move(target), std::move(voters),
+                  [this](const ElectionState& state) {
+                    return store_.WriteElectionState(state,
+                                                     replication_.membership().KraftVersion());
+                  }),
         epochs_(campaign_, kind == Kind::kMetadata ? "CONTROLLER" : "RAFT", kFetchTimeoutMs, 1000),
         replication_(campaign_, epochs_, *log_, TopicId(kind)),
         snapshots_(campaign_, epochs_, replication_, *log_),
+        changes_(campaign_, epochs_, replication_, kRequestTimeoutMs),
         kind_(kind),
         observer_(observer),
         apply_(std::move(apply)) {
   }
 
   absl::Status Recover() {
+    if (auto s = replication_.RefreshMembership(); !s.ok())
+      return s;
     optional<ElectionState> state;
     if (auto ec = store_.ReadElectionState(&state); ec)
       return Status(ec, "Reading quorum-state");
     set<int32_t> configured;
     for (const auto& voter : campaign_.voters())
       configured.insert(voter.key.id);
-    if (state && state->voters != configured)
+    const bool dynamic = replication_.membership().KraftVersion() >= 1;
+    if (!dynamic && state && state->voters != configured)
       return absl::FailedPreconditionError("Static voter IDs differ from durable quorum-state");
+    if (!dynamic && !observer_ && !configured.contains(campaign_.target().local_replica.id))
+      return absl::InvalidArgumentError("Local node is not in its static voter set");
     if (!state && log_->End().end_offset != 0)
       return absl::DataLossError("Missing quorum-state for a populated static quorum");
     if (auto ec = campaign_.Recover(state.value_or(ElectionState{}), log_->End()); ec)
@@ -90,16 +100,7 @@ class RaftGroup::Impl {
   }
 
   void Start(fb2::ProactorBase* owner) {
-    fibers_.push_back(owner->LaunchFiber([this] {
-      while (!stopping_) {
-        worker_.Await([this] { Tick(); });
-        ThisFiberSleep();
-      }
-    }));
-    for (const auto& voter : campaign_.voters()) {
-      if (voter.key.id != campaign_.target().local_replica.id)
-        fibers_.push_back(owner->LaunchFiber([this, voter] { RunPeer(voter); }));
-    }
+    supervisor_ = owner->LaunchFiber([this, owner] { ManagePeers(owner); });
   }
 
   void RequestStop() {
@@ -108,8 +109,8 @@ class RaftGroup::Impl {
 
   void Join() {
     RequestStop();
-    for (auto& fiber : fibers_)
-      fiber.Join();
+    if (supervisor_.IsJoinable())
+      supervisor_.Join();
   }
 
   RpcHandlers Handlers();
@@ -123,6 +124,66 @@ class RaftGroup::Impl {
   }
 
  private:
+  bool LocalVoter() const {
+    return !observer_ && ranges::any_of(campaign_.voters(), [&](const CampaignVoter& peer) {
+      return peer.key.Matches(campaign_.target().local_replica);
+    });
+  }
+
+  map<int32_t, CampaignVoter> DesiredPeers() const {
+    map<int32_t, CampaignVoter> desired;
+    for (const auto& peer : campaign_.voters())
+      desired.emplace(peer.key.id, peer);
+    if (const auto& leader = campaign_.LeaderEndpoint(); leader)
+      desired.try_emplace(leader->node_id,
+                          CampaignVoter{{leader->node_id}, {leader->host, leader->port}});
+    if (!LocalVoter()) {
+      for (const auto& seed : bootstrap_)
+        desired.try_emplace(seed.key.id, seed);
+    }
+    desired.erase(campaign_.target().local_replica.id);
+    return desired;
+  }
+
+  void ManagePeers(fb2::ProactorBase* owner) {
+    struct PeerWorker {
+      CampaignVoter voter;
+      atomic_bool active{true};
+      fb2::Fiber fiber;
+    };
+    map<int32_t, unique_ptr<PeerWorker>> peers;
+    while (!stopping_) {
+      auto desired = worker_.Await([&] {
+        Tick();
+        return DesiredPeers();
+      });
+      vector<unique_ptr<PeerWorker>> retiring;
+      for (auto it = peers.begin(); it != peers.end();) {
+        auto target = desired.find(it->first);
+        if (target != desired.end() && target->second == it->second->voter) {
+          desired.erase(target);
+          ++it;
+        } else {
+          it->second->active = false;
+          retiring.push_back(std::move(it->second));
+          it = peers.erase(it);
+        }
+      }
+      for (auto& [id, voter] : desired) {
+        auto next = make_unique<PeerWorker>();
+        next->voter = std::move(voter);
+        next->fiber =
+            owner->LaunchFiber([this, slot = next.get()] { RunPeer(slot->voter, slot->active); });
+        peers.emplace(id, std::move(next));
+      }
+      for (auto& expired : retiring)
+        expired->fiber.Join();
+      ThisFiberSleep();
+    }
+    for (auto& [id, peer] : peers)
+      peer->fiber.Join();
+  }
+
   static void ThisFiberSleep() {
     util::ThisFiber::SleepFor(chrono::milliseconds(25));
   }
@@ -139,6 +200,7 @@ class RaftGroup::Impl {
     if (!status.ok())
       return status;
     snapshots_.SyncRole();
+    changes_.Poll(NowMs());
     if (auto hw = replication_.HighWatermark(); hw && apply_ && *hw != applied_) {
       if (auto s = apply_(*log_, *hw); !s.ok())
         return s;
@@ -173,7 +235,8 @@ class RaftGroup::Impl {
     if (auto s = Synchronize(); !s.ok())
       return s;
     auto now = NowMs();
-    if (!observer_ && role_ != QuorumRole::kLeader && now >= deadline_) {
+    if ((LocalVoter() || role_ == QuorumRole::kResigned) && role_ != QuorumRole::kLeader &&
+        now >= deadline_) {
       if (auto ec = campaign_.OnElectionTimeout(); ec)
         return Status(ec, "Advancing election");
       ResetDeadline(now);
@@ -197,7 +260,7 @@ class RaftGroup::Impl {
       return std::move(notification.mapped());
     if (auto vote = campaign_.PrepareVote(key, log_->End()))
       return std::move(*vote);
-    if (observer_ && (role_ == QuorumRole::kUnattached || NowMs() >= deadline_) &&
+    if (!LocalVoter() && (role_ == QuorumRole::kUnattached || NowMs() >= deadline_) &&
         NowMs() >= discovery_after_[key.id]) {
       discovery_after_[key.id] = NowMs() + 250;
       return Pull::kDiscover;
@@ -216,9 +279,9 @@ class RaftGroup::Impl {
     });
   }
 
-  void RunPeer(const CampaignVoter& voter) {
+  void RunPeer(const CampaignVoter& voter, const atomic_bool& active) {
     PeerConnection peer(voter.endpoint, kRequestTimeoutMs, kMaxRaftFrame);
-    while (!stopping_) {
+    while (!stopping_ && active) {
       auto task = worker_.Await([&] { return Next(voter.key); });
       if (auto* vote = get_if<OutboundVote>(&task)) {
         VoteResponse response;
@@ -229,24 +292,26 @@ class RaftGroup::Impl {
           ec.clear();
         }
         if (!ec)
-          ec = OnWorker(
-              [&] { return campaign_.ReceiveVoteResponse(voter.key, vote->sequence, response); });
+          ec = OnWorker([&] {
+            return active ? campaign_.ReceiveVoteResponse(voter.key, vote->sequence, response)
+                          : error_code{};
+          });
         if (ec)
           VLOG(1) << "Vote to node " << voter.key.id << ": " << ec.message();
       } else if (auto* notification = get_if<EpochNotification>(&task)) {
-        auto ec = SendEpoch(peer, *notification);
+        auto ec = SendEpoch(peer, *notification, active);
         if (ec)
           VLOG(1) << "Epoch notification for node " << voter.key.id << ": " << ec.message();
       } else if (auto* pull = get_if<Pull>(&task)) {
         switch (*pull) {
           case Pull::kDiscover:
-            Discover(peer, voter);
+            Discover(peer, voter, active);
             break;
           case Pull::kFetch:
-            FetchFrom(peer, voter.key.id);
+            FetchFrom(peer, voter.key.id, active);
             break;
           case Pull::kSnapshot:
-            FetchSnapshotFrom(peer, voter.key.id);
+            FetchSnapshotFrom(peer, voter.key.id, active);
             break;
         }
       }
@@ -255,20 +320,25 @@ class RaftGroup::Impl {
     peer.Close();
   }
 
-  error_code SendEpoch(PeerConnection& peer, const EpochNotification& n) {
+  error_code SendEpoch(PeerConnection& peer, const EpochNotification& n,
+                       const atomic_bool& active) {
     if (auto* begin = get_if<BeginQuorumEpochRequest>(&n.request)) {
       BeginQuorumEpochResponse response;
       if (auto ec = peer.Call(*begin, 0, &response); ec)
         return ec;
-      return OnWorker([&] { return epochs_.ReceiveBeginResponse(n.recipient, n.epoch, response); });
+      return OnWorker([&] {
+        return active ? epochs_.ReceiveBeginResponse(n.recipient, n.epoch, response) : error_code{};
+      });
     }
     EndQuorumEpochResponse response;
     if (auto ec = peer.Call(get<EndQuorumEpochRequest>(n.request), 0, &response); ec)
       return ec;
-    return OnWorker([&] { return epochs_.ReceiveEndResponse(n.recipient, n.epoch, response); });
+    return OnWorker([&] {
+      return active ? epochs_.ReceiveEndResponse(n.recipient, n.epoch, response) : error_code{};
+    });
   }
 
-  void FetchFrom(PeerConnection& peer, int32_t leader) {
+  void FetchFrom(PeerConnection& peer, int32_t leader, const atomic_bool& active) {
     int16_t version;
     if (peer.Negotiate<FetchRequest>(kMinRaftFetchVersion, &version))
       return;
@@ -284,6 +354,8 @@ class RaftGroup::Impl {
     if (peer.Call(fetch->request, version, &response))
       return;
     worker_.Await([&] {
+      if (!active)
+        return;
       bool reset = false;
       auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, response, &reset);
       if (!s.ok())
@@ -293,7 +365,7 @@ class RaftGroup::Impl {
     });
   }
 
-  void Discover(PeerConnection& peer, const CampaignVoter& voter) {
+  void Discover(PeerConnection& peer, const CampaignVoter& voter, const atomic_bool& active) {
     DescribeQuorumRequest req;
     auto& topic = req.topics.emplace_back();
     topic.topic_name = campaign_.target().topic;
@@ -307,14 +379,14 @@ class RaftGroup::Impl {
         part.leader_id != voter.key.id)
       return;
     worker_.Await([&] {
-      if (part.leader_epoch >= campaign_.state().election.epoch) {
+      if (active && part.leader_epoch >= campaign_.state().election.epoch) {
         if (auto ec = campaign_.ObserveLeader(part.leader_epoch, voter.key.id, voter.endpoint); ec)
           VLOG(1) << "Metadata discovery: " << ec.message();
       }
     });
   }
 
-  void FetchSnapshotFrom(PeerConnection& peer, int32_t leader) {
+  void FetchSnapshotFrom(PeerConnection& peer, int32_t leader, const atomic_bool& active) {
     int16_t version;
     if (kind_ != Kind::kMetadata || peer.Negotiate<FetchSnapshotRequest>(0, &version))
       return;
@@ -325,6 +397,8 @@ class RaftGroup::Impl {
     if (peer.Call(fetch->request, version, &response))
       return;
     worker_.Await([&] {
+      if (!active)
+        return;
       bool reset = false;
       auto s = snapshots_.ReceiveResponse(leader, fetch->sequence, response, &reset);
       if (!s.ok())
@@ -335,13 +409,17 @@ class RaftGroup::Impl {
   }
 
   error_code Fetch(int16_t version, const FetchRequest& request, FetchResponse* response);
+  template <typename Request, typename Response>
+  error_code ChangeVoters(const Request& req, Response* res);
 
   unique_ptr<PartitionLog> log_;
   FileQuorumStateStore store_;
+  const vector<CampaignVoter> bootstrap_;
   ElectionCampaign campaign_;
   EpochControl epochs_;
   FetchReplication replication_;
   SnapshotTransfer snapshots_;
+  VoterChanges changes_;
   const Kind kind_;
   const bool observer_;
   ApplyCommitted apply_;
@@ -355,7 +433,7 @@ class RaftGroup::Impl {
   bool failed_ = false;
   map<int32_t, EpochNotification> notifications_;
   atomic_bool stopping_{false};
-  vector<fb2::Fiber> fibers_;
+  fb2::Fiber supervisor_;
 };
 
 RpcHandlers RaftGroup::Impl::Handlers() {
@@ -379,6 +457,16 @@ RpcHandlers RaftGroup::Impl::Handlers() {
     });
   };
   handlers.fetch = [this](int16_t v, const auto& req, auto* res) { return Fetch(v, req, res); };
+  // The caller supplies a group-specific listener for messages without a partition.
+  handlers.add_voter = [this](int16_t, const auto& req, auto* res) {
+    return ChangeVoters(req, res);
+  };
+  handlers.remove_voter = [this](int16_t, const auto& req, auto* res) {
+    return ChangeVoters(req, res);
+  };
+  handlers.update_voter = [this](int16_t, const auto& req, auto* res) {
+    return ChangeVoters(req, res);
+  };
   if (kind_ == Kind::kMetadata)
     handlers.fetch_snapshot = [this](int16_t v, const auto& req, auto* res) {
       return OnWorker([&] {
@@ -390,6 +478,64 @@ RpcHandlers RaftGroup::Impl::Handlers() {
     return OnWorker([&] { return DescribeQuorum(campaign_, replication_, v, req, WallMs(), res); });
   };
   return handlers;
+}
+
+template <typename Request, typename Response>
+error_code RaftGroup::Impl::ChangeVoters(const Request& req, Response* res) {
+  VoterChanges::Result result;
+  optional<VoterChanges::Probe> probe;
+  if (auto ec = OnWorker([&] {
+        result = changes_.Begin(req, NowMs(), WallMs());
+        probe = changes_.TakeProbe();
+        return error_code{};
+      });
+      ec)
+    return ec;
+  if (probe) {
+    PeerConnection peer(probe->endpoint, kRequestTimeoutMs, kMaxRaftFrame);
+    ApiVersionsRequest versions;
+    versions.client_software_name = "dragonfly";
+    versions.client_software_version = "1";
+    ApiVersionsResponse reply;
+    if (peer.Call(versions, 3, &reply))
+      reply.error_code = 7;
+    peer.Close();
+    if (auto ec = OnWorker([&] {
+          auto s = changes_.OnApiVersions(*probe, reply, NowMs(), WallMs());
+          return s.ok() ? error_code{} : make_error_code(errc::io_error);
+        });
+        ec)
+      return ec;
+  }
+  // The listener fiber may park; the quorum's disk worker must remain available to
+  // voters whose next Fetch can commit this very configuration change.
+  while (!stopping_) {
+    bool ready = false;
+    if (auto ec = OnWorker([&] {
+          if (!result->error)
+            return error_code{};
+          ready = true;
+          res->error_code = *result->error;
+          if constexpr (is_same_v<Response, UpdateRaftVoterResponse>) {
+            const auto& election = campaign_.state().election;
+            res->current_leader.leader_id = election.leader_id.value_or(-1);
+            res->current_leader.leader_epoch = election.epoch;
+            if (const auto& endpoint = campaign_.LeaderEndpoint(); endpoint) {
+              res->current_leader.host = endpoint->host;
+              res->current_leader.port = endpoint->port;
+            }
+          } else {
+            res->error_message = result->message;
+          }
+          return error_code{};
+        });
+        ec)
+      return ec;
+    if (ready)
+      return {};
+    ThisFiberSleep();
+  }
+  return make_error_code(errc::operation_canceled);
 }
 
 error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
@@ -432,7 +578,7 @@ absl::StatusOr<unique_ptr<RaftGroup>> RaftGroup::Open(const filesystem::path& di
                                                       const VoterConnections& voters, bool observer,
                                                       ApplyCommitted apply) {
   if (partition < 0 || voters.empty() || (kind == Kind::kMetadata && partition != 0) ||
-      (observer && kind != Kind::kMetadata) || voters.contains(identity.node_id) == observer)
+      (observer && (kind != Kind::kMetadata || voters.contains(identity.node_id))))
     return absl::InvalidArgumentError("Invalid quorum partition, local role or voter set");
   vector<CampaignVoter> members;
   for (const auto& [id, ep] : voters) {

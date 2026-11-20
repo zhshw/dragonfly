@@ -12,6 +12,8 @@
 #include <fstream>
 
 #include "server/cluster/raft/bootstrap/meta_properties.h"
+#include "server/cluster/raft/bootstrap/quorum_bootstrap.h"
+#include "server/cluster/raft/quorum/membership_history.h"
 
 namespace dfly::cluster::raft {
 namespace {
@@ -68,6 +70,60 @@ TEST_F(RaftDirectoryTest, SuppliedVoterDirectoryAndReservedIds) {
   auto formatted = FormatRaftDirectory(dir_, cfg);
   ASSERT_TRUE(formatted.ok()) << formatted.status();
   EXPECT_EQ(formatted->directory_id, reserved);
+}
+
+TEST_F(RaftDirectoryTest, DynamicQuorumBootstrapAndInterruptedRetry) {
+  const string local = "3@[::1]:9092:3Adc4FjfTeypRWROmQDNIQ";
+  const string other = "4@peer:9093:PIBvV0wFRuay02AARab3Iw";
+  auto initial = ParseQuorumBootstrap(other + "," + local, nullopt).value();
+  auto formatted = FormatRaftDirectory(dir_, cfg_, &initial);
+  ASSERT_TRUE(formatted.ok()) << formatted.status();
+  EXPECT_EQ(FormatDirectoryId(formatted->directory_id), "3Adc4FjfTeypRWROmQDNIQ");
+  EXPECT_EQ(initial.Partition(), "__cluster_metadata-0");
+  {
+    auto log = PartitionLog::Open(dir_ / initial.Partition()).value();
+    EXPECT_EQ(log->End(), (LogPosition{0, 0}));
+    EXPECT_EQ(log->LatestSnapshot(), (LogPosition{0, 0}));
+    MembershipHistory restored;
+    ASSERT_TRUE(restored.Update(*log).ok());
+    EXPECT_EQ(restored.KraftVersion(), 1);
+    ASSERT_NE(restored.VotersAt(-1), nullptr);
+    EXPECT_EQ(*restored.VotersAt(-1), initial.voters);
+    EXPECT_EQ(initial.voters.voters[0].endpoints[0].host, "::1");
+  }
+
+  // An interrupted format may have published the snapshot before the final identity.
+  ASSERT_TRUE(fs::remove(dir_ / "meta.properties"));
+  ASSERT_FALSE(ReadRaftDirectory(dir_).ok());
+  auto observer = ParseQuorumBootstrap(nullopt, nullopt).value();
+  EXPECT_FALSE(FormatRaftDirectory(dir_, cfg_, &observer).ok());
+  EXPECT_FALSE(FormatRaftDirectory(dir_, cfg_).ok());
+  auto same = ParseQuorumBootstrap(local + "," + other, nullopt).value();
+  auto retry = FormatRaftDirectory(dir_, cfg_, &same);
+  ASSERT_TRUE(retry.ok()) << retry.status();
+  EXPECT_EQ(*retry, *formatted);
+  EXPECT_TRUE(VerifyRaftDirectory(dir_, cfg_).ok());
+}
+
+TEST_F(RaftDirectoryTest, BootstrapDataGroupLearnerHasNoVotes) {
+  auto joining = ParseQuorumBootstrap(nullopt, 10).value();
+  EXPECT_EQ(joining.Partition(), "__dragonfly_data-10");
+  ASSERT_TRUE(FormatRaftDirectory(dir_, cfg_, &joining).ok());
+  auto log = PartitionLog::Open(dir_ / joining.Partition()).value();
+  MembershipHistory restored;
+  ASSERT_TRUE(restored.Update(*log).ok());
+  EXPECT_EQ(restored.KraftVersion(), 1);
+  EXPECT_EQ(restored.LatestVoters(), nullptr);
+  EXPECT_FALSE(fs::exists(dir_ / "__cluster_metadata-0"));
+
+  const string good = "3@peer:9092:3Adc4FjfTeypRWROmQDNIQ";
+  EXPECT_FALSE(ParseQuorumBootstrap(good + "," + good, 10).ok());
+  EXPECT_FALSE(ParseQuorumBootstrap(good, -1).ok());
+  for (const char* bad :
+       {"", "3@host:9092", "3@host:0:3Adc4FjfTeypRWROmQDNIQ", "3@::1:9092:3Adc4FjfTeypRWROmQDNIQ",
+        "1@[::1:42:3Adc4FjfTeypRWROmQDNIQ", "bad@localhost:9000:x"}) {
+    EXPECT_FALSE(ParseQuorumBootstrap(bad, nullopt).ok()) << bad;
+  }
 }
 
 TEST_F(RaftDirectoryTest, LegacyAndForeignContentsArePreserved) {

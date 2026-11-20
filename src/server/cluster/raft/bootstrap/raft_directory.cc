@@ -18,6 +18,7 @@
 #include <random>
 
 #include "server/cluster/raft/bootstrap/meta_properties.h"
+#include "server/cluster/raft/bootstrap/quorum_bootstrap.h"
 
 namespace dfly::cluster::raft {
 namespace {
@@ -34,7 +35,9 @@ absl::Status FileError(const fs::path& path, int error) {
   return absl::ErrnoToStatus(error, path.string());
 }
 
-bool ReservedId(const DirectoryId& id) {
+}  // namespace
+
+bool IsReservedDirectoryId(const DirectoryId& id) {
   // Kafka compares the low 64 bits as a signed Java long.
   return all_of(id.begin(), id.begin() + 8, [](uint8_t b) { return b == 0; }) &&
          ((id[8] & 0x80) ||
@@ -42,12 +45,13 @@ bool ReservedId(const DirectoryId& id) {
            id.back() < 100));
 }
 
+namespace {
 DirectoryId NewDirectoryId() {
   random_device source;
   DirectoryId id;
   do {
     generate(id.begin(), id.end(), [&] { return static_cast<uint8_t>(source()); });
-  } while (ReservedId(id) || FormatDirectoryId(id).starts_with('-'));
+  } while (IsReservedDirectoryId(id) || FormatDirectoryId(id).starts_with('-'));
   return id;
 }
 
@@ -61,7 +65,8 @@ absl::Status CheckIdentity(const RaftDirectoryIdentity& identity, const RaftDire
   return absl::OkStatus();
 }
 
-absl::StatusOr<RaftDirectoryIdentity> ReadIdentity(const fs::path& path) {
+absl::StatusOr<RaftDirectoryIdentity> ReadIdentity(const fs::path& path,
+                                                   string* bootstrap = nullptr) {
   int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (fd == -1)
     return FileError(path, errno);
@@ -84,12 +89,12 @@ absl::StatusOr<RaftDirectoryIdentity> ReadIdentity(const fs::path& path) {
     contents.append(buffer, count);
   }
 
-  auto identity = DecodeMetaProperties(contents);
+  auto identity = DecodeMetaProperties(contents, bootstrap);
   if (!identity.ok())
     return identity.status();
   if (!identity->directory_id || identity->node_id < 0 || identity->cluster_id.empty())
     return absl::DataLossError("Incomplete formatted Raft identity");
-  if (ReservedId(*identity->directory_id))
+  if (IsReservedDirectoryId(*identity->directory_id))
     return absl::DataLossError("Reserved Kafka directory.id in meta.properties");
   return RaftDirectoryIdentity{std::move(identity->cluster_id), identity->node_id,
                                *identity->directory_id};
@@ -183,11 +188,27 @@ absl::Status CheckLegacyDirectory(const fs::path& dir) {
 }
 
 absl::StatusOr<RaftDirectoryIdentity> FormatRaftDirectory(const fs::path& dir,
-                                                          const RaftDirectoryConfig& cfg) {
+                                                          const RaftDirectoryConfig& supplied,
+                                                          const QuorumBootstrap* bootstrap) {
+  auto cfg = supplied;
+  string bootstrap_id;
+  if (bootstrap) {
+    auto id = bootstrap->Identity();
+    if (!id.ok())
+      return id.status();
+    bootstrap_id = *std::move(id);
+    for (const auto& voter : bootstrap->voters.voters) {
+      if (voter.voter_id == cfg.node_id) {
+        if (cfg.directory_id && cfg.directory_id != voter.voter_directory_id)
+          return absl::InvalidArgumentError("directory.id differs from the initial voter");
+        cfg.directory_id = voter.voter_directory_id;
+      }
+    }
+  }
   if (dir.empty() || IsRemote(dir) || cfg.node_id < 0 || cfg.cluster_id.empty())
     return absl::InvalidArgumentError(
         "Format needs a local directory, cluster.id and node.id >= 0");
-  if (cfg.directory_id && ReservedId(*cfg.directory_id))
+  if (cfg.directory_id && IsReservedDirectoryId(*cfg.directory_id))
     return absl::InvalidArgumentError("Cannot assign a reserved Kafka directory.id");
   if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST)
     return FileError(dir, errno);
@@ -199,12 +220,15 @@ absl::StatusOr<RaftDirectoryIdentity> FormatRaftDirectory(const fs::path& dir,
   absl::Cleanup close_fd = [fd] { close(fd); };
   if (flock(fd, LOCK_EX) != 0)
     return FileError(dir, errno);
-  auto marker = ReadIdentity(dir / kMarker);
+  string previous_bootstrap;
+  auto marker = ReadIdentity(dir / kMarker, &previous_bootstrap);
   if (!marker.ok() && !absl::IsNotFound(marker.status()))
     return marker.status();
   if (marker.ok()) {
     if (auto status = CheckIdentity(*marker, cfg); !status.ok())
       return status;
+    if (bootstrap_id != previous_bootstrap)
+      return absl::FailedPreconditionError("Initial quorum differs from the formatted directory");
   } else {
     if (auto status = CheckUnformattedContents(dir); !status.ok())
       return status;
@@ -213,8 +237,22 @@ absl::StatusOr<RaftDirectoryIdentity> FormatRaftDirectory(const fs::path& dir,
     auto bytes = EncodeMetaProperties(identity);
     if (!bytes.ok())
       return bytes.status();
+    if (bootstrap)
+      absl::StrAppend(&*bytes, "dragonfly.bootstrap=", bootstrap_id, "\n");
     if (auto status = InstallMarker(dir, *bytes); !status.ok())
       return status;
+  }
+
+  // Publish meta.properties only after the initial snapshot is durable. The ownership
+  // marker binds retries to the original quorum even if the first format was interrupted.
+  if (bootstrap) {
+    struct stat properties;
+    if (lstat((dir / kProperties).c_str(), &properties) != 0) {
+      if (errno != ENOENT)
+        return FileError(dir / kProperties, errno);
+      if (auto s = bootstrap->Install(dir); !s.ok())
+        return s;
+    }
   }
 
   // link() never replaces an existing file. On retry, verify both names before returning.

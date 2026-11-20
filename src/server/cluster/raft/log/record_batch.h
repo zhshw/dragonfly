@@ -54,8 +54,9 @@ absl::StatusOr<std::string> MakeLeaderChangeBatch(
     std::span<const int32_t> voters, std::span<const int32_t> granting_voters,
     std::span<const ControlRecordValue> trailing = {});
 
-absl::StatusOr<std::string> MakeSnapshotHeaderBatch(int32_t epoch, int64_t timestamp_ms,
-                                                    int64_t last_contained_log_timestamp);
+absl::StatusOr<std::string> MakeSnapshotHeaderBatch(
+    int32_t epoch, int64_t timestamp_ms, int64_t last_contained_log_timestamp,
+    std::span<const ControlRecordValue> trailing = {});
 absl::StatusOr<std::string> MakeSnapshotFooterBatch(int64_t offset, int32_t epoch,
                                                     int64_t timestamp_ms);
 

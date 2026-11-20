@@ -1,5 +1,6 @@
 add_library(dfly_raft
             bootstrap/meta_properties.cc
+            bootstrap/quorum_bootstrap.cc
             bootstrap/raft_directory.cc
             config/quorum_config.cc
             data/apply_progress.cc
