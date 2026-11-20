@@ -47,6 +47,6 @@ helio_cxx_test(quorum/vote_handler_test dfly_raft LABELS DFLY)
 helio_cxx_test(replication/high_watermark_test dfly_raft LABELS DFLY)
 helio_cxx_test(storage/file_quorum_state_store_test dfly_raft LABELS DFLY)
 
-add_library(dfly_raft_transport transport/peer_connection.cc transport/raft_listener.cc)
-cxx_link(dfly_raft_transport dfly_raft fibers2)
+add_library(dfly_raft_transport runtime/controller.cc transport/peer_connection.cc transport/raft_listener.cc)
+cxx_link(dfly_raft_transport dfly_raft fibers2 absl::random_random)
 helio_cxx_test(transport/raft_listener_test dfly_raft_transport LABELS DFLY)

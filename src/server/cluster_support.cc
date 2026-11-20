@@ -15,7 +15,7 @@ using namespace std;
 
 ABSL_FLAG(string, cluster_mode, "",
           "Cluster mode supported. Possible values are "
-          "'emulated', 'yes' or ''");
+          "'emulated', 'yes', 'raft' or ''");
 
 ABSL_FLAG(bool, experimental_cluster_shard_by_slot, false,
           "If true, cluster mode is enabled and sharding is done by slot. "

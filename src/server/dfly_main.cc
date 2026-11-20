@@ -59,6 +59,7 @@
 #include "io/file_util.h"
 #include "io/proc_reader.h"
 #include "server/cluster/raft/bootstrap/raft_directory.h"
+#include "server/cluster/raft/runtime/controller.h"
 #include "server/common.h"
 #include "server/generic_family.h"
 #include "server/main_service.h"
@@ -81,6 +82,12 @@ extern char** environ;
 using namespace std;
 
 ABSL_DECLARE_FLAG(std::string, dir);
+ABSL_DECLARE_FLAG(std::string, cluster_mode);
+ABSL_FLAG(string, raft_role, "", "");
+ABSL_FLAG(string, raft_cluster_id, "", "Cluster ID recorded by raft_storage format.");
+ABSL_FLAG(int32_t, raft_node_id, -1, "Node ID recorded by raft_storage format.");
+ABSL_FLAG(string, raft_quorum_voters, "",
+          "Static metadata voters as id@host:port, separated by commas.");
 ABSL_DECLARE_FLAG(int32_t, port);
 ABSL_DECLARE_FLAG(uint32_t, memcached_port);
 ABSL_DECLARE_FLAG(uint16_t, admin_port);
@@ -338,6 +345,27 @@ const char* DefaultBindAddress() {
 }
 
 void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
+  const auto& dir = absl::GetFlag(FLAGS_dir);
+  if (GetFlag(FLAGS_cluster_mode) == "raft") {
+    if (GetFlag(FLAGS_raft_role) != "controller") {
+      LOG(ERROR) << "Set --raft_role=controller to start a dedicated metadata voter";
+      exit(1);
+    }
+#ifdef __linux__
+    const auto& user = GetFlag(FLAGS_user);
+    if (!user.empty() && !DropPrivilegesToUser(user, dir))
+      exit(1);
+#endif
+    auto status = cluster::raft::RunController(
+        dir.empty() ? "." : dir, GetFlag(FLAGS_raft_cluster_id), GetFlag(FLAGS_raft_node_id),
+        GetFlag(FLAGS_raft_quorum_voters), pool, acceptor);
+    if (!status.ok()) {
+      LOG(ERROR) << status;
+      exit(1);
+    }
+    return;
+  }
+
   uint64_t maxmemory = absl::GetFlag(FLAGS_maxmemory);
   if (maxmemory > 0 && maxmemory < pool->size() * 256_MB) {
     LOG(ERROR) << "There are " << pool->size() << " threads, so "
@@ -345,7 +373,6 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
     exit(1);
   }
 
-  const auto& dir = absl::GetFlag(FLAGS_dir);
   if (auto status = cluster::raft::CheckLegacyDirectory(dir.empty() ? "." : dir); !status.ok()) {
     LOG(ERROR) << status;
     exit(1);
@@ -1147,7 +1174,7 @@ Usage: dragonfly [FLAGS]
   // Ignore SIGHUP to prevent termination when the parent shell exits
   signal(SIGHUP, SIG_IGN);
 
-  if (GetFlag(FLAGS_port) == 0u) {
+  if (GetFlag(FLAGS_port) == 0u && GetFlag(FLAGS_cluster_mode) != "raft") {
     string usock = GetFlag(FLAGS_unixsocket);
     if (usock.length() == 0u) {
       LOG(ERROR) << "received --port 0, yet no unix socket to listen to. Exiting.";
