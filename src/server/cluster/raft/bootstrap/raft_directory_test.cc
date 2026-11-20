@@ -126,6 +126,21 @@ TEST_F(RaftDirectoryTest, BootstrapDataGroupLearnerHasNoVotes) {
   }
 }
 
+TEST_F(RaftDirectoryTest, OnlyAnExistingFormatMayResumeDataGroupZero) {
+  auto legacy = ParseQuorumBootstrap(nullopt, 0).value();
+  auto cfg = cfg_;
+  cfg.directory_id = ParseDirectoryId("3Adc4FjfTeypRWROmQDNIQ").value();
+  EXPECT_TRUE(absl::IsInvalidArgument(FormatRaftDirectory(dir_, cfg, &legacy).status()));
+  EXPECT_TRUE(fs::is_empty(dir_));
+
+  // Restore the marker left by an earlier formatter before its final hard link.
+  ofstream(dir_ / ".dragonfly-raft") << EncodeMetaProperties(cfg).value()
+                                     << "dragonfly.bootstrap=" << legacy.Identity().value() << '\n';
+  ASSERT_TRUE(FormatRaftDirectory(dir_, cfg, &legacy).ok());
+  EXPECT_TRUE(VerifyRaftDirectory(dir_, cfg).ok());
+  EXPECT_TRUE(FormatRaftDirectory(dir_, cfg, &legacy).ok());
+}
+
 TEST_F(RaftDirectoryTest, LegacyAndForeignContentsArePreserved) {
   EXPECT_TRUE(CheckLegacyDirectory(dir_).ok());
   EXPECT_TRUE(CheckLegacyDirectory("s3://example/dir").ok());

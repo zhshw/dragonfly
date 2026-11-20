@@ -15,16 +15,16 @@ namespace {
 using namespace std;
 using namespace protocol;
 
-constexpr string_view kTopology = R"([
+constexpr string_view kTopology = R"({"groups":[
   {"group_id":10,"slot_ranges":[{"start":0,"end":8191}],
-   "master":{"id":"A","ip":"a","port":6379,"broker_id":1,"raft_port":7100},
-   "replicas":[{"id":"A-r1","ip":"a-r1","port":6379,"broker_id":2,"raft_port":7100}]},
+   "members":[{"id":"A","ip":"a","port":6379,"broker_id":1,"raft_port":7100},
+              {"id":"A-r1","ip":"a-r1","port":6379,"broker_id":2,"raft_port":7100}]},
   {"group_id":20,"slot_ranges":[{"start":8192,"end":16383}],
-   "master":{"id":"B","ip":"b","port":6379,"broker_id":3,"raft_port":7100},
-   "replicas":[{"id":"B-r1","ip":"b-r1","port":6379,"broker_id":4,"raft_port":7100}]}
-])";
+   "members":[{"id":"B","ip":"b","port":6379,"broker_id":3,"raft_port":7100},
+              {"id":"B-r1","ip":"b-r1","port":6379,"broker_id":4,"raft_port":7100}]}
+]})";
 
-TEST(BootstrapTopologyTest, ImportsOriginalShardLayoutIntoOneCommittedTransaction) {
+TEST(BootstrapTopologyTest, CommitsGroupsAndMembersInOneMetadataTransaction) {
   auto records = ParseBootstrapTopology(kTopology);
   ASSERT_TRUE(records.ok()) << records.status();
   ASSERT_TRUE(holds_alternative<BeginTransactionRecord>(records->front().message));
@@ -48,6 +48,9 @@ TEST(BootstrapTopologyTest, ImportsOriginalShardLayoutIntoOneCommittedTransactio
   ASSERT_TRUE(loader.Advance(*log, log->End().end_offset).ok());
   auto image = loader.image();
   EXPECT_TRUE(image->directory.HasCompleteCoverage());
+  EXPECT_EQ(image->directory.groups().at(10).members, (vector<int32_t>{1, 2}));
+  EXPECT_FALSE(image->directory.groups().at(10).leadership);
+  EXPECT_EQ(image->directory.Lookup(0)->group_id, 10);
   EXPECT_EQ(image->directory.Lookup(42)->group_id, 10);
   EXPECT_EQ(image->directory.Lookup(8192)->group_id, 20);
   EXPECT_EQ(image->directory.nodes().at(2), "A-r1");
@@ -82,7 +85,7 @@ TEST(BootstrapTopologyTest, ImportsOriginalShardLayoutIntoOneCommittedTransactio
   filesystem::remove_all(tmp);
 }
 
-TEST(BootstrapTopologyTest, RejectsInvalidShardsBeforeProposingAnyRecords) {
+TEST(BootstrapTopologyTest, RejectsInvalidGroupsBeforeProposingAnyRecords) {
   for (auto [from, to] : {pair<string_view, string_view>{"8192", "8193"},
                           {"8192", "8191"},
                           {"16383", "99999"},
@@ -90,12 +93,31 @@ TEST(BootstrapTopologyTest, RejectsInvalidShardsBeforeProposingAnyRecords) {
                           {"\"A-r1\"", "\"A\""},
                           {"\"a-r1\"", "\"a\""},
                           {"\"group_id\":20", "\"group_id\":10"},
+                          {"\"group_id\":20", "\"group_id\":-1"},
                           {"\"broker_id\":4", "\"broker_id\":3"},
                           {"\"raft_port\":7100", "\"raft_port\":0"}}) {
     string json(kTopology);
     json.replace(json.find(from), from.size(), to);
     EXPECT_FALSE(ParseBootstrapTopology(json).ok()) << json;
   }
+  string reserved(kTopology);
+  reserved.replace(reserved.find("\"group_id\":10"), string_view("\"group_id\":10").size(),
+                   "\"group_id\":0");
+  EXPECT_TRUE(absl::IsOutOfRange(ParseBootstrapTopology(reserved).status()));
+}
+
+TEST(BootstrapTopologyTest, RequiresRaftGroupsAndSymmetricMembers) {
+  constexpr string_view legacy = R"([{"slot_ranges":[{"start":0,"end":16383}],
+    "master":{"id":"A","ip":"a","port":6379},"replicas":[]}])";
+  constexpr string_view old_group = R"({"group_id":10,"slot_ranges":[{"start":0,"end":16383}],
+    "master":{"id":"A","ip":"a","port":6379,"broker_id":1,"raft_port":7100},"replicas":[]})";
+  EXPECT_FALSE(ParseBootstrapTopology(legacy).ok());
+  EXPECT_FALSE(ParseBootstrapTopology("[" + string(old_group) + "]").ok());
+  EXPECT_FALSE(ParseBootstrapTopology("{\"groups\":[" + string(old_group) + "]}").ok());
+  EXPECT_FALSE(
+      ParseBootstrapTopology(
+          R"({"groups":[{"group_id":10,"slot_ranges":[{"start":0,"end":16383}],"members":[]}]})")
+          .ok());
 }
 
 }  // namespace

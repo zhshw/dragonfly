@@ -63,27 +63,25 @@ absl::Status AddNode(const Json& node, BootstrapState* state, DataGroupRecord* g
   return absl::OkStatus();
 }
 
-absl::Status AddGroup(const Json& shard, BootstrapState* state) {
-  auto id = Number<int32_t>(shard, "group_id");
-  if (!id || state->directory.groups().contains(*id) || !shard.contains("master") ||
-      !shard.contains("replicas") || !shard.at("replicas").is_array() ||
-      !shard.contains("slot_ranges") || !shard.at("slot_ranges").is_array())
-    return absl::InvalidArgumentError("Invalid bootstrap shard or repeated group ID");
-  if (shard.contains("migrations") &&
-      (!shard.at("migrations").is_array() || !shard.at("migrations").empty()))
-    return absl::FailedPreconditionError("Complete existing slot migrations before bootstrap");
+absl::Status AddGroup(const Json& config, BootstrapState* state) {
+  auto id = Number<int32_t>(config, "group_id");
+  if (!id || config.size() != 3 || !config.contains("members") ||
+      !config.at("members").is_array() || config.at("members").empty() ||
+      !config.contains("slot_ranges") || !config.at("slot_ranges").is_array())
+    return absl::InvalidArgumentError("Expected a group_id, nonempty members and slot_ranges");
+  if (*id <= 0)
+    return absl::OutOfRangeError(
+        "Data group IDs must be positive (0 is reserved for the controller)");
   DataGroupRecord group;
   group.group_id = *id;
-  if (auto s = AddNode(shard.at("master"), state, &group); !s.ok())
-    return s;
-  for (const auto& replica : shard.at("replicas").array_range()) {
-    if (auto s = AddNode(replica, state, &group); !s.ok())
+  for (const auto& member : config.at("members").array_range()) {
+    if (auto s = AddNode(member, state, &group); !s.ok())
       return s;
   }
   if (auto s = state->directory.Replay(group); !s.ok())
     return s;
   state->records.push_back({std::move(group)});
-  for (const auto& range : shard.at("slot_ranges").array_range()) {
+  for (const auto& range : config.at("slot_ranges").array_range()) {
     auto first = Number<SlotId>(range, "start"), last = Number<SlotId>(range, "end");
     if (!first || !last)
       return absl::InvalidArgumentError("Invalid slot bounds in bootstrap group");
@@ -108,11 +106,12 @@ absl::StatusOr<vector<MetadataRecord>> ParseBootstrapTopology(string_view input)
   state.records.push_back({FeatureLevelRecord{"metadata.version", 33, {}}});
   state.records.push_back({FeatureLevelRecord{"dragonfly.cluster", 1, {}}});
   try {
-    auto shards = Json::parse(input);
-    if (!shards.is_array())
-      return absl::InvalidArgumentError("Expected a bootstrap shard array");
-    for (const auto& shard : shards.array_range()) {
-      if (auto s = AddGroup(shard, &state); !s.ok())
+    const auto topology = Json::parse(input);
+    if (!topology.is_object() || topology.size() != 1 || !topology.contains("groups") ||
+        !topology.at("groups").is_array())
+      return absl::InvalidArgumentError("Expected a Raft topology object with a groups array");
+    for (const auto& group : topology.at("groups").array_range()) {
+      if (auto s = AddGroup(group, &state); !s.ok())
         return s;
     }
   } catch (const jsoncons::json_exception& e) {

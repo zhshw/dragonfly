@@ -97,7 +97,7 @@ struct ProbeTarget {
 class ActiveController {
  public:
   ActiveController(RaftGroup& group, MetadataLoader& loader, string cluster_id,
-                   vector<MetadataRecord> bootstrap)
+                   absl::StatusOr<vector<MetadataRecord>> bootstrap)
       : group_(group),
         loader_(loader),
         cluster_id_(std::move(cluster_id)),
@@ -119,8 +119,9 @@ class ActiveController {
     return handlers;
   }
 
-  void Run(fb2::ProactorBase* owner) {
+  absl::Status Run(fb2::ProactorBase* owner) {
     map<int32_t, fb2::Fiber> probes;
+    absl::Status bootstrap_error;
     while (!stopping_) {
       vector<pair<int32_t, int32_t>> needed;
       auto status = group_.Visit([&](RaftGroup::State state) {
@@ -135,8 +136,14 @@ class ActiveController {
           return Append(state, span(&abort, 1));
         }
         auto image = loader_.image();
-        if (image->directory.groups().empty() && !bootstrap_.empty())
-          return Append(state, bootstrap_);
+        if (image->directory.groups().empty()) {
+          if (!bootstrap_.ok()) {
+            bootstrap_error = bootstrap_.status();
+            return bootstrap_error;
+          }
+          if (!bootstrap_->empty())
+            return Append(state, *bootstrap_);
+        }
         if (auto expired = brokers_.Expire(*image, NowMs()); expired)
           return Append(state, span(&*expired, 1));
         for (const auto& [gid, group] : image->directory.groups()) {
@@ -147,6 +154,10 @@ class ActiveController {
         }
         return absl::OkStatus();
       });
+      if (!bootstrap_error.ok()) {
+        Stop();
+        break;
+      }
       if (!status.ok() && !stopping_)
         VLOG(1) << "Metadata controller: " << status;
       for (auto [id, gid] : needed)
@@ -155,6 +166,7 @@ class ActiveController {
     }
     for (auto& [id, fiber] : probes)
       fiber.Join();
+    return bootstrap_error;
   }
 
   void Stop() {
@@ -309,7 +321,7 @@ class ActiveController {
   RaftGroup& group_;
   MetadataLoader& loader_;
   string cluster_id_;
-  vector<MetadataRecord> bootstrap_;
+  absl::StatusOr<vector<MetadataRecord>> bootstrap_;
   BrokerControl brokers_{9000};
   int32_t epoch_ = -1;
   steady_clock::time_point last_snapshot_time_ = steady_clock::now();
@@ -330,9 +342,6 @@ absl::Status RunController(const filesystem::path& dir, const string& cluster_id
   if (absl::GetFlag(FLAGS_raft_metadata_snapshot_bytes) < 1 ||
       absl::GetFlag(FLAGS_raft_metadata_snapshot_interval_ms) < 0)
     return absl::InvalidArgumentError("Invalid metadata snapshot size or interval");
-  auto bootstrap = ReadBootstrap(bootstrap_file);
-  if (!bootstrap.ok())
-    return bootstrap.status();
   auto endpoints = ParseVoterConnections(voters);
   if (!endpoints.ok())
     return endpoints.status();
@@ -345,7 +354,18 @@ absl::Status RunController(const filesystem::path& dir, const string& cluster_id
   if (!opened.ok())
     return opened.status();
   RaftGroup& group = **opened;
-  ActiveController controller(group, loader, cluster_id, *std::move(bootstrap));
+  auto bootstrap = ReadBootstrap(bootstrap_file);
+  if (!bootstrap.ok()) {
+    // An empty log cannot supply a topology. Report a bad bootstrap file on a fresh controller
+    // before it starts listening, even if the other voters are offline. On a restart, committed
+    // metadata decides whether the original bootstrap file is still needed.
+    auto status = group.Visit([&](RaftGroup::State state) {
+      return state.log.End().end_offset == 0 ? bootstrap.status() : absl::OkStatus();
+    });
+    if (!status.ok())
+      return status;
+  }
+  ActiveController controller(group, loader, cluster_id, std::move(bootstrap));
   auto listener = make_unique<RaftListener>(kMaxRaftFrame, controller.Handlers());
   const auto& local = endpoints->at(node_id);
   if (auto ec = acceptor->AddListener(local.host.c_str(), local.port, listener.get()); ec)
@@ -358,13 +378,18 @@ absl::Status RunController(const filesystem::path& dir, const string& cluster_id
   acceptor->Run();
   auto owner = pool->GetNextProactor();
   group.Start(owner);
-  auto controller_fiber = owner->LaunchFiber([&] { controller.Run(owner); });
+  absl::Status controller_status;
+  auto controller_fiber = owner->LaunchFiber([&] {
+    controller_status = controller.Run(owner);
+    if (!controller_status.ok())
+      acceptor->Stop();
+  });
   acceptor->Wait();
   controller.Stop();
   controller_fiber.Join();
   group.Join();
   acceptor->TriggerOnBreakSignal({});
-  return absl::OkStatus();
+  return controller_status;
 }
 
 }  // namespace dfly::cluster::raft

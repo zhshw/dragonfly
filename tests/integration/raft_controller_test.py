@@ -288,24 +288,9 @@ class ControllerProcessTest(unittest.TestCase):
 
     def bootstrap_broker(self, resp_port, raft_port):
         path = self.root / "bootstrap.json"
-        path.write_text(
-            json.dumps(
-                [
-                    {
-                        "group_id": 10,
-                        "master": {
-                            "id": "A",
-                            "ip": "127.0.0.1",
-                            "port": resp_port,
-                            "broker_id": 7,
-                            "raft_port": raft_port,
-                        },
-                        "replicas": [],
-                        "slot_ranges": [{"start": 0, "end": 16383}],
-                    }
-                ]
-            )
-        )
+        member = dict(id="A", ip="127.0.0.1", port=resp_port, broker_id=7, raft_port=raft_port)
+        group = dict(group_id=10, members=[member], slot_ranges=[dict(start=0, end=16383)])
+        path.write_text(json.dumps({"groups": [group]}))
         self.bootstrap_flags = [f"--raft_bootstrap_topology={path}"]
 
     def test_bootstrap_broker_fencing_and_controller_failover(self):

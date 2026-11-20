@@ -87,20 +87,21 @@ class RaftDataGroupFixture(unittest.TestCase):
                 raft_port=self.raft[node],
             )
 
-        layout = []
-        for gid, (a, b) in GROUPS.items():
+        groups = []
+        for gid, node_ids in GROUPS.items():
             start = 0 if gid == 10 else 8192
-            layout.append(
+            members = [entry(node) for node in node_ids]
+            if self.learner is not None and gid == 10:
+                members.append(entry(self.learner))
+            groups.append(
                 dict(
                     group_id=gid,
-                    master=entry(a),
-                    replicas=[entry(b)]
-                    + ([entry(self.learner)] if self.learner and gid == 10 else []),
+                    members=members,
                     slot_ranges=[dict(start=start, end=start + 8191)],
                 )
             )
         self.config = self.root / "topology.json"
-        self.config.write_text(json.dumps(layout))
+        self.config.write_text(json.dumps({"groups": groups}))
         for node in self.raft:
             self.start(node)
 
@@ -125,9 +126,10 @@ class RaftDataGroupFixture(unittest.TestCase):
         else:
             flags += [
                 "--raft_role=controller",
-                f"--raft_bootstrap_topology={self.config}",
                 "--port=0",
             ]
+            if self.config is not None:
+                flags.append(f"--raft_bootstrap_topology={self.config}")
         with (self.root / f"{node}.log").open("ab") as log:
             self.proc[node] = subprocess.Popen(
                 [self.bin, *flags], stdout=log, stderr=log, cwd=self.root / str(node)
@@ -236,7 +238,7 @@ class RaftDataGroupTest(RaftDataGroupFixture):
         self.assertTrue(self.client(leader_b).set(key_b, b"metadata-offline"))
         self.assertEqual(self.client(leader_b).get(key_b), b"metadata-offline")
 
-    def test_recover_confirmed_values_after_power_loss(self):
+    def test_recover_confirmed_values_without_bootstrap_after_cluster_crash(self):
         slots = self.wait_for(self.slots)
         values = {
             self.key_for_range(row[0], row[1]): bytes([i, 0, 255]) for i, row in enumerate(slots)
@@ -247,6 +249,10 @@ class RaftDataGroupTest(RaftDataGroupFixture):
                 self.assertTrue(cluster.set(key, value))
         for node in list(self.proc):
             self.stop(node, crash=True)
+
+        # Every restarted process must recover slot ownership and node IDs from the quorum log.
+        self.config.unlink()
+        self.config = None
         for node in self.raft:
             self.start(node)
         recovered = self.wait_for(self.slots)

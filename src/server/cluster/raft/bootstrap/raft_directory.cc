@@ -230,6 +230,9 @@ absl::StatusOr<RaftDirectoryIdentity> FormatRaftDirectory(const fs::path& dir,
     if (bootstrap_id != previous_bootstrap)
       return absl::FailedPreconditionError("Initial quorum differs from the formatted directory");
   } else {
+    if (bootstrap && bootstrap->data_group && *bootstrap->data_group <= 0)
+      return absl::InvalidArgumentError(
+          "Data group IDs must be positive (0 is reserved for the controller)");
     if (auto status = CheckUnformattedContents(dir); !status.ok())
       return status;
     RaftDirectoryConfig identity{cfg.cluster_id, cfg.node_id,

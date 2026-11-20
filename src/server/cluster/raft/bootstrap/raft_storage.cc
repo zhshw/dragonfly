@@ -16,7 +16,7 @@ bool ParseNumber(std::string_view arg, int32_t* number) {
 
 int Usage() {
   std::cerr << "Usage: raft_storage format|verify DIRECTORY CLUSTER_ID NODE_ID [DIRECTORY_ID]\n"
-               "       format options: [--data-group ID] "
+               "       format options: [--data-group POSITIVE_ID] "
                "(--initial-controllers id@host:port:directoryId,... | --no-initial-controllers)\n";
   return 2;
 }

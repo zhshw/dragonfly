@@ -8,9 +8,9 @@
 
 namespace dfly::cluster::raft {
 
-// Read the legacy shard array with group_id added to each shard and broker_id,
-// raft_port, optional raft_host added to every node. Stage the returned records as
-// one metadata transaction. The placeholder brokers remain fenced until they join.
+// Build the initial Raft metadata transaction from the configured data groups and slot ranges.
+// Each group declares its ID, members and slot ranges. Each member supplies its Redis identity,
+// broker_id and RESP and Raft endpoints. Brokers remain fenced until they join.
 absl::StatusOr<std::vector<MetadataRecord>> ParseBootstrapTopology(std::string_view json);
 
 // Validate an observation from the reporting broker's registered RAFT endpoint.

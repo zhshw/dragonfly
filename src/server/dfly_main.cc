@@ -86,7 +86,9 @@ ABSL_DECLARE_FLAG(std::string, dir);
 ABSL_DECLARE_FLAG(std::string, cluster_mode);
 ABSL_FLAG(string, raft_role, "", "");
 ABSL_FLAG(string, raft_listen, "", "Internal data quorum host:port.");
-ABSL_FLAG(string, raft_bootstrap_topology, "", "Initial metadata controller topology file.");
+ABSL_FLAG(string, raft_bootstrap_topology, "",
+          "Initial Raft topology JSON file. Each entry in groups defines a group_id, members "
+          "and slot_ranges.");
 ABSL_FLAG(string, raft_cluster_id, "", "Cluster ID recorded by raft_storage format.");
 ABSL_FLAG(int32_t, raft_node_id, -1, "Node ID recorded by raft_storage format.");
 ABSL_FLAG(string, raft_quorum_voters, "",
