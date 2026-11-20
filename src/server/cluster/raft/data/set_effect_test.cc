@@ -105,6 +105,26 @@ TEST_F(SetEffectTest, FailedApplyAndWrongGroupDoNotAdvanceCursor) {
   EXPECT_EQ(values, (vector<string>{first_.value, second.value}));
 }
 
+TEST_F(SetEffectTest, ACommittedFailedConditionPreservesTheValueAcrossReplay) {
+  ASSERT_TRUE(Append(first_).ok());
+  auto failed = first_;
+  failed.action = SetEffect::Action::kNoop;
+  EXPECT_FALSE(Append(failed).ok());
+  failed.value.clear();
+  ASSERT_TRUE(Append(failed).ok());
+  log_.reset();
+  log_ = PartitionLog::Open(dir_).value();
+  CommittedEffects state(10);
+  vector<SetEffect> writes;
+  auto apply = [&](const SetEffect& effect) {
+    writes.push_back(effect);
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(state.ApplyTo(*log_, 2, apply).ok());
+  EXPECT_EQ(state.applied_offset(), 2);
+  EXPECT_EQ(writes, vector<SetEffect>{first_});
+}
+
 TEST_F(SetEffectTest, RejectsUnsupportedPayloadsAndInvalidAddresses) {
   SetEffect effect{10, 2, 1234, 7, "", ""};
   auto encoded = MakeSetEffectBatch(0, 3, 1, effect).value();

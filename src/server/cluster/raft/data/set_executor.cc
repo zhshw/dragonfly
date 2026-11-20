@@ -14,6 +14,8 @@ namespace dfly::cluster::raft {
 absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffect& effect) {
   if (KeySlot(effect.key) != effect.slot)
     return absl::DataLossError("Committed SET key hashes to a different slot");
+  if (effect.action == SetEffect::Action::kNoop)
+    return absl::OkStatus();
   std::array<std::string_view, 3> parts{"SET", effect.key, effect.value};
   journal::ParsedEntry::CmdData cmd;
   cmd.Assign(parts.begin(), parts.end(), parts.size());
@@ -28,6 +30,21 @@ absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffect& effect
   if (result != facade::DispatchResult::OK || !reply || *reply != "OK")
     return absl::FailedPreconditionError("Committed SET did not return OK");
   return absl::OkStatus();
+}
+
+absl::StatusOr<bool> ExistsForSet(JournalExecutor& executor, DbIndex db, std::string_view key) {
+  std::array<std::string_view, 2> parts{"EXISTS", key};
+  journal::ParsedEntry::CmdData cmd;
+  cmd.Assign(parts.begin(), parts.end(), parts.size());
+  facade::CapturingReplyBuilder capture;
+  auto result = executor.Execute(db, cmd, capture);
+  auto payload = capture.Take();
+  if (auto error = facade::CapturingReplyBuilder::TryExtractError(payload))
+    return absl::FailedPreconditionError(std::string(error->first));
+  auto* count = std::get_if<long>(&payload);
+  if (result != facade::DispatchResult::OK || !count || (*count != 0 && *count != 1))
+    return absl::InternalError("EXISTS did not return a single key count");
+  return *count == 1;
 }
 
 }  // namespace dfly::cluster::raft

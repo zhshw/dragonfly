@@ -1469,18 +1469,40 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
   if (name == "SET" || name == "GET") {
     if (cntx->ns != &namespaces->GetDefaultNamespace())
       return reject("Raft data groups currently support the default namespace");
-    if (name == "SET" && args.size() != 2)
-      return reject("Raft data groups currently support SET key value");
-    if (name == "SET" && ServerState::tlocal()->ShouldDenyOnOOM())
-      return reject(kOutOfMemory);
     if (name == "SET") {
+      optional<cluster::raft::SetCondition> condition;
+      for (size_t i = 2; i < args.size(); ++i) {
+        cluster::raft::SetCondition next;
+        if (absl::EqualsIgnoreCase(args[i], "NX"))
+          next = cluster::raft::SetCondition::kIfMissing;
+        else if (absl::EqualsIgnoreCase(args[i], "XX"))
+          next = cluster::raft::SetCondition::kIfExists;
+        else
+          return reject("Raft data groups support SET key value [NX|XX]");
+        if (condition && *condition != next)
+          return reject(kSyntaxErr);
+        condition = next;
+      }
+      if (ServerState::tlocal()->ShouldDenyOnOOM())
+        return reject(kOutOfMemory);
       cluster::raft::DataWritePosition position;
-      auto status = raft_data_commands_->Set(cntx->db_index(), args[0], args[1], &position);
+      absl::StatusOr<bool> stored = true;
+      if (condition) {
+        stored =
+            raft_data_commands_->SetIf(cntx->db_index(), args[0], args[1], *condition, &position);
+      } else {
+        auto status = raft_data_commands_->Set(cntx->db_index(), args[0], args[1], &position);
+        if (!status.ok())
+          stored = std::move(status);
+      }
       if (position.end_offset >= 0)
         cntx->conn_state.raft_last_write = position;
-      if (!status.ok())
-        return reject(status.message());
-      cmd->SendSimpleString("OK");
+      if (!stored.ok())
+        return reject(stored.status().message());
+      if (*stored)
+        cmd->SendSimpleString("OK");
+      else
+        static_cast<RedisReplyBuilder*>(cmd->rb())->SendNull();
       return DispatchResult::OK;
     }
     if (auto status = raft_data_commands_->CheckRead(cntx->db_index(), args[0]); !status.ok())

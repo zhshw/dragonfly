@@ -17,6 +17,8 @@
 
 namespace dfly::cluster::raft {
 
+enum class SetCondition { kIfMissing, kIfExists };
+
 struct DataTopology {
   // Published only after every slot has an owner. Shards list only groups with a routable leader.
   ClusterShardInfos shards;
@@ -48,6 +50,8 @@ class DataCommandHandler {
   virtual ~DataCommandHandler() = default;
   virtual absl::Status Set(DbIndex db, std::string_view key, std::string_view value,
                            DataWritePosition* position) = 0;
+  virtual absl::StatusOr<bool> SetIf(DbIndex db, std::string_view key, std::string_view value,
+                                     SetCondition condition, DataWritePosition* position) = 0;
   virtual absl::Status CheckRead(DbIndex db, std::string_view key) = 0;
 
   virtual absl::StatusOr<DataReplicationState> ReplicationState() {

@@ -14,15 +14,19 @@
 
 namespace dfly::cluster::raft {
 
-// A resolved, unconditional string replacement. SET clears the old value and TTL.
+// A resolved SET result. A replacement clears the old value and TTL. A failed condition
+// commits a no-op so that its reply is authorized by the same quorum as a successful write.
 // The group log supplies the epoch and offset; the effect identifies the addressed slot generation.
 struct SetEffect {
+  enum class Action : uint8_t { kReplace = 1, kNoop = 2 };
+
   int32_t group_id;
   DbIndex db;
   SlotId slot;
   int64_t generation;
   std::string key;
   std::string value;
+  Action action = Action::kReplace;
 
   bool operator==(const SetEffect&) const = default;
 };

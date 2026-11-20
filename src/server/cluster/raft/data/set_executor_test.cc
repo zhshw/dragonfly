@@ -20,6 +20,12 @@ TEST_F(SetExecutorTest, RealSetTransactionReplacesAnExistingTypeAndClearsItsTTL)
   SetEffect effect{10, 0, KeySlot(key), 7, key, std::string("a\0b", 3)};
   EXPECT_EQ(Run({"RPUSH", key, "item"}), 1);
   EXPECT_EQ(Run({"PEXPIRE", key, "60000"}), 1);
+  pp_->at(0)->Await([&] {
+    JournalExecutor executor(service_.get());
+    EXPECT_TRUE(ExistsForSet(executor, 0, key).value());
+    EXPECT_FALSE(ExistsForSet(executor, 0, "missing").value());
+    EXPECT_FALSE(ExistsForSet(executor, kInvalidDbId, key).ok());
+  });
   auto apply = [&] {
     return pp_->at(0)->Await([&] {
       JournalExecutor executor(service_.get());

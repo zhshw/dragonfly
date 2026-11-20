@@ -20,7 +20,6 @@ namespace be = absl::big_endian;
 // key and value. The enclosing Kafka DefaultRecord supplies the total value length.
 constexpr string_view kMagic = "DFKV";
 constexpr uint8_t kVersion = 0;
-constexpr uint8_t kSet = 1;
 constexpr size_t kHeader = 26;
 
 bool ValidAddress(const SetEffect& effect) {
@@ -31,16 +30,20 @@ bool ValidAddress(const SetEffect& effect) {
 absl::StatusOr<SetEffect> DecodeSetEffect(string_view payload) {
   if (payload.size() < kHeader || !payload.starts_with(kMagic))
     return absl::DataLossError("Invalid Dragonfly KV record header");
-  if (payload[4] != kVersion || payload[5] != kSet)
+  auto action = static_cast<SetEffect::Action>(static_cast<uint8_t>(payload[5]));
+  if (payload[4] != kVersion ||
+      (action != SetEffect::Action::kReplace && action != SetEffect::Action::kNoop))
     return absl::UnimplementedError("Unsupported Dragonfly KV record version or operation");
   SetEffect effect;
+  effect.action = action;
   effect.group_id = static_cast<int32_t>(be::Load32(payload.data() + 6));
   effect.db = be::Load16(payload.data() + 10);
   effect.slot = be::Load16(payload.data() + 12);
   effect.generation = static_cast<int64_t>(be::Load64(payload.data() + 14));
   size_t key_size = be::Load32(payload.data() + 22);
   payload.remove_prefix(kHeader);
-  if (!ValidAddress(effect) || key_size > payload.size())
+  if (!ValidAddress(effect) || key_size > payload.size() ||
+      (action == SetEffect::Action::kNoop && payload.size() != key_size))
     return absl::DataLossError("Invalid Dragonfly KV address or key length");
   effect.key.assign(payload.substr(0, key_size));
   effect.value.assign(payload.substr(key_size));
@@ -53,6 +56,9 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
                                           const SetEffect& effect) {
   if (!ValidAddress(effect))
     return absl::InvalidArgumentError("Invalid Dragonfly SET effect address");
+  if ((effect.action == SetEffect::Action::kNoop && !effect.value.empty()) ||
+      (effect.action != SetEffect::Action::kNoop && effect.action != SetEffect::Action::kReplace))
+    return absl::InvalidArgumentError("Invalid Dragonfly SET effect operation or value");
   if (effect.key.size() > kMaxBatchSize - kHeader ||
       effect.value.size() > kMaxBatchSize - kHeader - effect.key.size())
     return absl::ResourceExhaustedError("Dragonfly SET effect exceeds Kafka batch size");
@@ -61,7 +67,7 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
   payload.assign(kHeader, '\0');
   payload.replace(0, kMagic.size(), kMagic);
   payload[4] = kVersion;
-  payload[5] = kSet;
+  payload[5] = static_cast<char>(effect.action);
   be::Store32(payload.data() + 6, effect.group_id);
   be::Store16(payload.data() + 10, effect.db);
   be::Store16(payload.data() + 12, effect.slot);
@@ -104,8 +110,10 @@ absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, Appl
         return effect.status();
       if (effect->group_id != group_id_)
         return absl::FailedPreconditionError("SET effect belongs to another replication group");
-      if (auto s = apply(*effect); !s.ok())
-        return s;
+      if (effect->action == SetEffect::Action::kReplace) {
+        if (auto s = apply(*effect); !s.ok())
+          return s;
+      }
     }
     applied_ = batch->end.end_offset;
   }

@@ -37,6 +37,20 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
     return ExecuteSetEffect(executor, {10, db, KeySlot(key), 0, string(key), string(value)});
   }
 
+  absl::StatusOr<bool> SetIf(DbIndex db, string_view key, string_view value, SetCondition condition,
+                             DataWritePosition* position) override {
+    JournalExecutor executor(service_.get());
+    auto exists = ExistsForSet(executor, db, key);
+    if (!exists.ok())
+      return exists.status();
+    if (*exists != (condition == SetCondition::kIfExists))
+      return false;
+    auto status = Set(db, key, value, position);
+    if (!status.ok())
+      return status;
+    return true;
+  }
+
   absl::Status CheckRead(DbIndex, string_view) override {
     ++reads_;
     return ready_ ? absl::OkStatus() : absl::UnavailableError("-MOVED 42 127.0.0.1:7002");
@@ -94,7 +108,8 @@ TEST_F(DataDispatchTest, GateRunsBeforeTransactionsAndBypassesOnlyInternalReplay
   EXPECT_EQ(sets_, 2u);
   EXPECT_EQ(Run({"GET", "k"}), "v");
   EXPECT_EQ(reads_, 3u);
-  EXPECT_THAT(Run({"SET", "k", "v2", "NX"}), facade::ArgType(facade::RespExpr::ERROR));
+  EXPECT_THAT(Run({"SET", "k", "v2", "NX"}), facade::ArgType(facade::RespExpr::NIL));
+  EXPECT_THAT(Run({"SET", "k", "v2", "EX", "3"}), facade::ArgType(facade::RespExpr::ERROR));
   EXPECT_THAT(Run({"DEL", "k"}), facade::ArgType(facade::RespExpr::ERROR));
   EXPECT_THAT(Run({"MULTI"}), facade::ArgType(facade::RespExpr::ERROR));
   EXPECT_THAT(Run({"EVAL", "return redis.call('DEL','k')", "0"}),
@@ -102,6 +117,19 @@ TEST_F(DataDispatchTest, GateRunsBeforeTransactionsAndBypassesOnlyInternalReplay
   EXPECT_THAT(RunPrivileged({"DFLYCLUSTER", "CONFIG", "[]"}),
               facade::ArgType(facade::RespExpr::ERROR));
   EXPECT_EQ(Run({"GET", "k"}), "v");
+  EXPECT_EQ(sets_, 2u);
+}
+
+TEST_F(DataDispatchTest, ConditionalSetReturnsNullOrOkWithoutOverwritingOnFailure) {
+  ready_ = true;
+  EXPECT_THAT(Run({"SET", "k", "v1", "XX"}), facade::ArgType(facade::RespExpr::NIL));
+  EXPECT_THAT(Run({"GET", "k"}), facade::ArgType(facade::RespExpr::NIL));
+  EXPECT_EQ(Run({"SET", "k", "v2", "nx", "NX"}), "OK");
+  EXPECT_THAT(Run({"SET", "k", "v3", "NX"}), facade::ArgType(facade::RespExpr::NIL));
+  EXPECT_EQ(Run({"GET", "k"}), "v2");
+  EXPECT_EQ(Run({"SET", "k", "v4", "xX"}), "OK");
+  EXPECT_EQ(Run({"GET", "k"}), "v4");
+  EXPECT_THAT(Run({"SET", "k", "v5", "NX", "XX"}), facade::ArgType(facade::RespExpr::ERROR));
   EXPECT_EQ(sets_, 2u);
 }
 
