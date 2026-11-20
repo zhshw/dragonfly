@@ -87,11 +87,17 @@ class Reader {
   }
 
   bool Field(std::string& value) {
+    if (!flexible_) {
+      int16_t length;
+      return Field(length) && length >= 0 && String(length, &value);
+    }
     uint32_t length;
     return Varint(&length) && length != 0 && String(length - 1, &value);
   }
 
   bool Field(std::optional<std::string>& value) {
+    if (!flexible_)
+      return LegacyClientId(value);
     uint32_t length;
     if (!Varint(&length))
       return false;
@@ -227,12 +233,17 @@ class Writer {
   bool Field(const std::string& value) {
     if (value.size() > kMaxStringLength)
       return false;
-    Varint(value.size() + 1);
+    if (flexible_)
+      Varint(value.size() + 1);
+    else
+      Field(static_cast<int16_t>(value.size()));
     bytes_->append(value);
     return true;
   }
 
   bool Field(const std::optional<std::string>& value) {
+    if (!flexible_)
+      return LegacyClientId(value);
     if (value)
       return Field(*value);
     Varint(0);

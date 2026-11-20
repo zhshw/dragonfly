@@ -8,6 +8,8 @@
 #include <system_error>
 
 #include "server/cluster/raft/protocol/api_versions.h"
+#include "server/cluster/raft/protocol/begin_epoch.h"
+#include "server/cluster/raft/protocol/end_epoch.h"
 #include "server/cluster/raft/protocol/vote.h"
 
 namespace dfly::cluster::raft::protocol {
@@ -27,12 +29,25 @@ struct FrameResult {
   std::error_code handler_error{};
 };
 
-using VoteHandler = std::function<std::error_code(int16_t, const VoteRequest&, VoteResponse*)>;
+template <typename Request, typename Response>
+using RpcHandler = std::function<std::error_code(int16_t, const Request&, Response*)>;
+
+using VoteHandler = RpcHandler<VoteRequest, VoteResponse>;
+
+struct RpcHandlers {
+  VoteHandler vote;
+  RpcHandler<BeginQuorumEpochRequest, BeginQuorumEpochResponse> begin_epoch;
+  RpcHandler<EndQuorumEpochRequest, EndQuorumEpochResponse> end_epoch;
+};
 
 // Reads one size-prefixed request from the accumulated receive buffer. Only kComplete consumes
 // bytes and replaces response. On kNeedMore append more data; all other failures close this
 // connection without replying. A local persistence failure is returned in handler_error.
-// ApiVersions advertises Vote only when this listener has a Vote handler.
+// ApiVersions advertises only installed handlers.
+[[nodiscard]] FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
+                                           const RpcHandlers& handlers, std::string* response);
+
+// Convenience entry point for listeners that implement only Vote and ApiVersions.
 [[nodiscard]] FrameResult DispatchRequestFrame(std::string_view input, size_t max_payload_size,
                                                const VoteHandler& vote_handler,
                                                std::string* response);
@@ -51,6 +66,14 @@ struct RequestMetadata {
                                             const ApiVersionsRequest& request, int16_t version,
                                             std::string* output);
 
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const BeginQuorumEpochRequest& request, int16_t version,
+                                            std::string* output);
+
+[[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
+                                            const EndQuorumEpochRequest& request, int16_t version,
+                                            std::string* output);
+
 // The caller supplies the expected API version and correlation ID of the in-flight request.
 [[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
                                               int16_t version, int32_t correlation_id,
@@ -58,5 +81,13 @@ struct RequestMetadata {
 [[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
                                               int16_t version, int32_t correlation_id,
                                               ApiVersionsResponse* response);
+
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              BeginQuorumEpochResponse* response);
+
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              EndQuorumEpochResponse* response);
 
 }  // namespace dfly::cluster::raft::protocol

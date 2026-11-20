@@ -3,6 +3,8 @@ add_library(dfly_raft
             bootstrap/raft_directory.cc
             config/quorum_config.cc
             protocol/api_versions.cc
+            protocol/begin_epoch.cc
+            protocol/end_epoch.cc
             protocol/rpc_frame.cc
             protocol/vote.cc
             quorum/campaign.cc

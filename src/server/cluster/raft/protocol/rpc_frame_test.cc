@@ -187,6 +187,93 @@ TEST(RpcFrameTest, InvalidFramesAndPersistenceErrorsNeverProduceReply) {
   EXPECT_EQ("unchanged", reply);
 }
 
+TEST(RpcFrameTest, KafkaJavaBeginEndEpochFrames) {
+  constexpr std::string_view begin_requests[] = {
+      "00000025003500000102030400016b0001630000000100017400000001000000020000000100000007",
+      "0000003d003500010102030400016b0002630000000202027402000000020000000000000000000000000000002a"
+      "00000001000000070000020272026823840000"};
+  constexpr std::string_view end_requests[] = {
+      "00000031003600000102030400016b000163000000010001740000000100000002000000010000000700000002"
+      "0000000200000003",
+      "00000038003600010102030400016b00026302027402000000020000000100000007020000000200000000000000"
+      "00000000000000002a0000000100"};
+  constexpr std::string_view begin_responses[] = {"0000000a01020304000000000000",
+                                                  "00000009010203040000000100"};
+  constexpr std::string_view end_responses[] = {
+      "0000000a01020304000000000000", "00000015010203040000000101000a02000000020268238400"};
+  RequestMetadata metadata{kCorrelationId, "k", {}};
+  for (int16_t version = 0; version <= 1; ++version) {
+    SCOPED_TRACE(version);
+    RpcHandlers handlers;
+    handlers.begin_epoch = [&](int16_t received, const BeginQuorumEpochRequest& request,
+                               BeginQuorumEpochResponse*) {
+      EXPECT_EQ(version, received);
+      EXPECT_EQ("c", request.cluster_id);
+      if (request.topics.size() != 1 || request.topics[0].partitions.size() != 1)
+        return std::make_error_code(std::errc::invalid_argument);
+      const auto& part = request.topics[0].partitions[0];
+      EXPECT_EQ(7, part.leader_epoch);
+      EXPECT_EQ(2, part.partition_index);
+      EXPECT_EQ(version ? 42 : 0, part.voter_directory_id.back());
+      if (version == 1) {
+        EXPECT_EQ(2, request.voter_id);
+        EXPECT_EQ(1u, request.leader_endpoints.size());
+      }
+      std::string encoded;
+      EXPECT_EQ(CodecError::kOk, EncodeRequestFrame(metadata, request, received, &encoded));
+      EXPECT_EQ(FromHex(begin_requests[version]), encoded);
+      return std::error_code{};
+    };
+    handlers.end_epoch = [&](int16_t received, const EndQuorumEpochRequest& request,
+                             EndQuorumEpochResponse* response) {
+      EXPECT_EQ(version, received);
+      if (request.topics.size() != 1 || request.topics[0].partitions.size() != 1)
+        return std::make_error_code(std::errc::invalid_argument);
+      const auto& part = request.topics[0].partitions[0];
+      if (version == 0) {
+        EXPECT_EQ((std::vector<int32_t>{2, 3}), part.preferred_successors);
+        EXPECT_TRUE(part.preferred_candidates.empty());
+      } else {
+        EXPECT_TRUE(part.preferred_successors.empty());
+        if (part.preferred_candidates.size() != 1)
+          return std::make_error_code(std::errc::invalid_argument);
+        EXPECT_EQ(2, part.preferred_candidates[0].candidate_id);
+        EXPECT_EQ(42, part.preferred_candidates[0].candidate_directory_id.back());
+        auto& endpoint = response->node_endpoints.emplace_back();
+        endpoint.node_id = 2;
+        endpoint.host = "h";
+        endpoint.port = 9092;
+      }
+      std::string encoded;
+      EXPECT_EQ(CodecError::kOk, EncodeRequestFrame(metadata, request, received, &encoded));
+      EXPECT_EQ(FromHex(end_requests[version]), encoded);
+      return std::error_code{};
+    };
+    std::string reply;
+    auto result = DispatchRpcFrame(FromHex(begin_requests[version]), kMaxFrame, handlers, &reply);
+    ASSERT_EQ(FrameStatus::kComplete, result.status);
+    EXPECT_EQ(FromHex(begin_responses[version]), reply);
+    BeginQuorumEpochResponse begin;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DecodeResponseFrame(reply, kMaxFrame, version, kCorrelationId, &begin).status);
+    result = DispatchRpcFrame(FromHex(end_requests[version]), kMaxFrame, handlers, &reply);
+    ASSERT_EQ(FrameStatus::kComplete, result.status);
+    EXPECT_EQ(FromHex(end_responses[version]), reply);
+    EndQuorumEpochResponse end;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DecodeResponseFrame(reply, kMaxFrame, version, kCorrelationId, &end).status);
+    EXPECT_EQ(static_cast<size_t>(version), end.node_endpoints.size());
+    ASSERT_EQ(FrameStatus::kComplete,
+              DispatchRpcFrame(FromHex(kRequest[0]), kMaxFrame, handlers, &reply).status);
+    ApiVersionsResponse advertised;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DecodeResponseFrame(reply, kMaxFrame, 0, kCorrelationId, &advertised).status);
+    ASSERT_EQ(3u, advertised.api_keys.size());
+    EXPECT_EQ(53, advertised.api_keys[1].api_key);
+    EXPECT_EQ(54, advertised.api_keys[2].api_key);
+  }
+}
+
 TEST(RpcFrameTest, KafkaJavaApiVersionsFeatureTags) {
   auto frame = FromHex(
       "000000450102030400000100000000040014020e6b726166742e76657273696f6e00000001000108"

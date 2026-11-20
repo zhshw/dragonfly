@@ -19,6 +19,9 @@ struct VoteRequest {
   static constexpr int16_t kMaxVersion = 2;
   static constexpr int16_t kFirstFlexibleVersion = 0;
   static constexpr int16_t kHeaderVersion = 2;
+  static constexpr int16_t HeaderVersion(int16_t) {
+    return kHeaderVersion;
+  }
 
   std::optional<std::string> cluster_id{};
   int32_t voter_id = -1;
@@ -58,6 +61,9 @@ struct VoteResponse {
   static constexpr int16_t kMaxVersion = 2;
   static constexpr int16_t kFirstFlexibleVersion = 0;
   static constexpr int16_t kHeaderVersion = 1;
+  static constexpr int16_t HeaderVersion(int16_t) {
+    return kHeaderVersion;
+  }
 
   int16_t error_code{};
   struct TopicData {

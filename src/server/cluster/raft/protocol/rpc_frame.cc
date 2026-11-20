@@ -65,9 +65,9 @@ FrameStatus WriteResponse(const Response& response, int16_t version, int32_t cor
   if (Encode(response, version, &body) != CodecError::kOk)
     return FrameStatus::kInvalidFrame;
   std::string header;
-  Writer writer(Response::kHeaderVersion, &header);
+  Writer writer(Response::HeaderVersion(version), &header);
   writer.Field(correlation_id);
-  if constexpr (Response::kHeaderVersion >= 1)
+  if (Response::HeaderVersion(version) >= 1)
     writer.Tags({});
   if (WriteFrame(header, body, output) != CodecError::kOk)
     return FrameStatus::kInvalidFrame;
@@ -98,7 +98,7 @@ template <typename Request> void Advertise(ApiVersionsResponse* response) {
 }
 
 FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t correlation_id,
-                              bool serve_votes, std::string* output) {
+                              const RpcHandlers& handlers, std::string* output) {
   ApiVersionsResponse response;
   if (version < ApiVersionsRequest::kMinVersion || version > ApiVersionsRequest::kMaxVersion) {
     // KIP-511 uses a v0 response before the client and server have negotiated a version.
@@ -112,8 +112,12 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
     return FrameStatus::kInvalidFrame;
   if (IsValid(request, version)) {
     Advertise<ApiVersionsRequest>(&response);
-    if (serve_votes)
+    if (handlers.vote)
       Advertise<VoteRequest>(&response);
+    if (handlers.begin_epoch)
+      Advertise<BeginQuorumEpochRequest>(&response);
+    if (handlers.end_epoch)
+      Advertise<EndQuorumEpochRequest>(&response);
   } else {
     response.error_code = kInvalidRequest;
   }
@@ -128,11 +132,11 @@ FrameResult ReadResponse(std::string_view input, size_t max_payload_size, int16_
   if (result.status != FrameStatus::kComplete)
     return result;
 
-  Reader reader(Response::kHeaderVersion, payload);
+  Reader reader(Response::HeaderVersion(version), payload);
   int32_t received_id;
   if (!reader.Field(received_id) || received_id != correlation_id)
     return {FrameStatus::kInvalidFrame};
-  if constexpr (Response::kHeaderVersion >= 1) {
+  if (Response::HeaderVersion(version) >= 1) {
     TaggedFields tags;
     if (!reader.Tags(tags))
       return {FrameStatus::kInvalidFrame};
@@ -149,10 +153,39 @@ FrameResult ReadResponse(std::string_view input, size_t max_payload_size, int16_
   return result;
 }
 
+bool ReadHeaderTags(int16_t version, Reader* reader) {
+  TaggedFields tags;
+  return version < 2 || reader->Tags(tags);
+}
+
+template <typename Request, typename Response>
+FrameResult Dispatch(int16_t version, int32_t correlation_id, Reader* reader,
+                     const RpcHandler<Request, Response>& handler, std::string* output) {
+  if (!handler)
+    return {FrameStatus::kUnknownApi};
+  if (!ReadHeaderTags(Request::HeaderVersion(version), reader))
+    return {FrameStatus::kInvalidFrame};
+  Request request;
+  auto error = Decode(reader->remaining(), version, &request);
+  if (error == CodecError::kUnsupportedVersion)
+    return {FrameStatus::kUnsupportedVersion};
+  if (error != CodecError::kOk)
+    return {FrameStatus::kInvalidFrame};
+  Response reply;
+  if (auto err = handler(version, request, &reply))
+    return {FrameStatus::kHandlerError, 0, err};
+  return {WriteResponse(reply, version, correlation_id, output)};
+}
+
 }  // namespace
 
 FrameResult DispatchRequestFrame(std::string_view input, size_t max_payload_size,
                                  const VoteHandler& vote_handler, std::string* response) {
+  return DispatchRpcFrame(input, max_payload_size, {vote_handler, {}, {}}, response);
+}
+
+FrameResult DispatchRpcFrame(std::string_view input, size_t max_payload_size,
+                             const RpcHandlers& handlers, std::string* response) {
   std::string_view payload;
   auto result = ReadFrame(input, max_payload_size, &payload);
   if (result.status != FrameStatus::kComplete)
@@ -163,39 +196,32 @@ FrameResult DispatchRequestFrame(std::string_view input, size_t max_payload_size
   int32_t correlation_id;
   if (!reader.Field(api_key) || !reader.Field(version) || !reader.Field(correlation_id))
     return {FrameStatus::kInvalidFrame};
-  if (api_key != ApiVersionsRequest::kApiKey && (api_key != VoteRequest::kApiKey || !vote_handler))
-    return {FrameStatus::kUnknownApi};
   std::optional<std::string> client_id;
   if (!reader.LegacyClientId(client_id))
     return {FrameStatus::kInvalidFrame};
-  const int16_t header_version = api_key == ApiVersionsRequest::kApiKey
-                                     ? ApiVersionsRequest::HeaderVersion(version)
-                                     : VoteRequest::kHeaderVersion;
-  if (header_version >= 2) {
-    TaggedFields tags;
-    if (!reader.Tags(tags))
-      return {FrameStatus::kInvalidFrame};
-  }
 
-  FrameStatus status;
-  if (api_key == ApiVersionsRequest::kApiKey) {
-    status = HandleApiVersions(reader.remaining(), version, correlation_id,
-                               static_cast<bool>(vote_handler), response);
-  } else {
-    VoteRequest request;
-    auto error = Decode(reader.remaining(), version, &request);
-    if (error == CodecError::kUnsupportedVersion)
-      return {FrameStatus::kUnsupportedVersion};
-    if (error != CodecError::kOk)
-      return {FrameStatus::kInvalidFrame};
-    VoteResponse reply;
-    if (auto err = vote_handler(version, request, &reply))
-      return {FrameStatus::kHandlerError, 0, err};
-    status = WriteResponse(reply, version, correlation_id, response);
+  FrameResult dispatched;
+  switch (api_key) {
+    case ApiVersionsRequest::kApiKey:
+      if (!ReadHeaderTags(ApiVersionsRequest::HeaderVersion(version), &reader))
+        return {FrameStatus::kInvalidFrame};
+      dispatched = {
+          HandleApiVersions(reader.remaining(), version, correlation_id, handlers, response)};
+      break;
+    case VoteRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.vote, response);
+      break;
+    case BeginQuorumEpochRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.begin_epoch, response);
+      break;
+    case EndQuorumEpochRequest::kApiKey:
+      dispatched = Dispatch(version, correlation_id, &reader, handlers.end_epoch, response);
+      break;
+    default:
+      return {FrameStatus::kUnknownApi};
   }
-
-  if (status != FrameStatus::kComplete)
-    return {status};
+  if (dispatched.status != FrameStatus::kComplete)
+    return dispatched;
   return result;
 }
 
@@ -217,6 +243,29 @@ FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
 
 FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
                                 int32_t correlation_id, ApiVersionsResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata,
+                              const BeginQuorumEpochRequest& request, int16_t version,
+                              std::string* output) {
+  return WriteRequest(metadata, request, version, BeginQuorumEpochRequest::HeaderVersion(version),
+                      output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, BeginQuorumEpochResponse* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+CodecError EncodeRequestFrame(const RequestMetadata& metadata, const EndQuorumEpochRequest& request,
+                              int16_t version, std::string* output) {
+  return WriteRequest(metadata, request, version, EndQuorumEpochRequest::HeaderVersion(version),
+                      output);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, EndQuorumEpochResponse* response) {
   return ReadResponse(input, max_payload_size, version, correlation_id, response);
 }
 

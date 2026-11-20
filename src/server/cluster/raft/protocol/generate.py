@@ -33,6 +33,16 @@ def first_version(versions):
     return int(match[1])
 
 
+def version_condition(versions):
+    if versions.endswith("+"):
+        since = first_version(versions)
+        return f"io.version >= {since}" if since else ""
+    if "-" in versions:
+        low, high = map(int, versions.split("-"))
+        return f"io.version >= {low} && io.version <= {high}" if low else f"io.version <= {high}"
+    return f"io.version == {int(versions)}"
+
+
 def field_name(field):
     return re.sub(r"(?<!^)(?=[A-Z])", "_", field["name"]).lower()
 
@@ -40,9 +50,8 @@ def field_name(field):
 def cpp_field(field):
     raw = field["type"]
     if raw.startswith("[]"):
-        if not field.get("fields"):
-            raise ValueError(f"Expected an array of structures: {field}")
-        return f"std::vector<{raw[2:]}>"
+        element = raw[2:] if field.get("fields") else TYPES[raw[2:]]
+        return f"std::vector<{element}>"
     if "nullableVersions" in field:
         if raw != "string" or field["nullableVersions"] != field["versions"]:
             raise ValueError(f"Unsupported nullability: {field}")
@@ -56,20 +65,19 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
     visitor = []
     tags = ["m.unknown_tags"]
     for field in fields:
-        since = first_version(field["versions"])
+        condition = version_condition(field["versions"])
         member = "m." + field_name(field)
         if "fields" in field:
             emit_struct(
                 field["type"][2:], field["fields"], [], header, impl, flexible, (*parents, name)
             )
         default = field.get("default", "null")
-        if field["type"] == "string" and since < flexible:
-            raise ValueError(f"Legacy string body field requires a versioned encoding: {field}")
         if field.get("flexibleVersions"):
             raise ValueError(f"Per-field flexible versions require an explicit codec: {field}")
         initializer = "{}" if default in ("null", "false") else f" = {int(default)}"
         header.append(f"{cpp_field(field)} {field_name(field)}{initializer};")
         if "tag" in field:
+            since = first_version(field["taggedVersions"])
             if field["taggedVersions"] != field["versions"] or since < flexible:
                 raise ValueError(f"Unsupported tagged field shape: {field}")
             if field["type"].startswith("[]"):
@@ -81,8 +89,8 @@ def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
             else:
                 raise ValueError(f"Unsupported tagged field type: {field}")
             tags.append(f"Tagged{{{field['tag']}, {since}, {member}, {present}}}")
-        elif since:
-            visitor.append(f"if (io.version >= {since}) {{")
+        elif condition:
+            visitor.append(f"if ({condition}) {{")
             visitor.append(f"if (!io.Field({member})) return false;")
             if not field.get("ignorable", False):
                 if default not in ("null", "0", "false"):
@@ -153,10 +161,14 @@ def generate(schema_dir, api, stem):
             f"static constexpr int16_t kMaxVersion = {high};",
             f"static constexpr int16_t kFirstFlexibleVersion = {flexible};",
         ]
+        legacy_range = "0" if flexible == 1 else f"0-{flexible - 1}"
         if set(headers) == {"0+"}:
             constants.append(f"static constexpr int16_t kHeaderVersion = {headers['0+']};")
-        elif set(headers) == {f"0-{flexible - 1}", f"{flexible}+"}:
-            legacy_header = headers[f"0-{flexible - 1}"]
+            constants.append(
+                "static constexpr int16_t HeaderVersion(int16_t) {return kHeaderVersion;}"
+            )
+        elif set(headers) == {legacy_range, f"{flexible}+"}:
+            legacy_header = headers[legacy_range]
             flexible_header = headers[f"{flexible}+"]
             constants.append(
                 f"static constexpr int16_t HeaderVersion(int16_t version) {{"
@@ -198,3 +210,5 @@ if __name__ == "__main__":
     schema_dir = parser.parse_args().kafka / "clients/src/main/resources/common/message"
     generate(schema_dir, "Vote", "vote")
     generate(schema_dir, "ApiVersions", "api_versions")
+    generate(schema_dir, "BeginQuorumEpoch", "begin_epoch")
+    generate(schema_dir, "EndQuorumEpoch", "end_epoch")

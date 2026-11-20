@@ -41,6 +41,9 @@ struct ApiVersionsResponse {
   static constexpr int16_t kMaxVersion = 5;
   static constexpr int16_t kFirstFlexibleVersion = 3;
   static constexpr int16_t kHeaderVersion = 0;
+  static constexpr int16_t HeaderVersion(int16_t) {
+    return kHeaderVersion;
+  }
 
   int16_t error_code{};
   struct ApiVersion {
