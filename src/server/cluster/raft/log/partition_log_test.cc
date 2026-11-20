@@ -4,6 +4,8 @@
 
 #include "server/cluster/raft/log/partition_log.h"
 
+#include <absl/base/internal/endian.h>
+#include <absl/crc/crc32c.h>
 #include <gtest/gtest.h>
 #include <stdlib.h>
 
@@ -25,8 +27,8 @@ class PartitionLogTest : public testing::Test {
     Open();
   }
 
-  void Open() {
-    auto result = PartitionLog::Open(dir_);
+  void Open(size_t segment_bytes = 1U << 30) {
+    auto result = PartitionLog::Open(dir_, segment_bytes);
     ASSERT_TRUE(result.ok()) << result.status();
     log_ = *std::move(result);
   }
@@ -149,6 +151,81 @@ TEST_F(PartitionLogTest, RawKafkaSegmentMustBeContinuous) {
   ofstream(Segment(), ios::binary) << first;
   Open();
   EXPECT_EQ(log_->End(), (LogPosition{1, 2}));
+}
+
+TEST_F(PartitionLogTest, RollReadAndReplaceSuffixAcrossSegments) {
+  log_.reset();
+  Open(100);
+  auto first = MakeDataBatch(0, 3, 1, values_).value();
+  auto second = MakeDataBatch(2, 5, 2, values_).value();
+  auto third = MakeDataBatch(4, 5, 3, values_).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  ASSERT_TRUE(log_->Append(second, 5).ok());
+  ASSERT_TRUE(log_->Append(third, 5).ok());
+  auto middle = dir_ / "00000000000000000002.log";
+  auto last = dir_ / "00000000000000000004.log";
+  EXPECT_EQ(fs::file_size(middle), second.size());
+  EXPECT_EQ(fs::file_size(last), third.size());
+  log_.reset();
+  Open(100);
+  EXPECT_EQ(log_->EndForEpoch(4), (LogPosition{3, 2}));
+  EXPECT_EQ(log_->Read(0, 6, SIZE_MAX).value(), first);
+  EXPECT_EQ(log_->Read(2, 6, SIZE_MAX).value(), second);
+  EXPECT_EQ(log_->Read(4, 6, SIZE_MAX).value(), third);
+  ASSERT_TRUE(log_->TruncateTo(2, 2).ok());
+  EXPECT_FALSE(fs::exists(middle));
+  EXPECT_FALSE(fs::exists(last));
+  auto replacement = MakeDataBatch(2, 7, 4, values_).value();
+  ASSERT_TRUE(log_->Append(replacement, 7).ok());
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{7, 4}));
+  EXPECT_EQ(log_->Read(2, 4, SIZE_MAX).value(), replacement);
+}
+
+TEST_F(PartitionLogTest, UnpublishedRollAndMissingDurableMiddleSegment) {
+  log_.reset();
+  Open(100);
+  auto first = MakeDataBatch(0, 3, 1, values_).value();
+  auto second = MakeDataBatch(2, 3, 2, values_).value();
+  auto third = MakeDataBatch(4, 3, 3, values_).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  ASSERT_TRUE(fs::create_directory(dir_ / "dragonfly-log-end.tmp"));
+  EXPECT_FALSE(log_->Append(second, 3).ok());
+  EXPECT_FALSE(log_->io_failure().ok());
+  auto middle = dir_ / "00000000000000000002.log";
+  EXPECT_TRUE(fs::exists(middle));
+  log_.reset();
+  fs::remove(dir_ / "dragonfly-log-end.tmp");
+  Open(100);
+  EXPECT_FALSE(fs::exists(middle));
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  ASSERT_TRUE(log_->Append(second, 3).ok());
+  ASSERT_TRUE(log_->Append(third, 3).ok());
+  log_.reset();
+  ASSERT_TRUE(fs::remove(middle));
+  EXPECT_TRUE(absl::IsDataLoss(PartitionLog::Open(dir_).status()));
+}
+
+TEST_F(PartitionLogTest, UpgradeSingleSegmentMarker) {
+  auto first = MakeDataBatch(0, 3, 1, values_).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  log_.reset();
+  string legacy(24, '\0');
+  legacy.replace(0, 4, "DFE1");
+  absl::big_endian::Store64(legacy.data() + 4, first.size());
+  absl::big_endian::Store64(legacy.data() + 12, 2);
+  absl::big_endian::Store32(
+      legacy.data() + 20,
+      static_cast<uint32_t>(absl::ComputeCrc32c(string_view(legacy).substr(0, 20))));
+  ofstream(dir_ / "dragonfly-log-end", ios::binary) << legacy;
+  Open(100);
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  auto next = MakeDataBatch(2, 4, 2, values_).value();
+  ASSERT_TRUE(log_->Append(next, 4).ok());
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{4, 4}));
 }
 
 }  // namespace

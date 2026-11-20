@@ -2,6 +2,7 @@ add_library(dfly_raft
             bootstrap/meta_properties.cc
             bootstrap/raft_directory.cc
             config/quorum_config.cc
+            log/log_files.cc
             log/partition_log.cc
             log/record_batch.cc
             protocol/api_versions.cc
@@ -17,7 +18,7 @@ add_library(dfly_raft
             replication/high_watermark.cc
             storage/file_quorum_state_store.cc)
 target_compile_features(dfly_raft PUBLIC cxx_std_20)
-cxx_link(dfly_raft absl::crc32c absl::statusor absl::strings absl::cleanup TRDP::jsoncons)
+cxx_link(dfly_raft absl::crc32c absl::statusor absl::str_format absl::strings absl::cleanup TRDP::jsoncons)
 
 add_executable(raft_storage bootstrap/raft_storage.cc)
 cxx_link(raft_storage dfly_raft)

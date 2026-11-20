@@ -20,10 +20,15 @@ namespace dfly::cluster::raft {
 // Each successful append is durable before its resulting LEO can be reported to a peer.
 class PartitionLog {
  public:
-  static absl::StatusOr<std::unique_ptr<PartitionLog>> Open(const std::filesystem::path& dir);
+  static absl::StatusOr<std::unique_ptr<PartitionLog>> Open(const std::filesystem::path& dir,
+                                                            size_t segment_bytes = 1U << 30);
   ~PartitionLog();
   PartitionLog(const PartitionLog&) = delete;
   PartitionLog& operator=(const PartitionLog&) = delete;
+
+  const absl::Status& io_failure() const {
+    return io_failure_;
+  }
 
   LogPosition End() const;
   LogPosition EndForEpoch(int32_t requested_epoch) const;
@@ -46,18 +51,28 @@ class PartitionLog {
  private:
   struct Batch {
     LogPosition end;
+    int64_t segment_base;
+    int64_t file_start;
     int64_t file_end;
   };
 
-  explicit PartitionLog(std::filesystem::path dir) : dir_(std::move(dir)) {
+  PartitionLog(std::filesystem::path dir, size_t segment_bytes)
+      : dir_(std::move(dir)), segment_bytes_(segment_bytes) {
   }
   absl::Status Recover();
+  absl::Status RecoverSegment(std::optional<int64_t> durable_bytes);
+  absl::Status SetActive(int64_t base, int flags);
+  absl::Status RemoveSuffixSegments();
   absl::Status AppendBatches(std::string_view batches, int32_t epoch, bool follower);
   absl::Status PublishEnd(int64_t file_end, int64_t end_offset);
 
   std::filesystem::path dir_;
   int dir_fd_ = -1;
   int log_fd_ = -1;
+  size_t segment_bytes_;
+  int64_t active_base_ = 0;
+  int64_t active_bytes_ = 0;
+  std::vector<int64_t> segment_bases_;
   std::vector<Batch> batches_;
   absl::Status io_failure_;
 };
