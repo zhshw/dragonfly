@@ -1,7 +1,7 @@
-"""Generate the flexible KRaft Vote codec from the Kafka checkout's message schemas.
+"""Generate KRaft message codecs from the Kafka checkout's message schemas.
 
 Usage: python3 generate.py /path/to/kafka
-Run the repository clang-format hook on vote.h and vote.cc after generation.
+Run the repository clang-format hook on the generated files after generation.
 """
 
 import argparse
@@ -50,7 +50,7 @@ def cpp_field(field):
     return TYPES[raw]
 
 
-def emit_struct(name, fields, constants, header, impl, parents=()):
+def emit_struct(name, fields, constants, header, impl, flexible, parents=()):
     header.append(f"struct {name} {{")
     header.extend(constants)
     visitor = []
@@ -59,14 +59,28 @@ def emit_struct(name, fields, constants, header, impl, parents=()):
         since = first_version(field["versions"])
         member = "m." + field_name(field)
         if "fields" in field:
-            emit_struct(field["type"][2:], field["fields"], [], header, impl, (*parents, name))
+            emit_struct(
+                field["type"][2:], field["fields"], [], header, impl, flexible, (*parents, name)
+            )
         default = field.get("default", "null")
-        initializer = "{}" if default == "null" else f" = {int(default)}"
+        if field["type"] == "string" and since < flexible:
+            raise ValueError(f"Legacy string body field requires a versioned encoding: {field}")
+        if field.get("flexibleVersions"):
+            raise ValueError(f"Per-field flexible versions require an explicit codec: {field}")
+        initializer = "{}" if default in ("null", "false") else f" = {int(default)}"
         header.append(f"{cpp_field(field)} {field_name(field)}{initializer};")
         if "tag" in field:
-            if field["taggedVersions"] != field["versions"] or not field["type"].startswith("[]"):
+            if field["taggedVersions"] != field["versions"] or since < flexible:
                 raise ValueError(f"Unsupported tagged field shape: {field}")
-            tags.append(f"Tagged{{{field['tag']}, {since}, {member}}}")
+            if field["type"].startswith("[]"):
+                present = f"!{member}.empty()"
+            elif field["type"] == "bool":
+                present = member
+            elif field["type"] in ("int16", "int32", "int64"):
+                present = f"{member} != {int(default)}"
+            else:
+                raise ValueError(f"Unsupported tagged field type: {field}")
+            tags.append(f"Tagged{{{field['tag']}, {since}, {member}, {present}}}")
         elif since:
             visitor.append(f"if (io.version >= {since}) {{")
             visitor.append(f"if (!io.Field({member})) return false;")
@@ -86,6 +100,11 @@ def emit_struct(name, fields, constants, header, impl, parents=()):
             f"template <> struct Schema<{qualified}> {{",
             "template <typename IO, typename T> static bool Visit(IO& io, T& m) {",
             *visitor,
+            *(
+                [f"if (io.version < {flexible}) return io.Absent(m.unknown_tags);"]
+                if flexible
+                else []
+            ),
             f"return io.Tags({', '.join(tags)});",
             "}",
             "};",
@@ -94,7 +113,7 @@ def emit_struct(name, fields, constants, header, impl, parents=()):
     )
 
 
-def generate(schema_dir):
+def generate(schema_dir, api, stem):
     header = [
         NOTICE,
         "#pragma once",
@@ -110,7 +129,7 @@ def generate(schema_dir):
     ]
     impl = [
         NOTICE,
-        '#include "server/cluster/raft/protocol/vote.h"',
+        f'#include "server/cluster/raft/protocol/{stem}.h"',
         "",
         '#include "server/cluster/raft/protocol/flexible_message.h"',
         "",
@@ -119,23 +138,34 @@ def generate(schema_dir):
         "",
     ]
     functions = []
-    for name in ("VoteRequest", "VoteResponse"):
+    for name in (api + "Request", api + "Response"):
         schema = json.loads(
             re.sub(
                 r"^\s*//[^\n]*", "", (schema_dir / f"{name}.json").read_text(), flags=re.MULTILINE
             )
         )
-        if schema["flexibleVersions"] != "0+" or set(schema["headerVersions"]) != {"0+"}:
-            raise ValueError("Expected a flexible message with a fixed header version")
+        flexible = first_version(schema["flexibleVersions"])
+        headers = schema["headerVersions"]
         low, high = map(int, schema["validVersions"].split("-"))
         constants = [
             f"static constexpr int16_t kApiKey = {schema['apiKey']};",
             f"static constexpr int16_t kMinVersion = {low};",
             f"static constexpr int16_t kMaxVersion = {high};",
-            f"static constexpr int16_t kHeaderVersion = {schema['headerVersions']['0+']};",
-            "",
+            f"static constexpr int16_t kFirstFlexibleVersion = {flexible};",
         ]
-        emit_struct(name, schema["fields"], constants, header, impl)
+        if set(headers) == {"0+"}:
+            constants.append(f"static constexpr int16_t kHeaderVersion = {headers['0+']};")
+        elif set(headers) == {f"0-{flexible - 1}", f"{flexible}+"}:
+            legacy_header = headers[f"0-{flexible - 1}"]
+            flexible_header = headers[f"{flexible}+"]
+            constants.append(
+                f"static constexpr int16_t HeaderVersion(int16_t version) {{"
+                f"return version < kFirstFlexibleVersion ? {legacy_header} : {flexible_header}; }}"
+            )
+        else:
+            raise ValueError(f"Unsupported header version map {headers}")
+        constants.append("")
+        emit_struct(name, schema["fields"], constants, header, impl, flexible)
         header.append(
             "// Encode or decode one complete body without the RPC header or frame length."
         )
@@ -157,7 +187,7 @@ def generate(schema_dir):
             functions.extend([decl + " {", f"return detail::{function}Message({args});", "}", ""])
         header.append("")
     impl.extend(["}  // namespace detail", "", *functions])
-    for filename, lines in [("vote.h", header), ("vote.cc", impl)]:
+    for filename, lines in [(stem + ".h", header), (stem + ".cc", impl)]:
         lines.extend(["", f"}}  // namespace {NAMESPACE}", ""])
         Path(__file__).with_name(filename).write_text("\n".join(lines))
 
@@ -165,4 +195,6 @@ def generate(schema_dir):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("kafka", type=Path)
-    generate(parser.parse_args().kafka / "clients/src/main/resources/common/message")
+    schema_dir = parser.parse_args().kafka / "clients/src/main/resources/common/message"
+    generate(schema_dir, "Vote", "vote")
+    generate(schema_dir, "ApiVersions", "api_versions")

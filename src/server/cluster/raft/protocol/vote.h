@@ -17,6 +17,7 @@ struct VoteRequest {
   static constexpr int16_t kApiKey = 52;
   static constexpr int16_t kMinVersion = 0;
   static constexpr int16_t kMaxVersion = 2;
+  static constexpr int16_t kFirstFlexibleVersion = 0;
   static constexpr int16_t kHeaderVersion = 2;
 
   std::optional<std::string> cluster_id{};
@@ -55,6 +56,7 @@ struct VoteResponse {
   static constexpr int16_t kApiKey = 52;
   static constexpr int16_t kMinVersion = 0;
   static constexpr int16_t kMaxVersion = 2;
+  static constexpr int16_t kFirstFlexibleVersion = 0;
   static constexpr int16_t kHeaderVersion = 1;
 
   int16_t error_code{};

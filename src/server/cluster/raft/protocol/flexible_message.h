@@ -28,12 +28,18 @@ template <typename T> struct Tagged {
   uint32_t id;
   int16_t first_version;
   T& value;
+  bool present;
 };
-template <typename T> Tagged(uint32_t, int16_t, T&) -> Tagged<T>;
+template <typename T> Tagged(uint32_t, int16_t, T&, bool) -> Tagged<T>;
 
 class Reader {
  public:
-  Reader(int16_t version, std::string_view bytes) : version(version), bytes_(bytes) {
+  Reader(int16_t version, std::string_view bytes, bool flexible = true)
+      : version(version), bytes_(bytes), flexible_(flexible) {
+  }
+
+  std::string_view remaining() const {
+    return bytes_;
   }
 
   bool empty() const {
@@ -69,6 +75,17 @@ class Reader {
     return true;
   }
 
+  bool LegacyClientId(std::optional<std::string>& value) {
+    int16_t length;
+    if (!Field(length))
+      return false;
+    if (length < 0) {
+      value.reset();
+      return true;
+    }
+    return String(length, &value.emplace());
+  }
+
   bool Field(std::string& value) {
     uint32_t length;
     return Varint(&length) && length != 0 && String(length - 1, &value);
@@ -87,9 +104,14 @@ class Reader {
 
   template <typename T> bool Field(std::vector<T>& values) {
     uint32_t length;
-    if (!Varint(&length) || length == 0)
+    if (flexible_) {
+      if (!Varint(&length) || length == 0)
+        return false;
+      --length;
+    } else if (!Field(length)) {
       return false;
-    const auto count = length - 1;
+    }
+    const auto count = length;
     if (count > bytes_.size() || count > kMaxArrayLength)
       return false;
     for (uint32_t i = 0; i < count; ++i) {
@@ -108,6 +130,8 @@ class Reader {
   }
 
   template <typename... Fields> bool Tags(TaggedFields& unknown, Fields... known) {
+    if (!flexible_)
+      return true;
     uint32_t count;
     if (!Varint(&count) || count > kMaxTaggedFields || count > bytes_.size() / 2)
       return false;
@@ -164,11 +188,13 @@ class Reader {
   }
 
   std::string_view bytes_;
+  bool flexible_;
 };
 
 class Writer {
  public:
-  Writer(int16_t version, std::string* bytes) : version(version), bytes_(bytes) {
+  Writer(int16_t version, std::string* bytes, bool flexible = true)
+      : version(version), bytes_(bytes), flexible_(flexible) {
   }
 
   template <typename T>
@@ -185,6 +211,16 @@ class Writer {
 
   bool Field(const Uuid& value) {
     bytes_->append(reinterpret_cast<const char*>(value.data()), value.size());
+    return true;
+  }
+
+  bool LegacyClientId(const std::optional<std::string>& value) {
+    if (!value)
+      return Field(int16_t{-1});
+    if (value->size() > kMaxStringLength)
+      return false;
+    Field(static_cast<int16_t>(value->size()));
+    bytes_->append(*value);
     return true;
   }
 
@@ -206,7 +242,10 @@ class Writer {
   template <typename T> bool Field(const std::vector<T>& values) {
     if (values.size() > kMaxArrayLength)
       return false;
-    Varint(values.size() + 1);
+    if (flexible_)
+      Varint(values.size() + 1);
+    else
+      Field(static_cast<int32_t>(values.size()));
     for (const auto& value : values) {
       if (!Field(value))
         return false;
@@ -223,6 +262,8 @@ class Writer {
   }
 
   bool Tags(const TaggedFields& unknown) {
+    if (!flexible_)
+      return Absent(unknown);
     if (unknown.size() > kMaxTaggedFields)
       return false;
     Varint(unknown.size());
@@ -267,7 +308,7 @@ class Writer {
       return false;
     if (version < tag.first_version)
       return Absent(tag.value);
-    if (tag.value.empty())
+    if (!tag.present)
       return true;
     Writer field(version, &(*fields)[tag.id]);
     if (field.Field(tag.value))
@@ -277,13 +318,14 @@ class Writer {
   }
 
   std::string* bytes_;
+  bool flexible_;
 };
 
 template <typename T> CodecError EncodeMessage(const T& value, int16_t version, std::string* out) {
   if (version < T::kMinVersion || version > T::kMaxVersion)
     return CodecError::kUnsupportedVersion;
   std::string buffer;
-  Writer writer(version, &buffer);
+  Writer writer(version, &buffer, version >= T::kFirstFlexibleVersion);
   if (!writer.Field(value))
     return writer.error;
   *out = std::move(buffer);
@@ -294,7 +336,7 @@ template <typename T> CodecError DecodeMessage(std::string_view bytes, int16_t v
   if (version < T::kMinVersion || version > T::kMaxVersion)
     return CodecError::kUnsupportedVersion;
   T value;
-  Reader reader(version, bytes);
+  Reader reader(version, bytes, version >= T::kFirstFlexibleVersion);
   if (!reader.Field(value) || !reader.empty())
     return CodecError::kInvalidData;
   *out = std::move(value);

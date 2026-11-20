@@ -2,6 +2,8 @@ add_library(dfly_raft
             bootstrap/meta_properties.cc
             bootstrap/raft_directory.cc
             config/quorum_config.cc
+            protocol/api_versions.cc
+            protocol/rpc_frame.cc
             protocol/vote.cc
             quorum/election.cc
             replication/high_watermark.cc
@@ -14,6 +16,7 @@ cxx_link(raft_storage dfly_raft)
 
 helio_cxx_test(bootstrap/raft_directory_test dfly_raft LABELS DFLY)
 helio_cxx_test(config/quorum_config_test dfly_raft LABELS DFLY)
+helio_cxx_test(protocol/rpc_frame_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/vote_test dfly_raft LABELS DFLY)
 helio_cxx_test(quorum/election_test dfly_raft LABELS DFLY)
 helio_cxx_test(replication/high_watermark_test dfly_raft LABELS DFLY)
