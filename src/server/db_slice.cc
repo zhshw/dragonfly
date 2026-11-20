@@ -1111,6 +1111,10 @@ void DbSlice::FlushSlotsFb(const cluster::SlotSet& slot_ids, uint64_t next_versi
 }
 
 void DbSlice::FlushSlots(const cluster::SlotRanges& slot_ranges) {
+  StartFlushSlots(slot_ranges).Detach();
+}
+
+util::fb2::Fiber DbSlice::StartFlushSlots(const cluster::SlotRanges& slot_ranges) {
   cluster::SlotSet slot_set(slot_ranges);
   InvalidateSlotWatches(slot_set);
 
@@ -1160,9 +1164,10 @@ void DbSlice::FlushSlots(const cluster::SlotRanges& slot_ranges) {
   RegisterOnChange(consumer.get());
 
   fb2::Fiber::Opts opts{.priority = fb2::FiberPriority::BACKGROUND, .name = "flush_slots"};
-  fb2::Fiber(opts, [this, shared_slots, next_version, tables, consumer = std::move(consumer)]() {
-    FlushSlotsFb(*shared_slots, next_version, *tables, consumer.get());
-  }).Detach();
+  return fb2::Fiber(opts,
+                    [this, shared_slots, next_version, tables, consumer = std::move(consumer)]() {
+                      FlushSlotsFb(*shared_slots, next_version, *tables, consumer.get());
+                    });
 }
 
 util::fb2::Fiber DbSlice::FlushDbIndexes(const std::vector<DbIndex>& indexes) {

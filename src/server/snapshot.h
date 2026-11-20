@@ -58,6 +58,10 @@ class SliceSnapshot : public SerializerBase, public journal::JournalConsumerInte
 
   void Start(bool stream_journal, SnapshotFlush allow_flush = SnapshotFlush::kDisallow);
 
+  void SetSlotFilter(const cluster::SlotSet* slots) {
+    slots_ = slots;
+  }
+
   // Finalizes journal streaming writes. Only called for replication.
   // Blocking. Must be called from the Snapshot thread.
   void FinalizeJournalStream(bool cancel);
@@ -95,6 +99,7 @@ class SliceSnapshot : public SerializerBase, public journal::JournalConsumerInte
 
   // Flushes the serializer and yields between traversal steps.
   void PaceTraversal(bool done) override;
+  bool ShouldSerialize(DbIndex db_index, const PrimeKey& key) const override;
 
   // Called under stream_mu_ to perform RDB serialization of a single entry.
   void SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,
@@ -147,6 +152,8 @@ class SliceSnapshot : public SerializerBase, public journal::JournalConsumerInte
   } stats_;
 
   SnapshotDataConsumerInterface* consumer_;
+  const cluster::SlotSet* slots_ = nullptr;
+  mutable std::string key_buffer_;
 };
 
 }  // namespace dfly

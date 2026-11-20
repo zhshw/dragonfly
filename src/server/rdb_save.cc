@@ -1295,7 +1295,8 @@ class RdbSaver::Impl final : public SliceSnapshot::SnapshotDataConsumerInterface
 
   ~Impl();
 
-  void StartSnapshotting(bool stream_journal, ExecutionState* cntx, EngineShard* shard);
+  void StartSnapshotting(bool stream_journal, ExecutionState* cntx, EngineShard* shard,
+                         const cluster::SlotSet* slots);
 
   void StopSnapshotting(EngineShard* shard);
   void WaitForSnapshottingFinish(EngineShard* shard);
@@ -1464,11 +1465,12 @@ error_code RdbSaver::Impl::WriteRecord(io::Bytes src) {
 }
 
 void RdbSaver::Impl::StartSnapshotting(bool stream_journal, ExecutionState* cntx,
-                                       EngineShard* shard) {
+                                       EngineShard* shard, const cluster::SlotSet* slots) {
   auto& s = GetSnapshot(shard);
   auto& db_slice = namespaces->GetDefaultNamespace().GetDbSlice(shard->shard_id());
 
   s = CreateSliceSnapshot(shard, &db_slice, cntx);
+  s->SetSlotFilter(slots);
 
   const auto allow_flush = (save_mode_ != SaveMode::RDB) ? SliceSnapshot::SnapshotFlush::kAllow
                                                          : SliceSnapshot::SnapshotFlush::kDisallow;
@@ -1761,7 +1763,12 @@ RdbSaver::~RdbSaver() {
 }
 
 void RdbSaver::StartSnapshotInShard(bool stream_journal, ExecutionState* cntx, EngineShard* shard) {
-  impl_->StartSnapshotting(stream_journal, cntx, shard);
+  impl_->StartSnapshotting(stream_journal, cntx, shard, nullptr);
+}
+
+void RdbSaver::StartSlotSnapshotInShard(const cluster::SlotSet& slots, ExecutionState* cntx,
+                                        EngineShard* shard) {
+  impl_->StartSnapshotting(false, cntx, shard, &slots);
 }
 
 error_code RdbSaver::WaitSnapshotInShard(EngineShard* shard) {

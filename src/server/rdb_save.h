@@ -29,6 +29,10 @@ struct HnswNodeData;
 
 namespace dfly {
 
+namespace cluster {
+class SlotSet;
+}
+
 // keys are RDB_TYPE_xxx constants.
 using RdbTypeFreqMap = absl::flat_hash_map<unsigned, size_t>;
 
@@ -204,6 +208,10 @@ class RdbSaver {
   // Initiates the serialization in the shard's thread.
   // cll allows breaking in the middle.
   void StartSnapshotInShard(bool stream_journal, ExecutionState* cntx, EngineShard* shard);
+
+  // Capture the selected slots across all DBs. The immutable filter must outlive SaveBody.
+  void StartSlotSnapshotInShard(const cluster::SlotSet& slots, ExecutionState* cntx,
+                                EngineShard* shard);
 
   // Stops full-sync serialization for replication in the shard's thread.
   std::error_code StopFullSyncInShard(EngineShard* shard);

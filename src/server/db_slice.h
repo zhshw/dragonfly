@@ -429,6 +429,7 @@ class DbSlice {
 
   // Flushes the data of given slot ranges.
   void FlushSlots(const cluster::SlotRanges& slot_ranges);
+  util::fb2::Fiber StartFlushSlots(const cluster::SlotRanges& slot_ranges);
 
   EngineShard* shard_owner() const {
     return owner_;

@@ -29,6 +29,10 @@ struct streamID;
 
 namespace dfly {
 
+namespace cluster {
+class SlotSet;
+}
+
 class EngineShardSet;
 class ScriptMgr;
 class CompactObj;
@@ -362,6 +366,14 @@ class RdbLoader : protected RdbLoaderBase {
     load_unowned_slots_ = load_unowned;
   }
 
+  // Read a key-only RDB for an exact slot set. Validation reads the complete stream without
+  // populating the DB. The caller retains the filter for the duration of Load.
+  void SetSlotImage(const cluster::SlotSet& slots, bool validate_only) {
+    image_slots_ = &slots;
+    validate_image_ = validate_only;
+    rdb_ignore_expiry_ = false;
+  }
+
   // Sets shard count of the snapshot being loaded.
   // Does not necessarily match the shard count of the current instance.
   void SetShardCount(uint32_t shard_cnt) {
@@ -519,6 +531,8 @@ class RdbLoader : protected RdbLoaderBase {
   std::string snapshot_id_;
   bool override_existing_keys_ = false;
   bool load_unowned_slots_ = false;
+  const cluster::SlotSet* image_slots_ = nullptr;
+  bool validate_image_ = false;
   bool rdb_ignore_expiry_;
   const bool deserialize_hnsw_index_;
   uint32_t shard_id_ = UINT32_MAX;

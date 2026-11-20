@@ -13,6 +13,7 @@
 #include "base/flags.h"
 #include "base/logging.h"
 #include "core/search/base.h"
+#include "server/cluster/slot_set.h"
 #include "server/db_slice.h"
 #include "server/engine_shard_set.h"
 #include "server/execution_state.h"
@@ -119,7 +120,7 @@ void SliceSnapshot::Start(bool stream_journal, SnapshotFlush allow_flush) {
     consume_fun = std::bind_front(&SliceSnapshot::ConsumeBigValueChunk, this);
   }
 
-  bool serialize_index = SaveMode() != dfly::SaveMode::RDB &&
+  bool serialize_index = !slots_ && SaveMode() != dfly::SaveMode::RDB &&
                          absl::GetFlag(FLAGS_serialize_hnsw_index) &&
                          replica_dfly_version_ >= DflyVersion::VER6;
 
@@ -237,6 +238,10 @@ void SliceSnapshot::PaceTraversal(bool /*done*/) {
   // extend the wait: sustained writes can not stall the traversal for good.
   writer_.WaitBelow(
       min(writer_.limit() / 4, size_t(ServerState::tlocal()->serialization_max_chunk_size)));
+}
+
+bool SliceSnapshot::ShouldSerialize(DbIndex, const PrimeKey& key) const {
+  return !slots_ || slots_->Contains(KeySlot(key.GetSlice(&key_buffer_)));
 }
 
 void SliceSnapshot::SerializeEntryLocked(DbIndex db_index, const PrimeKey& pk, const PrimeValue& pv,

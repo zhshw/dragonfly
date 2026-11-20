@@ -45,6 +45,7 @@ extern "C" {
 #include "core/string_set.h"
 #include "core/topk.h"
 #include "server/cluster/cluster_config.h"
+#include "server/cluster/slot_set.h"
 #include "server/engine_shard_set.h"
 #include "server/error.h"
 #include "server/family_utils.h"
@@ -2687,6 +2688,11 @@ auto RdbLoader::LoadImpl(io::Source* src) -> Error {
 
     DVLOG(3) << "Opcode type: " << type;
 
+    // A slot image contains KV entries and their attributes. Node-wide metadata, incremental
+    // commands and partial replication streams cannot be applied as a slot replacement.
+    if (image_slots_ && type >= 200 && type <= 240 && type != RDB_OPCODE_DF_MASK)
+      return unsupported_type(type);
+
     // Dragonfly reserves 200-240 for its own opcodes. Other producers may reuse these IDs.
     if (!allow_df_extensions && type >= 200 && type <= 240)
       return unsupported_type(type);
@@ -2770,13 +2776,19 @@ auto RdbLoader::LoadImpl(io::Source* src) -> Error {
     }
 
     if (type == RDB_OPCODE_SELECTDB) {
-      unsigned dbid = 0;
+      uint64_t dbid = 0;
 
       /* SELECTDB: Select the specified database. */
       RDB_TRY_SET(LoadLen(nullptr), dbid) << "SELECTDB";
 
+      if (image_slots_ && dbid >= GetFlag(FLAGS_dbnum))
+        return Fail(errc::bad_db_index) << "slot image DB " << dbid;
       if (dbid > GetFlag(FLAGS_dbnum))
         return Fail(errc::bad_db_index) << "db " << dbid << " > --dbnum " << GetFlag(FLAGS_dbnum);
+      if (validate_image_) {
+        cur_db_index_ = dbid;
+        continue;
+      }
 
       DVLOG(2) << "Select DB: " << dbid;
       for (unsigned i = 0; i < shard_set->size(); ++i) {
@@ -3233,6 +3245,15 @@ error_code RdbLoader::HandleAux() {
   SET_OR_RETURN(FetchGenericString(), auxkey);
   SET_OR_RETURN(FetchGenericString(), auxval);
 
+  if (image_slots_) {
+    if (auxkey == "df-ver")
+      is_df_snapshot_ = true;
+    else if (auxkey != "redis-ver" && auxkey != "redis-bits" && auxkey != "ctime" &&
+             auxkey != "used-mem" && auxkey != "aof-preamble")
+      return RdbError(errc::rdb_file_corrupted);
+    return kOk;
+  }
+
   if (!auxkey.empty() && auxkey[0] == '%') {
     /* All the fields with a name staring with '%' are considered
      * information fields and are logged at startup with a log
@@ -3540,6 +3561,8 @@ auto RdbLoader::LoadKeyValPair(int type, ObjSettings* settings) -> Error {
 
   RDB_TRY_SET(ReadKey(), key);
   last_key_loaded_ = key;
+  if (image_slots_ && !image_slots_->Contains(KeySlot(key)))
+    return Fail(errc::rdb_file_corrupted) << "key outside slot image";
 
   bool finalized = false;
   do {
@@ -3628,7 +3651,7 @@ auto RdbLoader::ReadAndDispatchObject(int object_type, std::string& key,
 
   // Read a part of the object. Updates remaining items
   if (auto err = ReadObj(object_type, &item->val); err) {
-    if (err.ec == RdbError(errc::feature_not_supported)) {
+    if (!image_slots_ && err.ec == RdbError(errc::feature_not_supported)) {
       LOG(WARNING) << "Skipping unsupported key: " << key;
       pending_read_ = {};
       return true;
@@ -3643,7 +3666,7 @@ auto RdbLoader::ReadAndDispatchObject(int object_type, std::string& key,
     return finalized;
   }
 
-  if (GetFlag(FLAGS_rdb_load_dry_run)) {
+  if (validate_image_ || (!image_slots_ && GetFlag(FLAGS_rdb_load_dry_run))) {
     return finalized;
   }
 
@@ -3692,6 +3715,9 @@ auto RdbLoader::ReadAndDispatchObject(int object_type, std::string& key,
 }
 
 bool RdbLoader::ShouldDiscardKey(std::string_view key, const ObjSettings& settings) const {
+  // Rebuild the committed state and retain its absolute expiry for subsequent Raft effects.
+  if (image_slots_)
+    return false;
   if (!load_unowned_slots_ && IsClusterEnabled()) {
     const auto cluster_config = cluster::ClusterConfig::Current();
     if (cluster_config && !cluster_config->IsMySlot(key)) {
