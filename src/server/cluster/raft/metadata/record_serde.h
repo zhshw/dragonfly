@@ -32,5 +32,6 @@ struct MetadataRecord {
 // record-version prefix. The surrounding Kafka record batch carries its offset and CRC.
 absl::StatusOr<std::string> EncodeMetadataRecord(const MetadataRecord& record);
 absl::StatusOr<MetadataRecord> DecodeMetadataRecord(std::string_view bytes);
+int16_t RegisterBrokerRecordVersion(int16_t metadata_version);
 
 }  // namespace dfly::cluster::raft

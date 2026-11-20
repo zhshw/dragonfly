@@ -42,6 +42,12 @@ class MetadataLoader {
   int64_t consumed_end_offset() const {
     return consumed_end_offset_;
   }
+  uint64_t bytes_since_snapshot() const {
+    return bytes_since_snapshot_;
+  }
+  void SnapshotWritten() {
+    bytes_since_snapshot_ = 0;
+  }
 
  private:
   absl::Status ApplyBatch(std::string_view bytes);
@@ -50,6 +56,7 @@ class MetadataLoader {
   std::shared_ptr<const MetadataImage> image_ = std::make_shared<MetadataImage>();
   std::unique_ptr<MetadataImage> transaction_;
   int64_t consumed_end_offset_ = 0;
+  uint64_t bytes_since_snapshot_ = 0;
 };
 
 }  // namespace dfly::cluster::raft

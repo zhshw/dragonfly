@@ -20,14 +20,6 @@ bool ReservedDirectory(const Uuid& dir) {
          bit_cast<int64_t>(absl::big_endian::Load64(dir.data() + 8)) < 100;
 }
 
-int16_t RegisterVersion(int16_t metadata_version) {
-  if (metadata_version >= 30)
-    return 4;
-  if (metadata_version >= 17)
-    return 3;
-  return metadata_version >= 8 ? 2 : 1;
-}
-
 int16_t ValidateRegistration(const MetadataImage& image, const BrokerRegistrationRequest& req,
                              const RegisterBrokerRecord& existing, int16_t mv) {
   if (req.is_migrating_zk_broker)
@@ -136,7 +128,7 @@ vector<MetadataRecord> BrokerControl::Register(const MetadataImage& image, strin
   for (const auto& f : req.features)
     broker.features.push_back({f.name, f.min_supported_version, f.max_supported_version, {}});
   res->broker_epoch = broker.broker_epoch;
-  return {{std::move(broker), RegisterVersion(mv->second)}};
+  return {{std::move(broker), RegisterBrokerRecordVersion(mv->second)}};
 }
 
 vector<MetadataRecord> BrokerControl::Heartbeat(const MetadataImage& image, int64_t now,
@@ -195,7 +187,8 @@ vector<MetadataRecord> BrokerControl::Heartbeat(const MetadataImage& image, int6
   vector<MetadataRecord> result;
   if (change.fenced || change.in_controlled_shutdown)
     result.push_back({change, static_cast<int16_t>(change.in_controlled_shutdown ? 1 : 0)});
-  auto level = image.features.at("metadata.version");
+  auto mv = image.features.find("metadata.version");
+  auto level = mv == image.features.end() ? 0 : mv->second;
   if (level >= 17 && !req.offline_log_dirs.empty()) {
     auto dirs = broker.log_dirs;
     erase_if(dirs, [&](const auto& dir) {

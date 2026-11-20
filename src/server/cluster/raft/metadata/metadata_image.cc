@@ -239,6 +239,7 @@ absl::Status MetadataLoader::RestoreSnapshot(const PartitionLog& log, LogPositio
   }
   next->stable_end_offset = id.end_offset;
   consumed_end_offset_ = id.end_offset;
+  bytes_since_snapshot_ = 0;
   image_ = std::move(next);
   transaction_.reset();
   return absl::OkStatus();
@@ -264,6 +265,7 @@ absl::Status MetadataLoader::Advance(const PartitionLog& log, int64_t high_water
       return absl::InvalidArgumentError("Metadata HW falls inside a record batch");
     if (auto status = ApplyBatch(*bytes); !status.ok())
       return status;
+    bytes_since_snapshot_ += bytes->size();
   }
   return absl::OkStatus();
 }

@@ -13,6 +13,7 @@ add_library(dfly_raft
             metadata/bootstrap_topology.cc
             metadata/broker_control.cc
             metadata/metadata_image.cc
+            metadata/metadata_snapshot.cc
             metadata/record_serde.cc
             metadata/slot_directory.cc
             protocol/add_voter.cc

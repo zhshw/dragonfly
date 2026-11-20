@@ -1,5 +1,6 @@
 """Run against a local build containing dragonfly and raft_storage (DRAGONFLY_PATH)."""
 
+import base64
 import io
 import json
 import os
@@ -19,14 +20,14 @@ class View(NamedTuple):
     epoch: int
     hw: int
     voters: dict
+    observers: dict
 
 
-def describe(port):
+def describe(port, topic=b"__cluster_metadata", partition_id=0):
     # Kafka DescribeQuorum v0, flexible headers, one topic and one partition.
-    topic = b"__cluster_metadata"
     topic_field = bytes([len(topic) + 1]) + topic
     header = struct.pack(">hhihB", 55, 0, 21, -1, 0)
-    request = header + b"\x02" + topic_field + b"\x02" + struct.pack(">iBBB", 0, 0, 0, 0)
+    request = header + b"\x02" + topic_field + b"\x02" + struct.pack(">iBBB", partition_id, 0, 0, 0)
     with socket.create_connection(("127.0.0.1", port), timeout=1) as sock, sock.makefile("rb") as r:
         sock.sendall(struct.pack(">i", len(request)) + request)
         size = struct.unpack(">i", r.read(4))[0]
@@ -35,17 +36,22 @@ def describe(port):
     assert struct.unpack(">iBhB", body.read(8)) == (21, 0, 0, 2)
     assert body.read(len(topic_field)) == topic_field
     count, partition, error, leader, epoch, hw = struct.unpack(">Bihiiq", body.read(23))
-    assert count == 2 and partition == 0
+    assert count == 2 and partition == partition_id
     if error == 6:  # NOT_LEADER_OR_FOLLOWER
         return None
     assert error == 0, error
-    voters = {}
-    for _ in range(body.read(1)[0] - 1):
-        node, end, tags = struct.unpack(">iqB", body.read(13))
-        assert tags == 0
-        voters[node] = end
-    assert body.read() == b"\x01\x00\x00\x00"  # No observers or unknown tags.
-    return View(leader, epoch, hw, voters)
+
+    def replicas():
+        offsets = {}
+        for _ in range(body.read(1)[0] - 1):
+            node, end, tags = struct.unpack(">iqB", body.read(13))
+            assert tags == 0
+            offsets[node] = end
+        return offsets
+
+    voters, observers = replicas(), replicas()
+    assert body.read() == b"\x00\x00\x00"
+    return View(leader, epoch, hw, voters, observers)
 
 
 def compact(value):
@@ -65,6 +71,24 @@ def broker_rpc(port, key, version, request):
         result = r.read(size)
     assert struct.unpack(">iB", result[:5]) == (correlation, 0)
     return result[5:]
+
+
+def change_voter(port, key, cluster, node, directory, *, listener=None, endpoint=0, epoch=0):
+    identity = struct.pack(">i", node) + directory
+    req = compact(cluster)
+    if key == 80:
+        req += struct.pack(">i", 5000)
+    elif key == 82:
+        req += struct.pack(">i", epoch)
+    req += identity
+    if key in (80, 82):
+        req += b"\x02" + compact(listener) + compact("127.0.0.1") + struct.pack(">HB", endpoint, 0)
+    if key == 80:
+        req += b"\x01"  # ackWhenCommitted
+    if key == 82:
+        req += struct.pack(">hhB", 0, 1, 0)
+    result = broker_rpc(port, key, int(key == 80), req + b"\x00")
+    return struct.unpack_from(">h", result, 4)[0]
 
 
 def register(port, cluster, incarnation, resp_port, raft_port):
@@ -100,12 +124,29 @@ class ControllerProcessTest(unittest.TestCase):
         self.ports = {}
         self.cluster_id = "HIJ1rG6XThu4T7D5Jg8xIg"
 
-    def configure(self, count):
+    def configure(self, count, initial_count=None):
         with ExitStack() as stack:
             for node in range(1, count + 1):
                 sock = stack.enter_context(socket.socket())
                 sock.bind(("127.0.0.1", 0))
                 self.ports[node] = sock.getsockname()[1]
+            for node in self.ports:
+                options = []
+                if initial_count is not None:
+
+                    def directory(n):
+                        return base64.urlsafe_b64encode(bytes([n]) * 16).decode().rstrip("=")
+
+                    initial = ",".join(
+                        f"{n}@127.0.0.1:{p}:{directory(n)}"
+                        for n, p in self.ports.items()
+                        if n <= initial_count
+                    )
+                    options = [directory(node)]
+                    if node <= initial_count:
+                        options += ["--initial-controllers", initial]
+                    else:
+                        options += ["--no-initial-controllers"]
                 subprocess.run(
                     [
                         self.server.with_name("raft_storage"),
@@ -113,6 +154,7 @@ class ControllerProcessTest(unittest.TestCase):
                         self.root / str(node),
                         self.cluster_id,
                         str(node),
+                        *options,
                     ],
                     check=True,
                     stdout=subprocess.DEVNULL,
@@ -181,6 +223,51 @@ class ControllerProcessTest(unittest.TestCase):
             and all(v.voters[k] >= v.hw for k in members)
         )
 
+    def test_dynamic_add_update_remove_leader_and_restart(self):
+        self.configure(3, initial_count=2)
+        for node in self.ports:
+            self.start(node)
+        before = self.wait_for(
+            lambda n, v: v and n == v.leader and v.hw > 0 and v.observers.get(3, -1) >= v.hw
+        )
+        self.assertEqual(set(before.voters), {1, 2})
+        port = self.ports[before.leader]
+        fields = dict(listener="CONTROLLER", endpoint=self.ports[3])
+        self.assertEqual(change_voter(port, 80, self.cluster_id, 3, bytes([3]) * 16, **fields), 0)
+        promoted = self.committed(before.hw)
+        self.assertEqual(
+            change_voter(
+                port, 82, self.cluster_id, 3, bytes([3]) * 16, epoch=promoted.epoch - 1, **fields
+            ),
+            74,
+        )
+        self.assertEqual(
+            change_voter(
+                port, 82, self.cluster_id, 3, bytes([3]) * 16, epoch=promoted.epoch, **fields
+            ),
+            0,
+        )
+        self.assertEqual(
+            change_voter(port, 81, self.cluster_id, before.leader, bytes([before.leader]) * 16), 0
+        )
+        kept = {1, 2, 3} - {before.leader}
+        self.wait_for(
+            lambda n, v: v
+            and n == v.leader
+            and v.epoch > before.epoch
+            and set(v.voters) == kept
+            and v.hw > promoted.hw
+        )
+        self.stop(before.leader)
+        self.start(before.leader)
+        recovered = self.wait_for(
+            lambda n, v: v
+            and n == v.leader
+            and set(v.voters) == kept
+            and v.observers.get(before.leader, -1) >= v.hw
+        )
+        self.assertIn(recovered.leader, kept)
+
     def test_single_voter_and_incompatible_restart(self):
         self.configure(1)
         self.start(1)
@@ -196,6 +283,28 @@ class ControllerProcessTest(unittest.TestCase):
         self.start(1)
         self.assertGreater(self.committed(view.hw).epoch, view.epoch)
 
+    def bootstrap_broker(self, resp_port, raft_port):
+        path = self.root / "bootstrap.json"
+        path.write_text(
+            json.dumps(
+                [
+                    {
+                        "group_id": 10,
+                        "master": {
+                            "id": "A",
+                            "ip": "127.0.0.1",
+                            "port": resp_port,
+                            "broker_id": 7,
+                            "raft_port": raft_port,
+                        },
+                        "replicas": [],
+                        "slot_ranges": [{"start": 0, "end": 16383}],
+                    }
+                ]
+            )
+        )
+        self.bootstrap_flags = [f"--raft_bootstrap_topology={path}"]
+
     def test_bootstrap_broker_fencing_and_controller_failover(self):
         self.configure(3)
         with ExitStack() as stack:
@@ -205,26 +314,7 @@ class ControllerProcessTest(unittest.TestCase):
                 sock.bind(("127.0.0.1", 0))
                 ports.append(sock.getsockname()[1])
             resp_port, raft_port = ports
-            path = self.root / "bootstrap.json"
-            path.write_text(
-                json.dumps(
-                    [
-                        {
-                            "group_id": 10,
-                            "master": {
-                                "id": "A",
-                                "ip": "127.0.0.1",
-                                "port": resp_port,
-                                "broker_id": 7,
-                                "raft_port": raft_port,
-                            },
-                            "replicas": [],
-                            "slot_ranges": [{"start": 0, "end": 16383}],
-                        }
-                    ]
-                )
-            )
-            self.bootstrap_flags = [f"--raft_bootstrap_topology={path}"]
+            self.bootstrap_broker(resp_port, raft_port)
             for node in self.ports:
                 self.start(node)
             initial = self.committed(1)
@@ -245,6 +335,45 @@ class ControllerProcessTest(unittest.TestCase):
             self.assertEqual(heartbeat(new_port, epoch, next_view.hw - 1), (0, True, False))
             self.assertEqual(heartbeat(new_port, epoch - 1, next_view.hw - 1), (77, False, True))
             self.assertEqual(register(new_port, self.cluster_id, 1, *ports), (0, epoch))
+
+    def test_recovers_broker_and_registration_barrier_from_offline_snapshot(self):
+        self.configure(1)
+        with ExitStack() as stack:
+            ports = []
+            for _ in range(2):
+                sock = stack.enter_context(socket.socket())
+                sock.bind(("127.0.0.1", 0))
+                ports.append(sock.getsockname()[1])
+            self.bootstrap_broker(*ports)
+            self.bootstrap_flags.append("--raft_metadata_snapshot_bytes=1")
+            self.start(1)
+            initial = self.committed(1)
+            port = self.ports[1]
+            error, epoch = register(port, self.cluster_id, 1, *ports)
+            self.assertEqual(error, 0)
+            self.assertEqual(heartbeat(port, epoch, epoch), (0, True, False))
+            stable = self.committed(initial.hw)
+            checkpoint = (
+                self.root
+                / "1"
+                / "__cluster_metadata-0"
+                / f"{stable.hw:020d}-{stable.epoch:010d}.checkpoint"
+            )
+            deadline = time.monotonic() + 10
+            while not checkpoint.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(checkpoint.is_file(), checkpoint)
+            self.stop(1, crash=True)
+            self.bootstrap_flags = []
+            self.start(1)
+            restarted = self.committed(stable.hw)
+            self.assertGreater(restarted.epoch, stable.epoch)
+
+            # Snapshot replay reconstructs registration provenance at its inclusive cut.
+            # A log-only recovery would retain the older registration offset (epoch).
+            self.assertGreater(stable.hw - 1, epoch)
+            self.assertEqual(heartbeat(port, epoch, epoch), (0, False, False))
+            self.assertEqual(heartbeat(port, epoch, stable.hw - 1), (0, True, False))
 
     def test_election_minority_and_durable_prefix(self):
         self.configure(3)

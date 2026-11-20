@@ -35,6 +35,14 @@ template <typename... Ts> constexpr auto Decoders(variant<Ts...>*) {
 
 }  // namespace
 
+int16_t RegisterBrokerRecordVersion(int16_t metadata_version) {
+  if (metadata_version >= 30)
+    return 4;
+  if (metadata_version >= 17)
+    return 3;
+  return metadata_version >= 8 ? 2 : 1;
+}
+
 absl::StatusOr<string> EncodeMetadataRecord(const MetadataRecord& record) {
   string body, bytes;
   detail::Writer header(kFrameVersion, &bytes);

@@ -9,6 +9,7 @@
 
 #include "server/cluster/raft/log/partition_log.h"
 #include "server/cluster/raft/log/record_batch.h"
+#include "server/cluster/raft/metadata/metadata_snapshot.h"
 
 namespace dfly::cluster::raft {
 namespace {
@@ -199,6 +200,65 @@ TEST_F(MetadataImageTest, RecoversSnapshotDirectoryAndOnlyPublishesCommittedSuff
   EXPECT_FALSE(CatchUp().ok());
   EXPECT_EQ(loader_.image(), stable);
   EXPECT_EQ(loader_.consumed_end_offset(), 101);
+}
+
+TEST_F(MetadataImageTest, EmitsStableSnapshotWithMembershipEffectiveAtItsCut) {
+  VotersRecord voters;
+  auto& voter = voters.voters.emplace_back();
+  voter.voter_id = 7;
+  voter.voter_directory_id.back() = 3;
+  voter.k_raft_version_feature.max_supported_version = 1;
+  voter.endpoints.push_back({"RAFT", "a", 7100, {}});
+  string kraft, config;
+  ASSERT_EQ(Encode(KRaftVersionRecord{0, 1, {}}, 0, &kraft), CodecError::kOk);
+  ASSERT_EQ(Encode(voters, 0, &config), CodecError::kOk);
+  array<ControlRecordValue, 2> controls{{{5, kraft}, {6, config}}};
+  ASSERT_TRUE(log_->Append(MakeControlBatch(0, 1, 900, controls).value(), 1).ok());
+  RegisterBrokerRecord broker;
+  broker.broker_id = 7;
+  broker.broker_epoch = 3;
+  broker.fenced = false;
+  broker.end_points.push_back({"RESP", "a", 6379, 0, {}});
+  Append({{Feature("metadata.version", 33)},
+          {Feature("dragonfly.cluster", 1)},
+          {broker, 4},
+          {RedisNodeRecord{7, "A", {}}},
+          {DataGroupRecord{10, {7}, {}}},
+          {GroupLeaderRecord{10, 7, 2, -1, 7, 3, {}}},
+          {SlotAssignmentRecord{0, 16383, -1, 0, 10, 1, {}}}});
+  ASSERT_TRUE(CatchUp().ok());
+  const auto cut = log_->End();
+  auto image = loader_.image();
+  const auto first = voters;
+  voters.voters.front().voter_id = 8;
+  ASSERT_EQ(Encode(voters, 0, &config), CodecError::kOk);
+  const ControlRecordValue replacement{6, config};
+  auto suffix = MakeControlBatch(cut.end_offset, 1, 1200, span(&replacement, 1)).value();
+  ASSERT_TRUE(log_->Append(suffix, 1).ok());
+  MembershipHistory membership;
+  ASSERT_TRUE(membership.Update(*log_).ok());
+  ASSERT_EQ(*membership.LatestVoters(), voters);
+  EXPECT_FALSE(WriteMetadataSnapshot(*image, membership, cut.end_offset - 1, 123, log_.get()).ok());
+  ASSERT_TRUE(WriteMetadataSnapshot(*image, membership, cut.end_offset, 123, log_.get()).ok());
+  ASSERT_EQ(log_->LatestSnapshot(), cut);
+  ASSERT_TRUE(log_->DeleteBeforeSnapshot(cut, cut.end_offset).ok());
+  log_.reset();
+  log_ = PartitionLog::Open(dir_).value();
+  MembershipHistory recovered;
+  ASSERT_TRUE(recovered.Update(*log_).ok());
+  ASSERT_NE(recovered.VotersAt(cut.end_offset - 1), nullptr);
+  EXPECT_EQ(*recovered.VotersAt(cut.end_offset - 1), first);
+  EXPECT_EQ(recovered.KraftVersionAt(cut.end_offset - 1), 1);
+  EXPECT_EQ(*recovered.LatestVoters(), voters);
+  MetadataLoader replay;
+  ASSERT_TRUE(replay.Advance(*log_, cut.end_offset).ok());
+  EXPECT_EQ(replay.image()->features, image->features);
+  EXPECT_EQ(replay.image()->brokers, image->brokers);
+  EXPECT_EQ(replay.image()->directory, image->directory);
+  EXPECT_EQ(replay.image()->registration_offsets.at(7), cut.end_offset - 1);
+  EXPECT_EQ(replay.bytes_since_snapshot(), 0u);
+  ASSERT_TRUE(replay.Advance(*log_, log_->End().end_offset).ok());
+  EXPECT_EQ(replay.bytes_since_snapshot(), suffix.size());
 }
 
 }  // namespace

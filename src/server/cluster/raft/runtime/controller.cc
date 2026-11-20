@@ -4,6 +4,8 @@
 
 #include "server/cluster/raft/runtime/controller.h"
 
+#include <absl/flags/flag.h>
+
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -12,12 +14,18 @@
 #include "server/cluster/raft/log/record_batch.h"
 #include "server/cluster/raft/metadata/bootstrap_topology.h"
 #include "server/cluster/raft/metadata/broker_control.h"
+#include "server/cluster/raft/metadata/metadata_snapshot.h"
 #include "server/cluster/raft/quorum/fetch_replication.h"
 #include "server/cluster/raft/runtime/group.h"
 #include "server/cluster/raft/transport/peer_connection.h"
 #include "server/cluster/raft/transport/raft_listener.h"
 #include "util/accept_server.h"
 #include "util/fibers/pool.h"
+
+ABSL_FLAG(int64_t, raft_metadata_snapshot_bytes, 20 << 20,
+          "Committed metadata log bytes between snapshots.");
+ABSL_FLAG(int64_t, raft_metadata_snapshot_interval_ms, 3600000,
+          "Maximum time between snapshots of new committed metadata. Zero disables the timer.");
 
 namespace dfly::cluster::raft {
 namespace {
@@ -116,6 +124,8 @@ class ActiveController {
     while (!stopping_) {
       vector<pair<int32_t, int32_t>> needed;
       auto status = group_.Visit([&](RaftGroup::State state) {
+        if (auto s = MaybeSnapshot(state); !s.ok())
+          LOG(ERROR) << "Writing metadata snapshot: " << s;
         if (!Ready(state))
           return absl::OkStatus();
         if (loader_.transaction_open()) {
@@ -152,6 +162,32 @@ class ActiveController {
   }
 
  private:
+  absl::Status MaybeSnapshot(RaftGroup::State state) {
+    const auto hw = state.replication.HighWatermark();
+    auto image = loader_.image();
+    auto latest = state.log.LatestSnapshot();
+    if (!hw || !image->stable_end_offset || loader_.transaction_open() ||
+        (latest && latest->end_offset >= image->stable_end_offset))
+      return absl::OkStatus();
+    auto now = steady_clock::now();
+    if (now < next_snapshot_retry_)
+      return absl::OkStatus();
+    auto interval = absl::GetFlag(FLAGS_raft_metadata_snapshot_interval_ms);
+    if (loader_.bytes_since_snapshot() <
+            static_cast<uint64_t>(absl::GetFlag(FLAGS_raft_metadata_snapshot_bytes)) &&
+        (!interval || now - last_snapshot_time_ < milliseconds(interval)))
+      return absl::OkStatus();
+    const auto wall = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    auto s = WriteMetadataSnapshot(*image, state.replication.membership(), *hw, wall, &state.log);
+    if (s.ok()) {
+      last_snapshot_time_ = now;
+      loader_.SnapshotWritten();
+    } else {
+      next_snapshot_retry_ = now + seconds(5);
+    }
+    return s;
+  }
+
   bool Ready(RaftGroup::State state) {
     const auto& election = state.election.state();
     if (election.role != QuorumRole::kLeader || !state.replication.HighWatermark() ||
@@ -276,6 +312,8 @@ class ActiveController {
   vector<MetadataRecord> bootstrap_;
   BrokerControl brokers_{9000};
   int32_t epoch_ = -1;
+  steady_clock::time_point last_snapshot_time_ = steady_clock::now();
+  steady_clock::time_point next_snapshot_retry_{};
   atomic_bool stopping_{false};
 };
 }  // namespace
@@ -289,6 +327,9 @@ absl::Status RunController(const filesystem::path& dir, const string& cluster_id
   if (identity->node_id != node_id || identity->cluster_id != cluster_id)
     return absl::FailedPreconditionError(
         "Configured cluster ID or node ID differs from meta.properties");
+  if (absl::GetFlag(FLAGS_raft_metadata_snapshot_bytes) < 1 ||
+      absl::GetFlag(FLAGS_raft_metadata_snapshot_interval_ms) < 0)
+    return absl::InvalidArgumentError("Invalid metadata snapshot size or interval");
   auto bootstrap = ReadBootstrap(bootstrap_file);
   if (!bootstrap.ok())
     return bootstrap.status();
