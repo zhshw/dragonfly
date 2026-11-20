@@ -1,79 +1,10 @@
-measurement,mode,profile,payload_mib,writers,trial,records,elapsed_s,mib_per_s,p50_ms,p95_ms,restart_to_wait2_s,settle_seconds,warmup_writes,first_set_p50_ms,window_share_pct
-Redis SET,raft,ready,64,8,1,256,1.25542,50.98,39.73,50.33,1.20552,0.0,0,35.13,
-Redis SET,raft,ready,64,8,2,256,1.2066,53.04,39.83,48.96,1.21957,0.0,0,30.43,
-Redis SET,raft,ready,64,8,3,256,1.26224,50.7,39.82,52.84,1.10336,0.0,0,38.13,
-Redis SET,raft,idle,64,8,1,256,1.39503,45.88,42.43,64.6,1.11023,5.0,0,41.8,
-Redis SET,raft,idle,64,8,2,256,1.28272,49.89,39.48,58.78,1.10417,5.0,0,66.8,
-Redis SET,raft,idle,64,8,3,256,1.30877,48.9,40.79,53.01,1.10773,5.0,0,36.09,
-Redis SET,raft,warm,64,8,1,256,1.26189,50.72,37.88,56.94,1.20504,5.0,32,33.16,
-Redis SET,raft,warm,64,8,2,256,1.21509,52.67,38.8,46.93,1.20569,5.0,32,44.23,
-Redis SET,raft,warm,64,8,3,256,1.5154,42.23,43.25,68.22,1.20795,5.0,32,43.23,
-Redis SET,yes,warm,64,1,1,256,0.5699,112.3,1.86,4.86,0.30867,5.0,32,1.36,
-Redis SET,yes,warm,64,1,2,256,0.38253,167.31,1.44,2.16,0.3075,5.0,32,1.1,
-Redis SET,yes,warm,64,1,3,256,0.4335,147.64,1.57,2.56,0.30941,5.0,32,1.59,
-Redis SET,raft,warm,64,1,1,256,2.24609,28.49,8.19,12.39,1.30919,5.0,32,9.08,
-Redis SET,raft,warm,64,1,2,256,2.18168,29.34,8.12,12.09,1.20807,5.0,32,7.51,
-Redis SET,raft,warm,64,1,3,256,2.1546,29.7,8.25,11.78,1.20677,5.0,32,9.32,
-Redis SET,yes,warm,64,8,1,256,0.32035,199.78,8.44,22.41,0.3091,5.0,32,25.29,
-Redis SET,yes,warm,64,8,2,256,0.28105,227.72,8.33,12.01,0.30757,5.0,32,7.39,
-Redis SET,yes,warm,64,8,3,256,0.25644,249.57,7.67,11.28,0.30921,5.0,32,5.73,
-Redis SET,raft,warm,128,1,1,512,4.01281,31.9,7.62,10.43,2.10759,5.0,32,12.11,
-Redis SET,raft,warm,128,1,2,512,4.08415,31.34,7.65,11.19,2.21324,5.0,32,7.18,
-Redis SET,raft,warm,128,1,3,512,4.40566,29.05,8.27,11.53,2.30726,5.0,32,6.71,
-Redis SET,yes,warm,128,1,1,512,0.75809,168.85,1.46,2.2,0.50756,5.0,32,1.14,
-Redis SET,yes,warm,128,1,2,512,0.75182,170.25,1.54,2.07,0.51003,5.0,32,1.52,
-Redis SET,yes,warm,128,1,3,512,0.92052,139.05,1.65,3.0,0.51456,5.0,32,1.17,
-Kafka producer ACK,acks=all default flush,warm,64,1,1,256,0.5781,110.72,2.033,3.542,,,32,,
-Kafka producer ACK,acks=all default flush,warm,64,1,2,256,0.9999,64.01,2.812,9.982,,,32,,
-Kafka producer ACK,acks=all default flush,warm,64,1,3,256,0.3489,183.43,1.130,2.783,,,32,,
-Kafka producer ACK,acks=all flush.messages=1,warm,64,1,1,256,1.0813,59.19,3.943,6.417,,,32,,
-Kafka producer ACK,acks=all flush.messages=1,warm,64,1,2,256,2.3188,27.60,7.661,18.865,,,32,,
-Kafka producer ACK,acks=all flush.messages=1,warm,64,1,3,256,1.0367,61.73,3.434,7.803,,,32,,
-Kafka producer ACK,acks=all default flush,warm,128,1,1,512,1.8170,70.44,2.951,8.600,,,32,,
-Kafka producer ACK,acks=all default flush,warm,128,1,2,512,3.9980,32.02,6.120,18.412,,,32,,
-Kafka producer ACK,acks=all default flush,warm,128,1,3,512,0.6496,197.04,1.028,2.441,,,32,,
-Kafka producer ACK,acks=all flush.messages=1,warm,128,1,1,512,2.3565,54.32,4.182,7.971,,,32,,
-Kafka producer ACK,acks=all flush.messages=1,warm,128,1,2,512,3.1720,40.35,5.212,11.285,,,32,,
-Kafka producer ACK,acks=all flush.messages=1,warm,128,1,3,512,3.2069,39.91,5.537,11.168,,,32,,
-KRaft commit listener,linger.ms=0,warm,64,1,1,256,1.132366834,56.518787,4.176917,6.532083,,,32,,
-KRaft commit listener,linger.ms=0,warm,64,1,2,256,1.0100595,63.362604,3.723708,5.998834,,,32,,
-KRaft commit listener,linger.ms=0,warm,64,1,3,256,1.378300667,46.433990,4.608541,10.235541,,,32,,
-KRaft commit listener,linger.ms=0,warm,128,1,1,512,2.85517671,44.830850,4.556125,11.433458,,,32,,
-KRaft commit listener,linger.ms=0,warm,128,1,2,512,3.099745501,41.293713,4.309625,11.760792,,,32,,
-KRaft commit listener,linger.ms=0,warm,128,1,3,512,2.302900126,55.582089,4.199625,7.197875,,,32,,
-KRaft commit listener,linger.ms=25,warm,64,1,1,256,7.791659129,8.213912,29.998542,33.125833,,,32,,
-KRaft commit listener,linger.ms=25,warm,64,1,2,256,7.677953462,8.335555,29.660166,32.583083,,,32,,
-KRaft commit listener,linger.ms=25,warm,64,1,3,256,7.72719517,8.282436,29.645291,32.977125,,,32,,
-KRaft commit listener,linger.ms=25,warm,128,1,1,512,15.77021455,8.116567,29.945916,34.107916,,,32,,
-KRaft commit listener,linger.ms=25,warm,128,1,2,512,15.527064549,8.243670,29.6865,33.433792,,,32,,
-KRaft commit listener,linger.ms=25,warm,128,1,3,512,15.247134882,8.395020,29.23525,32.999708,,,32,,
-Leader log append to HW,raft,in-process,64,1,1,256,,,4.167917,6.097708,,5,32,,85.055468
-HW to next leader log append,raft,in-process,64,1,1,255,,,0.695375,1.170125,,5,32,,14.944532
-Next in-process submission to log append,raft,in-process,64,1,1,255,,,0.628708,1.089167,,5,32,,
-Leader log append to durable,raft,in-process,64,1,1,256,,,1.477083,3.540750,,5,32,,
-Leader durable to HW,raft,in-process,64,1,1,256,,,2.133250,4.143625,,5,32,,
-First leader log append to last HW,raft,in-process,64,1,1,256,1.293631500,49.473130,,,,5,32,,
-Leader log append to HW,raft,in-process,64,1,2,256,,,4.492417,6.513958,,5,32,,86.489097
-HW to next leader log append,raft,in-process,64,1,2,255,,,0.668375,1.031291,,5,32,,13.510903
-Next in-process submission to log append,raft,in-process,64,1,2,255,,,0.607000,0.923250,,5,32,,
-Leader log append to durable,raft,in-process,64,1,2,256,,,1.493625,3.518625,,5,32,,
-Leader durable to HW,raft,in-process,64,1,2,256,,,2.213667,4.139667,,5,32,,
-First leader log append to last HW,raft,in-process,64,1,2,256,1.329366417,48.143235,,,,5,32,,
-Leader log append to HW,raft,in-process,64,1,3,256,,,3.807625,5.819000,,5,32,,85.439169
-HW to next leader log append,raft,in-process,64,1,3,255,,,0.659125,1.003542,,5,32,,14.560831
-Next in-process submission to log append,raft,in-process,64,1,3,255,,,0.601416,0.902708,,5,32,,
-Leader log append to durable,raft,in-process,64,1,3,256,,,1.406667,3.432166,,5,32,,
-Leader durable to HW,raft,in-process,64,1,3,256,,,1.948875,3.882083,,5,32,,
-First leader log append to last HW,raft,in-process,64,1,3,256,1.210919959,52.852378,,,,5,32,,
-Leader log append to HW,linger.ms=0,in-process,64,1,1,256,,,3.555125,8.981166,,5,32,,91.813295
-HW to next leader log append,linger.ms=0,in-process,64,1,1,255,,,0.342916,0.815209,,5,32,,8.186705
-Next in-process submission to log append,linger.ms=0,in-process,64,1,1,255,,,0.182667,0.423417,,5,32,,
-First leader log append to last HW,linger.ms=0,in-process,64,1,1,256,1.287993459,49.689693,,,,5,32,,
-Leader log append to HW,linger.ms=0,in-process,64,1,2,256,,,3.437041,6.223958,,5,32,,91.388797
-HW to next leader log append,linger.ms=0,in-process,64,1,2,255,,,0.321125,0.609458,,5,32,,8.611203
-Next in-process submission to log append,linger.ms=0,in-process,64,1,2,255,,,0.161375,0.340917,,5,32,,
-First leader log append to last HW,linger.ms=0,in-process,64,1,2,256,1.074406626,59.567764,,,,5,32,,
-Leader log append to HW,linger.ms=0,in-process,64,1,3,256,,,4.051250,6.848417,,5,32,,91.107050
-HW to next leader log append,linger.ms=0,in-process,64,1,3,255,,,0.381166,0.716375,,5,32,,8.892950
-Next in-process submission to log append,linger.ms=0,in-process,64,1,3,255,,,0.163250,0.432167,,5,32,,
-First leader log append to last HW,linger.ms=0,in-process,64,1,3,256,1.199577626,53.352112,,,,5,32,,
+run_order,trial,implementation,mode,clients,payload_mib,keys,settle_seconds,warmup_writes,readback_node,write_ms,mib_per_s,first_set_p50_ms,set_p50_ms,set_p95_ms,set_max_ms,restart_to_wait_two_ms
+1,1,async,yes,1,64,256,5.0,32,13,426.5,150.06,1.71,1.58,2.67,6.12,315.7
+2,1,raft,raft,1,64,256,5.0,32,13,2232.49,28.67,10.51,8.11,13.91,23.41,1305.72
+3,1,direct,raft,1,64,256,5.0,32,13,2174.92,29.43,5.85,8.42,11.28,14.15,1305.65
+4,2,raft,raft,1,64,256,5.0,32,13,2567.91,24.92,14.36,9.54,14.7,22.24,1407.43
+5,2,direct,raft,1,64,256,5.0,32,13,2223.57,28.78,5.79,8.44,11.59,27.23,1304.7
+6,2,async,yes,1,64,256,5.0,32,13,421.89,151.7,1.39,1.6,2.71,4.02,307.73
+7,3,direct,raft,1,64,256,5.0,32,13,2335.16,27.41,13.53,8.8,12.6,16.89,1608.17
+8,3,async,yes,1,64,256,5.0,32,13,402.95,158.83,4.8,1.54,2.44,4.8,309.24
+9,3,raft,raft,1,64,256,5.0,32,13,2169.86,29.49,11.27,8.24,11.39,20.12,1206.2

@@ -1,0 +1,181 @@
+--- a/data_node.cc
++++ b/data_node.cc
+@@ -9,6 +9,7 @@
+
+ #include <atomic>
+ #include <chrono>
++#include <fstream>
+
+ #include "base/flags.h"
+ #include "base/logging.h"
+@@ -24,6 +25,7 @@
+ #include "server/cluster/raft/transport/peer_connection.h"
+ #include "server/cluster/raft/transport/raft_listener.h"
+ #include "server/journal/executor.h"
++#include "trace.h"
+ #include "util/accept_server.h"
+ #include "util/fibers/fiberqueue_threadpool.h"
+ #include "util/fibers/pool.h"
+@@ -91,11 +93,21 @@
+   // The group worker applies one committed effect at a time on the owner proactor.
+   // Keeping its executor lets journal replay activate each DB once across all shards.
+   JournalExecutor apply_executor;
++  std::string bench_values;
++  size_t bench_seen = 0;
+   DataApplyProgress progress;
+   unique_ptr<RaftGroup> raft;
+   unique_ptr<SlotMigrationDriver> migrations;
+   RpcHandlers handlers;
+ };
++
++std::string BenchKey(size_t i) {
++  return (i % 2 ? "{104856}:aligned:" : "{12561}:aligned:") + std::to_string(i);
++}
++std::string_view BenchValue(const LocalPartition& part, size_t i) {
++  return std::string_view(part.bench_values)
++      .substr(i * commit_benchmark::kPayload, commit_benchmark::kPayload);
++}
+
+ class DataNodeImpl final : public DataNode {
+  public:
+@@ -242,10 +254,34 @@
+       voters.emplace(member, *ep);
+     }
+     auto local = make_shared<LocalPartition>(id, identity_.cluster_id, *service_, owner_);
++    if (id == 10) {
++      const char* values_path = std::getenv("RAFT_COMMIT_BENCH_VALUES");
++      if (!values_path)
++        return absl::FailedPreconditionError("commit benchmark payload path missing");
++      std::ifstream input(values_path, std::ios::binary);
++      local->bench_values.resize(commit_benchmark::kTotal * commit_benchmark::kPayload);
++      if (!input.read(local->bench_values.data(), local->bench_values.size()))
++        return absl::DataLossError("pre-generated benchmark values missing");
++    }
+     auto apply = [this, replica = local.get()](const PartitionLog& log, int64_t hw) {
+       if (auto s = replica->snapshots.Restore(log, hw, &replica->effects); !s.ok())
+         return s;
+       auto apply_set = [&](const SetEffect& effect) {
++        if (effect.key.starts_with("{12561}:aligned:") ||
++            effect.key.starts_with("{104856}:aligned:")) {
++          const size_t i = replica->bench_seen;
++          if (commit_benchmark::active && !commit_benchmark::active->listener)
++            commit_benchmark::active->listener = commit_benchmark::Now();
++          if (i >= commit_benchmark::kTotal || BenchKey(i) != effect.key || effect.db != 0 ||
++              BenchValue(*replica, i) != effect.value)
++            return absl::DataLossError("unexpected benchmark commit key, payload or order");
++          ++replica->bench_seen;
++
++          // The recovering voter materializes data so its own KV can be checked outside the timer.
++          if (identity_.node_id != 13)
++            return absl::OkStatus();
++        }
++
+         // Re-enter the service on a proactor. Client writes wait outside shard transactions.
+         return owner_->Await([&] { return ExecuteSetEffect(replica->apply_executor, effect); });
+       };
+@@ -481,6 +517,68 @@
+     return Route(slot, nullptr).status();
+   }
+
++  if (key == "{12561}:start-aligned-probe" && local->id == 10) {
++    const bool warm = value == "warm";
++    if (!warm && value != "measure")
++      return absl::InvalidArgumentError("invalid benchmark phase");
++    size_t i = warm ? 0 : commit_benchmark::kWarmup;
++    const size_t limit = warm ? commit_benchmark::kWarmup : commit_benchmark::kTotal;
++    int32_t epoch = -1;
++    int64_t last_end = -1;
++    auto status = local->raft->VisitUntil(
++        steady_clock::now() + seconds(40), [&](RaftGroup::State s, bool* done) -> absl::Status {
++          const auto& elected = s.election.state();
++          if (elected.role != QuorumRole::kLeader ||
++              (epoch >= 0 && epoch != elected.election.epoch))
++            return absl::FailedPreconditionError("probe changed leader or epoch");
++          epoch = elected.election.epoch;
++          if (last_end >= 0 && (s.replication.HighWatermark().value_or(-1) < last_end ||
++                                local->effects.applied_offset() < last_end))
++            return absl::OkStatus();
++          if (local->bench_seen != i)
++            return absl::DataLossError("committed effect callback skipped or duplicated");
++          if (i == limit) {
++            commit_benchmark::active = nullptr;
++            if (!warm && !commit_benchmark::WriteTrace())
++              return absl::InternalError("could not write commit benchmark timestamps");
++            *position = {local->id, epoch, last_end};
++            *done = true;
++            return absl::OkStatus();
++          }
++
++          auto& row = commit_benchmark::rows[i];
++          row.submit = commit_benchmark::Now();
++          row.leader = identity_.node_id;
++          row.epoch = epoch;
++          auto bench_key = BenchKey(i);
++          const SlotId bench_slot = KeySlot(bench_key);
++          auto route = Route(bench_slot, local.get());
++          if (!route.ok())
++            return route.status();
++          SetEffect effect{local->id,
++                           0,
++                           bench_slot,
++                           route->owner.generation,
++                           std::move(bench_key),
++                           string(BenchValue(*local, i))};
++          auto batch = MakeSetEffectBatch(
++              s.log.End().end_offset, epoch,
++              duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count(), effect);
++          if (!batch.ok())
++            return batch.status();
++          row.end = last_end = s.log.End().end_offset + 1;
++          row.wire_bytes = batch->size();
++          commit_benchmark::active = &row;
++          if (auto appended = s.replication.Append(*batch, epoch); !appended.ok())
++            return appended;
++          local->effects.RememberAppended({epoch, last_end}, batch->size(), std::move(effect));
++          ++i;
++          return absl::OkStatus();
++        });
++    if (!status.ok())
++      return status;
++    return true;
++  }
+   PendingSet proposal{db, slot, key, value, condition};
+   const auto deadline = steady_clock::now() + seconds(5);
+   shared_ptr<SetBatch> batch;
+--- a/fetch_replication.cc
++++ b/fetch_replication.cc
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+
+ #include "server/cluster/raft/log/record_batch.h"
++#include "trace.h"
+
+ namespace dfly::cluster::raft {
+ namespace {
+@@ -181,6 +182,11 @@
+   }
+   if (leader_hw_->Update(voter_ends_))
+     committed_ = max(committed_.value_or(0), leader_hw_->value()->offset);
++  if (auto* p = commit_benchmark::active; p && !p->hw && committed_ && *committed_ >= p->end &&
++                                          campaign_.target().topic == "__dragonfly_data" &&
++                                          campaign_.target().partition == 10 &&
++                                          p->epoch == leader_epoch_)
++    p->hw = commit_benchmark::Now();
+   if (!local_member && active_voter_offset_ && leader_hw_->value() &&
+       leader_hw_->value()->offset > *active_voter_offset_)
+     (void)campaign_.Resign(leader_epoch_);
+@@ -229,10 +235,14 @@
+     parked->ready_.store(true, memory_order_release);
+     wake_fetch_();
+   };
++  if (commit_benchmark::active)
++    commit_benchmark::active->append = commit_benchmark::Now();
+   if (auto s = log_.Append(batches, expected_epoch, written); !s.ok())
+     return log_.io_failure().ok() ? s : DurableFailure(s);
+   if (may_have_appended)
+     *may_have_appended = true;
++  if (commit_benchmark::active)
++    commit_benchmark::active->durable = commit_benchmark::Now();
+   if (auto s = membership_.Appended(batches, log_.End().end_offset); !s.ok())
+     return DurableFailure(s);
+   if (auto s = RefreshMembership(); !s.ok())

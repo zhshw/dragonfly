@@ -1,0 +1,86 @@
+--- a/src/server/cluster/raft/data/set_effect.cc
++++ b/src/server/cluster/raft/data/set_effect.cc
+@@ -8,6 +8,7 @@
+ #include <absl/cleanup/cleanup.h>
+
+ #include <algorithm>
++#include <absl/crc/crc32c.h>
+
+ #include "server/cluster/raft/log/record_batch.h"
+ #include "server/cluster_support.h"
+@@ -64,20 +65,61 @@
+   if (effect.key.size() > kMaxBatchSize - kHeader ||
+       effect.value.size() > kMaxBatchSize - kHeader - effect.key.size())
+     return absl::ResourceExhaustedError("Dragonfly SET effect exceeds Kafka batch size");
+-  array<string, 1> records;
+-  string& payload = records.front();
+-  payload.assign(kHeader, '\0');
+-  payload.replace(0, kMagic.size(), kMagic);
+-  payload[4] = kVersion;
+-  payload[5] = static_cast<char>(effect.action);
+-  be::Store32(payload.data() + 6, effect.group_id);
+-  be::Store16(payload.data() + 10, effect.db);
+-  be::Store16(payload.data() + 12, effect.slot);
+-  be::Store64(payload.data() + 14, effect.generation);
+-  be::Store32(payload.data() + 22, effect.key.size());
+-  payload += effect.key;
+-  payload += effect.value;
+-  return MakeDataBatch(offset, epoch, timestamp_ms, records);
++  if (offset < 0 || offset == INT64_MAX || epoch < 0 || timestamp_ms < 0)
++    return absl::InvalidArgumentError("Invalid KRaft batch offset, epoch, count or timestamp");
++
++  // A single SET is one DefaultRecord with null key, offset delta 0 and no record headers.
++  auto varint = [](size_t n) {
++    string out;
++    uint32_t raw = static_cast<uint32_t>(n) << 1;
++    while (raw >= 128) {
++      out.push_back(static_cast<char>((raw & 0x7f) | 0x80));
++      raw >>= 7;
++    }
++    out.push_back(static_cast<char>(raw));
++    return out;
++  };
++  auto value_size = kHeader + effect.key.size() + effect.value.size();
++  auto value_length = varint(value_size);
++  auto body_size = 4 + value_length.size() + value_size + 1;
++  auto body_length = varint(body_size);
++  auto size = kBatchHeaderSize + body_length.size() + body_size;
++  if (size > kMaxBatchSize)
++    return absl::ResourceExhaustedError("KRaft batch exceeds maximum size");
++  string batch;
++  batch.reserve(size);
++  batch.resize(kBatchHeaderSize);
++  char* h=batch.data();
++  be::Store64(h, offset);
++  be::Store32(h + 8, size - 12);
++  be::Store32(h + 12, epoch);
++  h[16] = 2;
++  be::Store64(h + 27, timestamp_ms);
++  be::Store64(h + 35, timestamp_ms);
++  be::Store64(h + 43, UINT64_MAX);
++  be::Store16(h + 51, UINT16_MAX);
++  be::Store32(h + 53, UINT32_MAX);
++  be::Store32(h + 57, 1);
++  batch.append(body_length);
++  batch.append("\0\0\0\1",4);
++  batch.append(value_length);
++  auto address_start = batch.size();
++  batch.resize(address_start + kHeader);
++  char* address = batch.data()+address_start;
++  std::copy(kMagic.begin(),kMagic.end(),address);
++  address[4]=kVersion;
++  address[5]=static_cast<char>(effect.action);
++  be::Store32(address+6,effect.group_id);
++  be::Store16(address+10,effect.db);
++  be::Store16(address+12,effect.slot);
++  be::Store64(address+14,effect.generation);
++  be::Store32(address+22,effect.key.size());
++  batch.append(effect.key);
++  batch.append(effect.value);
++  batch.push_back(0);
++  be::Store32(batch.data() + 17,
++              static_cast<uint32_t>(absl::ComputeCrc32c(string_view(batch).substr(21))));
++  return batch;
+ }
+
+ CommittedEffects::CommittedEffects(int32_t group_id, int64_t applied_offset)

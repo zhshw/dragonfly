@@ -265,7 +265,7 @@ sequenceDiagram
 
 ## 6. KV 执行、快照与客户端故障语义
 
-`yes` 通过 `Transaction::LogAutoJournalOnShard` 记录已执行的变更，各引擎线程独立分配 LSN，副本跟随指定的主节点。`raft` 的数据组 leader 将 SET 的效果追加到本组日志。各副本按组内 offset 应用已提交前缀，leader 在本地 KV 应用后回复客户端。[Journal 格式](../../src/server/journal/types.h) · [主从复制管理](../../src/server/replica_manager.cc) · [Raft 数据节点](../../src/server/cluster/raft/runtime/data_node.cc)
+`yes` 由各引擎线程记录已执行的变更并独立分配 LSN。普通 SET 由 `SetCmd::RecordJournal` 显式写入 journal，副本跟随指定的主节点。`raft` 的数据组 leader 将 SET 的效果追加到本组日志。各副本按组内 offset 应用已提交前缀，leader 在本地 KV 应用后回复客户端。[SET 的 journal 入口](../../src/server/string_family.cc) · [主从复制管理](../../src/server/replica_manager.cc) · [Raft 数据节点](../../src/server/cluster/raft/runtime/data_node.cc)
 
 | 接入点 | 当前数据路径 |
 | --- | --- |
@@ -273,6 +273,10 @@ sequenceDiagram
 | 写入与条件求值 | leader 在追加前检查 slot 归属、generation 和本组角色。普通 SET 产生替换记录。NX/XX 等待此前追加的记录全部应用，再求值并记录替换或空操作。条件不满足时也等这次决定提交和应用后才返回 nil。[写入入口](../../src/server/cluster/raft/runtime/data_node.cc) |
 | 确定性重放 | 数据批次携带 group ID、DB ID、slot、generation、键和值。副本按提交顺序应用相同效果。迁槽也以本组记录保存冻结、分块、安装和完成进度，切主或重启后可继续执行。[效果回放](../../src/server/cluster/raft/data/set_effect.cc) · [迁槽记录](../../src/server/cluster/raft/data/slot_transfer_state.cc) |
 | 读取与 WAIT | GET 由已追上本组 HW 的当前 leader 提供。WAIT 按该连接记录的写入位置，统计本组副本在当前 epoch 报告的已应用位置。[副本应用进度](../../src/server/cluster/raft/data/apply_progress.cc) · [集成测试](../../tests/integration/raft_data_group_test.py) |
+
+**SET 编码的取舍。** 当前数据组保留 Kafka 日志批内的 `DFKV v0` 载荷，编码器的优化方向是一次预留、直接写入最终批。Raft 已复用旧版的 `JournalExecutor` 来执行提交后的普通 SET。保留现有日志字节就能减少搬运，也能继续用同一解码器回放已有 WAL。[SET 执行](../../src/server/cluster/raft/data/set_executor.cc) · [直接编码原型对照](replication-benchmark.md#旧版-cluster-的复制如何减少搬运)
+
+旧版 journal 先用 `SELECT` 指定 DB，再用 `COMMAND` 记录事务 ID 和已经求值的 SET 命令。独立验证把这些字节装入 Kafka 数据批，取出后用原版 `JournalReader` 正确读回了 DB 0 和 DB 11 的空值及 256 KiB 二进制值。条件未满足时，旧版跳过这条 SET，Raft 则提交一个占用 offset 的空操作。旧 journal 也没有记录数据组、slot 和归属代际，Raft 回放时要用这些信息阻止旧代际的写入。将来扩展到 DEL、带绝对过期时间的 SET 等写入时，共用 journal 命令体可以省去逐条定义参数编码的工作，届时仍需保留 Raft 的归属校验、空操作和旧 WAL 解码。[Journal 编解码](../../src/server/journal/serializer.cc) · [组归属与代际校验](../../src/server/cluster/raft/data/set_effect.cc) · [条件失败后的重启回放](../../src/server/cluster/raft/data/set_effect_test.cc)
 
 **换主后的条件写。** 假设 A 已将一次 `SET k v NX` 复制给 A-r1，客户端收到回复前 A 宕机。A-r1 当选时，继承的日志可能领先于本地 KV。新 leader 在前序记录按新任期的 HW 提交并应用后，才对下一次 NX/XX 求值。失去本组多数时，节点不能确认新的条件写。[条件写实现](../../src/server/cluster/raft/runtime/data_node.cc)
 
@@ -290,6 +294,10 @@ etcd/raft v3.6.0 在落盘后释放 follower 的追加确认。它的 leader 通
 
 ### 日志恢复标记
 
-恢复标记 `dragonfly-log-end` 的 DFE3 格式在同一普通文件的两个分离块中保存带校验的边界。先写并同步未选中的块，再修改文件长度以选中新块，并同步该文件。只有这两步成功后才公布新的本地 LEO。重启只读取已选中的块，若该块损坏则报错。新二进制可以读取 DFE1、DFE2，下一次发布时原子升级。旧二进制无法打开已升级的目录。[恢复标记](../../src/server/cluster/raft/log/log_files.cc) · [中断、损坏与升级回归](../../src/server/cluster/raft/log/partition_log_test.cc)
+数据组和控制器的分区日志都通过 `dragonfly-log-end` 记录本地持久化边界。DFE4 在文件开头的 44 字节内保存带 CRC32C 的基准记录，包含快照起点、日志段编号、已验证的字节末端和对应的排他 offset。同一段内最多可从这个基准向前发布 4095 个 offset。稀疏文件的逻辑长度编码已发布的增量，并带有能发现单比特长度错误的校验。[磁盘格式](../../src/server/cluster/raft/log/log_files.cc)
+
+在这个窗口内，节点先写全并同步日志段，再用 `ftruncate` 更新标记长度并同步标记文件，随后才公布新的本地 LEO。换段、超出窗口、截断或改变快照保留边界时，节点写入并同步新的基准文件，原子替换旧文件，再同步目录。[追加与截断](../../src/server/cluster/raft/log/partition_log.cc) · [快照处理](../../src/server/cluster/raft/log/partition_snapshot.cc)
+
+如果进程在更新标记长度后、同步返回前退出，重启进程可能从操作系统缓存中读到新的长度。启动时先同步 DFE3 或 DFE4 的标记文件，再同步目录，确保持久化了用于恢复的文件和选择。随后核对基准字节位置与 offset，逐批校验到所选边界，成功后才向 quorum 报告本地进度。已发布范围出现短写、坏 CRC 或断裂的批次会导致打开失败。选定边界之后的字节会被截掉，即使它们恰好构成有效日志批。新版本可以读取 DFE1、DFE2 和 DFE3，下一次发布边界时原子升级到 DFE4。已升级的分区目录需要支持 DFE4 的二进制才能重新打开。[边界恢复与升级回归](../../src/server/cluster/raft/log/partition_log_test.cc)
 
 [数据组复制优化项与验收方法](replication-benchmark.md#数据组复制优化项)

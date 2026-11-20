@@ -1,0 +1,139 @@
+--- a/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java
++++ b/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java
+@@ -1868 +1868,4 @@
+-        LogAppendInfo info = log.appendAsLeader(records, quorum.epoch());
++        final int appendEpoch = quorum.epoch();
++        final long started = System.nanoTime();
++        LogAppendInfo info = log.appendAsLeader(records, appendEpoch);
++        AlignedProbe.append(info.firstOffset(), info.lastOffset(), appendEpoch, started);
+--- a/raft/src/main/java/org/apache/kafka/raft/LeaderState.java
++++ b/raft/src/main/java/org/apache/kafka/raft/LeaderState.java
+@@ -687,0 +688 @@
++                        AlignedProbe.advance(highWatermarkUpdateOffset, System.nanoTime());
+@@ -707,0 +709 @@
++                    AlignedProbe.advance(highWatermarkUpdateOffset, System.nanoTime());
+--- a/core/src/main/scala/kafka/tools/TestRaftServer.scala
++++ b/core/src/main/scala/kafka/tools/TestRaftServer.scala
+@@ -171 +171 @@
+-    private case class HandleCommit(reader: BatchReader[Array[Byte]]) extends RaftEvent
++    private case class HandleCommit(reader: BatchReader[Array[Byte]], callbackNanos: Long) extends RaftEvent
+@@ -177 +177,30 @@
+-    private val payload = new Array[Byte](recordSize)
++    private lazy val payloads = {
++      val rng = new java.util.Random(42L)
++      Array.fill(512) {
++        val value = new Array[Byte](recordSize)
++        rng.nextBytes(value)
++        value
++      }
++    }
++    private val goPath = java.nio.file.Paths.get(sys.env("KRAFT_PROBE_GO"))
++    private val readyKinds = Seq("all", "majority", "warmed")
++    private val markers = readyKinds.map(k =>
++      (k -> ("ready-" + sys.env("KRAFT_PROBE_NONCE") + "-" + k).getBytes(java.nio.charset.StandardCharsets.US_ASCII))
++    ).toMap
++    private val sentMarkers = scala.collection.mutable.Set.empty[String]
++    private def sendMarker(epoch: Int, kind: String): Unit = {
++      if (sentMarkers.add(kind)) {
++        val off = raftManager.client.prepareAppend(epoch, List(markers(kind)).asJava)
++        raftManager.client.schedulePreparedAppend()
++        println(s"PROBE_MARKER_PREPARED kind=$kind epoch=$epoch offset=$off")
++      }
++    }
++    private val rawRows = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, Long, Long, Long)]
++
++    private val sizes = Seq(32, 256)
++    private var phase = 0
++    private var completed = 0
++    private var startedNanos = 0L
++    private var appendNanos = 0L
++    private var durations = scala.collection.mutable.ArrayBuffer.empty[Long]
++    private var verifiedOnFollower = 0
+@@ -186,0 +216 @@
++      println(s"PROBE_VIEW node=${config.nodeId} leader=${newLeaderAndEpoch.leaderId().orElse(-1)} epoch=${newLeaderAndEpoch.epoch()}")
+@@ -195 +225 @@
+-      eventQueue.offer(HandleCommit(reader))
++      eventQueue.offer(HandleCommit(reader, System.nanoTime()))
+@@ -218,0 +249,3 @@
++        val payload = payloads(completed)
++        appendNanos = System.nanoTime()
++        if (completed == 0) startedNanos = appendNanos
+@@ -232,2 +265,12 @@
+-        val throttleTimeMs = throttler.maybeThrottle(recordCount.get() + 1, startTimeMs)
+-        if (throttleTimeMs == 0) {
++        if (phase >= sizes.size || !pendingAppends.isEmpty) {
++          Long.MaxValue
++        } else if (!java.nio.file.Files.exists(goPath)) {
++          sendMarker(leaderEpoch, "all")
++          20L
++        } else if (!java.nio.file.Files.exists(goPath.resolveSibling("warmup"))) {
++          sendMarker(leaderEpoch, "majority")
++          20L
++        } else if (phase != 0 && !java.nio.file.Files.exists(goPath.resolveSibling("timed"))) {
++          sendMarker(leaderEpoch, "warmed")
++          20L
++        } else {
+@@ -234,0 +278 @@
++          1000L
+@@ -236 +279,0 @@
+-        throttleTimeMs
+@@ -240,0 +284 @@
++          println(s"PROBE_LEADER node=${config.nodeId} epoch=$epoch")
+@@ -250 +294 @@
+-        case HandleCommit(reader) =>
++        case HandleCommit(reader, callbackNanos) =>
+@@ -254,2 +298,19 @@
+-              claimedEpoch.foreach { leaderEpoch =>
+-                handleLeaderCommit(leaderEpoch, batch)
++              val entries = batch.records()
++              val marker = if (entries.size() == 1 && entries.get(0).length < 128)
++                readyKinds.find(k => java.util.Arrays.equals(entries.get(0), markers(k)))
++              else None
++              if (claimedEpoch.isEmpty && marker.isEmpty) {
++                for (record <- batch.records.asScala if record.length == recordSize) {
++                  val i = if (verifiedOnFollower < 32) verifiedOnFollower else verifiedOnFollower - 32
++                  require(java.util.Arrays.equals(record, payloads(i)), s"follower value mismatch $i")
++                  verifiedOnFollower += 1
++                  if (verifiedOnFollower == 288) println(s"PROBE_FOLLOWER_VERIFIED node=${config.nodeId} n=288 offset=${batch.baseOffset}")
++                }
++              }
++              marker match {
++                case Some(kind) =>
++                  println(s"PROBE_MARKER_COMMITTED kind=$kind node=${config.nodeId} epoch=${batch.epoch()} offset=${batch.baseOffset}")
++                case None =>
++                  claimedEpoch.foreach { leaderEpoch =>
++                    handleLeaderCommit(leaderEpoch, batch, callbackNanos)
++                  }
+@@ -274 +335 @@
+-      batch: Batch[Array[Byte]]
++      batch: Batch[Array[Byte]], callbackNanos: Long
+@@ -296 +357,28 @@
+-        stats.record(latencyMs, record.length, currentTimeMs)
++        require(java.util.Arrays.equals(record, payloads(completed)))
++        rawRows += ((phase, completed, offset, appendNanos, callbackNanos))
++        durations += callbackNanos - appendNanos
++        completed += 1
++        if (completed == sizes(phase)) {
++          val sorted = durations.sorted
++          def percentile(q: Double) = sorted(math.ceil(q * sorted.size).toInt - 1) / 1e6
++          val secs = (callbackNanos - startedNanos) / 1e9
++          val mib = completed * record.length / 1048576
++          println(f"PROBE_RESULT phase=$phase records=$completed mib=$mib seconds=$secs%.6f mibps=${mib / secs}%.3f p50ms=${percentile(0.50)}%.4f p95ms=${percentile(0.95)}%.4f")
++          phase += 1
++          completed = 0
++          durations.clear()
++          if (phase == sizes.size) {
++            val out = java.nio.file.Files.newBufferedWriter(java.nio.file.Paths.get(sys.env("KRAFT_PROBE_RAW")))
++            try {
++              out.write("phase,ordinal,offset,epoch,prepare_ns,append_ns,hw_ns,callback_ns\n")
++              rawRows.foreach { case (p, i, o, b, c) =>
++                val a = org.apache.kafka.raft.AlignedProbe.appendNs(o)
++                val h = org.apache.kafka.raft.AlignedProbe.hwNs(o)
++                val e = org.apache.kafka.raft.AlignedProbe.epoch(o)
++                require(e == leaderEpoch && b <= a && a < h && h <= c, s"probe failed $o $e $b $a $h $c")
++                out.write(s"$p,$i,$o,$e,$b,$a,$h,$c\n")
++              }
++            } finally out.close()
++            println("PROBE_DONE")
++          }
++        }

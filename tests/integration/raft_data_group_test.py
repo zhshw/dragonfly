@@ -233,8 +233,11 @@ class RaftDataGroupFixture(unittest.TestCase):
                 if size in (first_slot_size, first_slot_size + 15):
                     source.seek(0 if size == first_slot_size else slot_stride)
                     magic = b"DFE3"
-                else:
+                elif size == 44:
                     magic = b"DFE2"
+                else:
+                    # DFE4 keeps the retained snapshot position in the fixed anchor.
+                    magic = b"DFE4"
                 data = source.read(44)
                 if os.fstat(source.fileno()).st_size != size:
                     return None
