@@ -3,8 +3,8 @@
 | 版本 | 确认吞吐 MiB/s | 对比 |
 | --- | ---: | ---: |
 | 原始 `raft.memory`（profile 优化前） | 169.56 | — |
-| 最新 `raft.memory`（以下优化全部包含） | **325.31** | **+91.9%** |
-| 原 cluster（最新同轮对照） | 606.05 | 仍为最新 Raft 的 1.86 倍 |
+| 最新 `raft.memory`（v9，含以下全部优化） | **389.95** | **+130.0%** |
+| 原 cluster（最新同轮对照） | 580.94 | 仍为最新 Raft 的 1.49 倍 |
 
 最新版本包含的优化项：
 
@@ -12,48 +12,27 @@
 - **P0-2：有界批量应用与借用参数**。多笔已提交 effect 一次投递 owner，SET 同步借用 key/value，减少往返、复制和清零。
 - **P1-4：follower 复用已验证的接收批次**。普通 SET/no-op 从共享缓冲应用，省去本轮负载的 WAL 读回、重复 CRC/解码和 value 副本。
 - **P1-7：Fetch 直接封帧**。只计算字段长度后一次预留，去掉 body → frame 副本和尾部扩容复制。
+- **P1-5：SET 输入所有权转交**。接管已解析参数，drain 后释放输入，票据仍按原有序回复释放配额。
 
 均为 1 连接、pipeline 64、未插桩三轮中位数，计时包含 SET + 原写连接 WAIT 1。
-**+91.9% 是原始基线到最新版本的跨轮累计对比**，包含上述全部优化及 WAIT 等待变化；各阶段增量不能相加。
-本轮确认吞吐中位数 +8.6%，但范围重叠、第三组几乎持平；逐笔 shard 执行等成本仍存在。
-逐轮数据与结论见[实验索引](#experiments)；最新火焰图与 trace 见 [v8 实验](profile/v8-fetch-frame.md)，完整口径见 [benchmark](replication-benchmark.md)。
+**+130.0% 是原始基线到最新版本的跨轮累计对比**，包含上述全部优化及 WAIT 等待变化；各阶段增量不能相加。
 
-## 1. 初始诊断依据（优化前 v3）
+**最新一轮 v9：SET 输入所有权转交**（2026-11-23）。以下使用同轮 v8 复测作为增量基线。
 
-以下采用 2026-11-23 的 `memory-c1-p64-v3` / `cluster-c1-p64-v3` 初始采样，作为选择优化项的依据。
-同机、同一插桩二进制（SHA-256 前缀 `72f222abed27`）、1 连接、pipeline 64、256 MiB、256 KiB/value；
-三副本停一台，计时包含原写连接 `WAIT 1`。恢复、`WAIT 2` 和 1088 个值读回均通过。
+| 指标 | v8 本轮复测 | v9 | 变化 |
+| --- | ---: | ---: | ---: |
+| 确认吞吐（三轮中位数） | 322.41 MiB/s | **389.95 MiB/s** | **+20.9%** |
+| 批次 P95（三轮中位数） | 74.94 ms | **65.32 ms** | **−12.8%** |
+| leader CPU（单次诊断） | 612 ms | 506 ms | −17.3% |
+| 两节点 CPU 合计（单次诊断） | 852 ms | 744 ms | −12.7% |
+| 入队 key/value 复制 CPU（采样估计） | 54 ms | 0 ms | 目标副本消除 |
+| leader 峰值 RSS（单次诊断） | 459.72 MiB | 445.07 MiB | −3.2% |
 
-| 指标 | raft.memory | 原 cluster |
-| --- | ---: | ---: |
-| 未插桩三轮确认吞吐中位数 | 169.56 MiB/s | 628.87 MiB/s |
-| 插桩 SET + WAIT 1 | 1512.14 ms | 415.31 ms |
-| leader CPU 样本 / 估计 CPU 时间 | 628 / 1256 ms | 191 / 382 ms |
-| leader memcpy | 366 样本 / 732 ms | 116 样本 / 232 ms |
-| leader memset | 66 样本 / 132 ms | 30 样本 / 60 ms |
-| leader CRC32::Extend | 45 样本 / 90 ms | 未采到 |
-| follower CPU 样本 / 估计 CPU 时间 | 253 / 506 ms | 70 / 140 ms |
+三组确认吞吐配对均提升约 20%–21%，范围不重叠；两版末尾 WAIT 均约 0.15 ms。
+第三组 P95 上升 5.7%；RSS 测量前占用和角色节点不同，不能将全部差值归因于优化。
+逐轮数据与结论见[实验索引](#experiments)；最新火焰图与 trace 见 [v9 实验](profile/v9-input-ownership.md)，完整口径见 [benchmark](replication-benchmark.md)。
 
-- Raft leader 总 CPU 为 **3.29 倍**；`memcpy + memset` 的绝对差约 **572 ms**，占 CPU 差值的约 **65%**。
-  两边 memcpy 百分比都接近 60%，只比较百分比会掩盖差距。
-- `AppendSetBatch` 累计占 leader 样本 **36.0%**，其中 `MakeSetEffectBatch` 为 **23.1%**。
-  父子栈包含关系不能相加，也不能把这些 CPU 比例直接换算为吞吐提升。
-- trace 区间并集：leader 编码 **475 ms**、worker 排队 **588 ms**、应用 **237 ms**；follower 应用 **369 ms**。
-  应用内部的 `journal.apply` 分别为 **111 / 98 ms**，原 cluster follower 为 **47 ms**。
-  外层还包含日志读取、解码和跨线程等待；各阶段重叠，差值不能直接认定为某一种开销。
-- 初始 1024 笔 SET 对应 leader **5106 次** worker 访问、**2650 次**等待 I/O 排空；
-  次数也包含复制等操作，不能全部归因于 SET。
-- CPU 采样为 500 Hz，时间是样本估计，包含多线程；火焰图没有测量分配字节、峰值 RSS 或实际内存带宽。
-  “复制多”已有证据，“内存占用降低多少”仍需补测。
-- `memory` 仍写 page cache、后台同步；每笔 SET 仍需多数接收并完成本地应用。原 cluster 的 SET 先回复本地执行结果，
-  再由末尾 WAIT 确认副本应用。总计时包含副本确认，但两者逐笔确认和持久性语义仍有区别。
-
-证据入口：[Raft 火焰图](http://172.31.23.2:3137/memory-c1-p64-v3/index.html)、
-[原 cluster 火焰图](http://172.31.23.2:3137/cluster-c1-p64-v3/index.html)、
-[trace 结论及链接](replication-observability.md)、[未插桩 benchmark](replication-benchmark.md)。
-原始 `*.folded`、`stages.csv` 和 `summary.json` 位于 `benchmarks/observability-20261123/`，由 Git 忽略。
-
-## 2. 路径差异：哪些工作可以减少
+## 1. 路径差异：哪些工作可以减少
 
 | 阶段 | 原 cluster | raft.memory | 优化方向 |
 | --- | --- | --- | --- |
@@ -65,7 +44,7 @@
 
 Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责；借鉴原 cluster 的数据处理方式，保持两种集群设计独立。
 
-## 3. 优化项与当前状态
+## 2. 优化项与当前状态
 
 <a id="wal-buffer-remaining"></a>
 
@@ -102,8 +81,9 @@ Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责；借鉴原
 - 这与 P1-6“允许追加和 fsync 并行”不同：先优化已经接收的位置报告，不改变持久标记切点。
   P1-4 已独立验证接收缓冲复用，减少了读回、清零及重复解码；后续评估须使用最新实现作基线，不能重复计算收益。
 
-**依据与收益边界：** 接收后的串行等待及其与 leader 工作的重叠，见[确认路径复核](profile/v5-batched-apply.md#confirmation-path)。
-先补齐 Fetch 实际发送、leader 接纳位置与 HW 推进的关联事件，再决定是否完整异步化；不能把累计等待直接算成可兑现收益。
+**依据与收益边界：** 最新接收间隔及其与 leader 工作的重叠，见[v9 确认路径复核](profile/v9-input-ownership.md#v9-confirmation-review)。
+此前复核保留在[v5 实验](profile/v5-batched-apply.md#confirmation-path)。先补齐 Fetch 实际发送、leader 接纳位置与 HW 推进的关联事件，
+再决定是否完整异步化；不能把累计等待直接算成可兑现收益。
 
 **验收：** 先补齐接收完成、Fetch 实际发出、leader 接纳 offset/HW 的关联事件，核对确认等待是否消失；
 再做 1 连接 / pipeline 64 三轮未插桩对照及原 cluster 对照，保持 SET + 原连接 WAIT 1 口径。
@@ -126,7 +106,8 @@ Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责；借鉴原
 
 **代码依据：** `TrySet` 为每笔创建确认 fiber；`WaitApplied → VisitUntil → RunOnWorker` 查询应用进度。
 当前使用事件等待；查询已应用前缀仍可能先等追加或后台同步结束，批量 owner 投递没有移除此处等待。
-调用次数与批次末尾回复等待的区别，见[确认路径复核](profile/v5-batched-apply.md#confirmation-path)。
+最新批次末尾的 offset 关联结果，见[v9 确认路径复核](profile/v9-input-ownership.md#v9-confirmation-review)；
+本轮没有显示应用完成后的票据回查是主要尾部瓶颈，不能仅凭 worker 访问次数将其列为下一项。
 
 - 按 `(epoch, end_offset)` 登记待完成票据，由应用进度一次完成连续前缀，减少每笔唤醒后重新排队查询。
 - 角色/任期变化、存储失败、超时和关闭必须完成或取消相应票据；连接回复仍按原顺序。
@@ -144,7 +125,12 @@ follower 完成完整批次校验和本模式追加后，将不可变接收缓�
 网络输入与磁盘重读仍完整校验，缓存命中不代替实际应用成功；缓存预算不等于全部在途内存上限。
 选择依据、正确性和性能结果见[follower 缓存实验](profile/v7-follower-cache.md)。
 
-### P1-5：统一内存预算，缩短副本生命周期
+### P1-5：统一内存预算，缩短副本生命周期（输入所有权转交已实现）
+
+**已完成第一步：** 普通异步 SET 将已解析参数的所有权转交给请求，消除 `AsyncPendingSet` 再复制 key/value，
+在 drain 不再引用输入后释放大缓冲；票据反压仍保持到有序回复释放。拒绝入队不能消耗原参数，断连后已接收写仍可独立完成。
+实现、测试与性能结论见[v9 实验](profile/v9-input-ownership.md#input-ownership)。
+本轮对照和正确性验证已通过；这只是 P1-5 的第一步，全流程内存预算仍未统一，内存测量见实验文件。
 
 **现状：** 提交/排队已有 **8 MiB / 256 笔**限制；每个数据副本的 effect 缓存另有 **8 MiB / 4096 条**上限，
 现在同时覆盖 leader 追加和 follower 接收缓冲。
@@ -182,7 +168,7 @@ WAL 副本、Fetch 响应、应用参数、确认 fiber 和 allocator 容量仍�
 后续若共享 parked Fetch 缓冲或采用分散缓冲发送，需另行处理所有权、部分发送、背压和内存预算。
 
 
-## 4. 验证顺序与收益记录
+## 3. 验证顺序与收益记录
 
 1. 先增加按阶段的复制/分配计数及 apply 子阶段：WAL 读取、CRC/解码、owner 排队、实际 KV 应用。
    已增加进程 RSS 和应用读取/解码、owner 排队/批次 trace；复制/分配字节尚未完整采集。
@@ -204,17 +190,10 @@ WAL 副本、Fetch 响应、应用参数、确认 fiber 和 allocator 容量仍�
 
 每个实验的测试数据、火焰图、trace 结论和验证范围单独保存；原始采集文件继续放在 Git 忽略的 `benchmarks/` 下。
 
+- [v3：初始基线与诊断](profile/v3-baseline.md)
 - [v4：共享 WAL 缓冲与直接编码](profile/v4-wal-buffer.md)
 - [v5：批量应用与借用参数](profile/v5-batched-apply.md)
-
-<a id="v6-drain-experiment"></a>
-
-- [v6：直接聚合编码与 effect/WAL 共享](profile/v6-drain-sharing.md)
-
-<a id="v7-follower-experiment"></a>
-
-- [v7：follower 复用接收批次](profile/v7-follower-cache.md)
-
-<a id="v8-frame-experiment"></a>
-
-- [v8：Fetch 直接封帧](profile/v8-fetch-frame.md)
+- <a id="v6-drain-experiment"></a>[v6：直接聚合编码与 effect/WAL 共享](profile/v6-drain-sharing.md)
+- <a id="v7-follower-experiment"></a>[v7：follower 复用接收批次](profile/v7-follower-cache.md)
+- <a id="v8-frame-experiment"></a>[v8：Fetch 直接封帧](profile/v8-fetch-frame.md)
+- <a id="v9-input-experiment"></a>[v9：SET 输入所有权转交](profile/v9-input-ownership.md)（最新）

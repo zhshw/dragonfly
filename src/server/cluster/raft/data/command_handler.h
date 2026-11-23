@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "common/backed_args.h"
 #include "server/cluster/cluster_defs.h"
 #include "server/cluster/raft/data/write_position.h"
 #include "server/common_types.h"
@@ -68,6 +69,12 @@ class DataCommandHandler {
   virtual std::shared_ptr<PendingDataWrite> TrySet(DbIndex db, std::string_view key,
                                                    std::string_view value) {
     return nullptr;
+  }
+
+  // args contains SET, key and value. On admission implementations may consume all arguments;
+  // on rejection args is unchanged. The fallback copies through the ordinary owning API.
+  virtual std::shared_ptr<PendingDataWrite> TrySetOwned(DbIndex db, cmn::BackedArguments* args) {
+    return TrySet(db, (*args)[1], (*args)[2]);
   }
 
   virtual absl::Status Set(DbIndex db, std::string_view key, std::string_view value,

@@ -117,18 +117,40 @@ struct LocalPartition {
 
 struct AsyncPendingSet final : PendingDataWrite {
   AsyncPendingSet(shared_ptr<LocalPartition> local, DbIndex db, string_view key, string_view value,
-                  int32_t epoch)
-      : local(std::move(local)), key(key), value(value), proposal{db,        KeySlot(key),
-                                                                  this->key, this->value,
-                                                                  nullopt,   epoch} {
+                  int32_t epoch, cmn::BackedArguments* owned_args)
+      : local(std::move(local)),
+        reserved_bytes(key.size() + value.size()),
+        proposal{db, KeySlot(key), {}, {}, nullopt, epoch} {
+    if (owned_args) {
+      input.SwapArgs(*owned_args);
+      proposal.key = input[1];
+      proposal.value = input[2];
+    } else {
+      this->key = key;
+      this->value = value;
+      proposal.key = this->key;
+      proposal.value = this->value;
+    }
   }
 
   ~AsyncPendingSet() override {
-    local->async_bytes.fetch_sub(key.size() + value.size());
+    local->async_bytes.fetch_sub(reserved_bytes);
     local->async_requests.fetch_sub(1);
   }
 
+  void ReleaseInput() {
+    // The drainer has finished all reads; cached effects now refer to the immutable WAL.
+    proposal.effect.reset();
+    proposal.key = {};
+    proposal.value = {};
+    cmn::BackedArguments{}.SwapArgs(input);
+    string{}.swap(key);
+    string{}.swap(value);
+  }
+
   shared_ptr<LocalPartition> local;
+  const size_t reserved_bytes;
+  cmn::BackedArguments input;
   string key;
   string value;
   PendingSet proposal;
@@ -212,6 +234,7 @@ class DataNodeImpl final : public DataNode {
     return absl::GetFlag(FLAGS_raft_drain_writes);
   }
   shared_ptr<PendingDataWrite> TrySet(DbIndex db, string_view key, string_view value) override;
+  shared_ptr<PendingDataWrite> TrySetOwned(DbIndex db, cmn::BackedArguments* args) override;
   absl::Status Set(DbIndex db, string_view key, string_view value,
                    DataWritePosition* position) override;
   absl::StatusOr<bool> SetIf(DbIndex db, string_view key, string_view value, SetCondition condition,
@@ -239,6 +262,8 @@ class DataNodeImpl final : public DataNode {
   }
   absl::StatusOr<bool> ProposeSet(DbIndex db, string_view key, string_view value,
                                   optional<SetCondition> condition, DataWritePosition* position);
+  shared_ptr<PendingDataWrite> TrySetImpl(DbIndex db, string_view key, string_view value,
+                                          cmn::BackedArguments* owned_args);
   absl::Status QueueSet(shared_ptr<LocalPartition> local, PendingSet* request);
   void DrainSets(shared_ptr<LocalPartition> local);
   absl::Status WaitApplied(shared_ptr<LocalPartition> local, const PendingSet& proposal,
@@ -528,6 +553,17 @@ absl::StatusOr<optional<string>> DataNodeImpl::Get(DbIndex db, string_view key) 
 }
 
 shared_ptr<PendingDataWrite> DataNodeImpl::TrySet(DbIndex db, string_view key, string_view value) {
+  return TrySetImpl(db, key, value, nullptr);
+}
+
+shared_ptr<PendingDataWrite> DataNodeImpl::TrySetOwned(DbIndex db, cmn::BackedArguments* args) {
+  DCHECK_EQ(args->size(), 3u);
+  return TrySetImpl(db, (*args)[1], (*args)[2], args);
+}
+
+shared_ptr<PendingDataWrite> DataNodeImpl::TrySetImpl(DbIndex db, string_view key,
+                                                      string_view value,
+                                                      cmn::BackedArguments* owned_args) {
   auto local = partition_.load();
   if (!local || stopping_ || !SupportsAsyncSet())
     return nullptr;
@@ -548,7 +584,7 @@ shared_ptr<PendingDataWrite> DataNodeImpl::TrySet(DbIndex db, string_view key, s
   auto epoch = local->raft->LeaderEpoch();
   if (!epoch)
     return nullptr;
-  auto request = make_shared<AsyncPendingSet>(local, db, key, value, *epoch);
+  auto request = make_shared<AsyncPendingSet>(local, db, key, value, *epoch, owned_args);
   local->async_bytes.fetch_add(bytes);
   local->async_requests.fetch_add(1);
   local->ready_sets.push_back(&request->proposal);
@@ -567,6 +603,7 @@ shared_ptr<PendingDataWrite> DataNodeImpl::TrySet(DbIndex db, string_view key, s
     if (launch)
       owner_->Dispatch([this, local] { DrainSets(local); });
     request->proposal.appended.Wait();
+    request->ReleaseInput();
     request->status = request->proposal.status;
     if (request->status.ok())
       request->status = WaitApplied(local, request->proposal, deadline, &request->position);

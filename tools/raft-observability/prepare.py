@@ -71,6 +71,36 @@ def instrument(relative):
     elif relative == RAFT + "runtime/data_node.cc":
         edits = [
             (
+                "    if (owned_args) {",
+                '    dfly_observe::Scope observed_input(owned_args ? "raft.set.input_take"\n'
+                '                                                       : "raft.set.input_copy",\n'
+                "                                       reserved_bytes);\n"
+                "    if (owned_args) {",
+            ),
+            (
+                "  const size_t reserved_bytes;",
+                "  const size_t reserved_bytes;\n"
+                "  const int64_t observed_input_start = dfly_observe::Now();",
+            ),
+            (
+                "  void ReleaseInput() {",
+                "  void ReleaseInput() {\n"
+                '    dfly_observe::Record("raft.set.input_lifetime", observed_input_start,\n'
+                "                         reserved_bytes, input.HeapMemory());",
+            ),
+            (
+                "    string{}.swap(value);",
+                "    string{}.swap(value);\n"
+                '    dfly_observe::Record("raft.set.input_release", dfly_observe::Now(),\n'
+                "                         input.HeapMemory(), reserved_bytes);",
+            ),
+            (
+                "  ~AsyncPendingSet() override {",
+                "  ~AsyncPendingSet() override {\n"
+                '    dfly_observe::Record("raft.set.ticket_lifetime", observed_input_start,\n'
+                "                         reserved_bytes, input.HeapMemory());",
+            ),
+            (
                 "                replica->effects.RememberFetched(log, buffer, batches);",
                 '                dfly_observe::Scope observed_cache("raft.fetch.cache_prepare", batches.size());\n'
                 "                replica->effects.RememberFetched(log, buffer, batches);\n"

@@ -17,6 +17,10 @@ using namespace std;
 
 class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
  protected:
+  struct TestWrite : PendingDataWrite {
+    cmn::BackedArguments input;
+  };
+
   void SetUp() override {
     SetTestFlag("cluster_mode", "raft");
     BaseFamilyTest::SetUp();
@@ -35,8 +39,15 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
     if (pending_.size() == 2)
       return nullptr;
     submitted_.emplace_back(key, value);
-    pending_.push_back(make_shared<PendingDataWrite>());
+    pending_.push_back(make_shared<TestWrite>());
     return pending_.back();
+  }
+
+  shared_ptr<PendingDataWrite> TrySetOwned(DbIndex db, cmn::BackedArguments* args) override {
+    auto write = TrySet(db, (*args)[1], (*args)[2]);
+    if (write)
+      static_cast<TestWrite&>(*write).input.SwapArgs(*args);
+    return write;
   }
 
   absl::Status Set(DbIndex db, string_view key, string_view value,
@@ -107,7 +118,7 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
   size_t known_nodes_ = 1;
   size_t assigned_groups_ = 1;
   bool async_enabled_ = false;
-  vector<shared_ptr<PendingDataWrite>> pending_;
+  vector<shared_ptr<TestWrite>> pending_;
   vector<pair<string, string>> submitted_;
   bool ready_ = false;
   unsigned sets_ = 0;
@@ -190,7 +201,9 @@ TEST_F(DataDispatchTest, AsyncSetsSubmitBeforeConfirmationAndKeepBarriers) {
       return cmd;
     };
     auto first = command({"SET", "same", "first"});
-    auto second = command({"SET", "same", "second"});
+    const string large_value(256U << 10, '\0');
+    auto second = command({"SET", "same", large_value});
+    const char* value_data = second->back().data();
     EXPECT_EQ(service_->DispatchCommandSimple(first.get(), facade::AsyncPreference::PREFER_ASYNC,
                                               nullptr),
               facade::DispatchResult::OK);
@@ -199,7 +212,14 @@ TEST_F(DataDispatchTest, AsyncSetsSubmitBeforeConfirmationAndKeepBarriers) {
         facade::DispatchResult::OK);
     ASSERT_EQ(pending_.size(), 2u);
     EXPECT_EQ(submitted_[0], make_pair(string("same"), string("first")));
-    EXPECT_EQ(submitted_[1], make_pair(string("same"), string("second")));
+    EXPECT_EQ(submitted_[1], make_pair(string("same"), large_value));
+    EXPECT_TRUE(first->empty());
+    EXPECT_TRUE(second->empty());
+    EXPECT_TRUE(first->tail_args().empty());
+    EXPECT_TRUE(second->tail_args().empty());
+    EXPECT_EQ(pending_[0]->input[2], "first");
+    EXPECT_EQ(pending_[1]->input[2].data(), value_data);
+    EXPECT_EQ(pending_[1]->input[2], large_value);
     EXPECT_FALSE(first->CanReply());
     EXPECT_FALSE(second->CanReply());
     EXPECT_FALSE(connection.conn_state.raft_last_write);
@@ -213,6 +233,8 @@ TEST_F(DataDispatchTest, AsyncSetsSubmitBeforeConfirmationAndKeepBarriers) {
         facade::DispatchResult::WOULD_BLOCK);
     EXPECT_FALSE(full->IsDeferredReply());
     EXPECT_EQ(pending_.size(), 2u);
+    ASSERT_EQ(full->size(), 3u);
+    EXPECT_EQ(full->back(), "third");
     for (auto parts : {initializer_list<string_view>{"GET", "same"},
                        {"WAIT", "1", "1"},
                        {"SET", "same", "conditional", "NX"},
@@ -290,10 +312,38 @@ TEST_F(DataDispatchTest, AsyncSetErrorsAndDroppedCommandsKeepOwnedCompletion) {
               facade::DispatchResult::OK);
     ASSERT_EQ(pending_.size(), 2u);
     dropped.reset();
+    EXPECT_EQ(pending_[1]->input[1], "key");
+    EXPECT_EQ(pending_[1]->input[2], "value");
     pending_[1]->position = {10, 3, 9};
     pending_[1]->ready.Dec();
     EXPECT_EQ(connection.conn_state.raft_last_write->end_offset, 8);
     EXPECT_EQ(capture.Take().index(), 0u);
+  });
+}
+
+TEST_F(DataDispatchTest, AsyncSetExternalArgumentsKeepParsedStorage) {
+  async_enabled_ = true;
+  pp_->at(0)->Await([&] {
+    ConnectionContext connection(nullptr, acl::UserCredentials{});
+    connection.ns = &namespaces->GetDefaultNamespace();
+    connection.skip_acl_validation = true;
+    facade::CapturingReplyBuilder capture;
+    CommandContext cmd(&capture, &connection);
+    array<string_view, 3> stored{"SET", "original", "kept"};
+    cmd.Assign(stored.begin(), stored.end(), stored.size());
+    array<string_view, 3> external{"SET", "external", ""};
+    EXPECT_EQ(service_->DispatchCommand(facade::ArgSlice{external}, &cmd,
+                                        facade::AsyncPreference::ONLY_ASYNC, nullptr),
+              facade::DispatchResult::OK);
+    ASSERT_EQ(pending_.size(), 1u);
+    EXPECT_TRUE(pending_[0]->input.empty());
+    EXPECT_EQ(submitted_[0], make_pair(string("external"), string{}));
+    ASSERT_EQ(cmd.size(), 3u);
+    EXPECT_EQ(cmd[1], "original");
+    EXPECT_EQ(cmd[2], "kept");
+    pending_[0]->ready.Dec();
+    cmd.SendReply();
+    EXPECT_EQ(get<facade::payload::SimpleString>(capture.Take()), "OK");
   });
 }
 

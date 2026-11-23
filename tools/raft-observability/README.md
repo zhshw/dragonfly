@@ -40,6 +40,11 @@ sudo docker compose --env-file /data/dragonfly-observability/config/langfuse.env
 follower 对应 `raft.fetch.cache_bytes`，字段口径相同；`raft.fetch.cache_prepare` 记录已验证记录入缓存的处理时间，
 `raft.apply.cache_hit` 记录每条从缓存取出的 effect，其 `arg0` 为记录起始 offset。失败后重试可能再次从 WAL 读回，命中数不是成功应用数。
 共享缓存按唯一 capacity 计数；这些是瞬时值，不能累加，也不代表含输入、应用和 I/O 引用的总在途内存。
+`raft.set.input_take` / `input_copy` 区分普通 SET 的参数接管与复制，`arg0` 为 key/value 逻辑字节数。
+`raft.set.input_lifetime` 从请求创建持续到 drain 不再引用输入，`arg0` 为准入字节，`arg1` 为接管参数的
+`HeapMemory()`（含参数偏移存储，不含对象自身、KV 或 WAL）；复制回退的 string 容量不计入这个字段。
+`raft.set.input_release` 的 `arg0` 记录释放后剩余参数堆容量，`arg1` 为仍保留的准入字节；
+`raft.set.ticket_lifetime` 持续到票据销毁释放配额，字段与 input lifetime 一致。上述诊断只存在于独立插桩二进制。
 达到时间预算后可能只完成前缀，剩余项的下一次投递会重复计入 `arg0`；完成笔数应核对 `journal.apply` 次数。
 
 ```sh

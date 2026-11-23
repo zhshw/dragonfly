@@ -1535,7 +1535,24 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
       if (ServerState::tlocal()->ShouldDenyOnOOM())
         return reject(kOutOfMemory);
       if (async_set) {
-        if (auto write = raft_data_commands_->TrySet(cntx->db_index(), args[0], args[1])) {
+        const size_t before = cmd->UsedMemory();
+
+        // Direct dispatch may supply external views instead of the parsed command's storage.
+        auto owns_arg = [&](size_t i) {
+          auto stored = (*cmd)[i + 1];
+          return stored.data() == args[i].data() && stored.size() == args[i].size();
+        };
+        auto write = cmd->size() == 3 && owns_arg(0) && owns_arg(1)
+                         ? raft_data_commands_->TrySetOwned(cntx->db_index(), cmd)
+                         : raft_data_commands_->TrySet(cntx->db_index(), args[0], args[1]);
+        if (write) {
+          const size_t after = cmd->UsedMemory();
+          if (before != after && cmd->conn())
+            cmd->conn()->AdjustParsedCmdBytes(ssize_t(after) - ssize_t(before));
+
+          // Consumed arguments belong to the write, which can outlive this reply context.
+          if (cmd->empty())
+            cmd->SetTailArgs({});
           ReplyRaftSet(cmd, std::move(write));
           return DispatchResult::OK;
         }

@@ -453,7 +453,14 @@ class RaftPipelineTest(RaftDataGroupFixture):
 
         for disconnect in (False, True):
             before = self.wait_for(view)
-            commands = [("SET", key, f"{disconnect}-{i}".encode()) for i in range(64)]
+            commands = [
+                (
+                    "SET",
+                    key,
+                    f"{disconnect}-{i}".encode() + (bytes([i]) * 32768 if disconnect else b""),
+                )
+                for i in range(64)
+            ]
             self.proc[follower].send_signal(signal.SIGSTOP)
             try:
                 connection = client.connection
@@ -478,6 +485,42 @@ class RaftPipelineTest(RaftDataGroupFixture):
                 self.assertEqual(client.wait(1, 2500), 1)
             with self.client(leader) as reader:
                 self.wait_for(lambda: reader.get(key) == commands[-1][2])
+
+    def test_released_pipeline_inputs_keep_admission_budget(self):
+        client, key, leader, follower = self.writer()
+        self.assertTrue(client.set(key, b"initial"))
+        self.assertEqual(client.wait(1, 2500), 1)
+        view = lambda: describe(self.raft[leader], b"__dragonfly_data", 10)
+        before = self.wait_for(view)
+        value = bytes(range(256)) * 1024
+        limit = (8 << 20) // (len(key) + len(value))
+        commands = [("SET", key, value) for _ in range(64)]
+        connection = client.connection
+
+        # Appended input can be freed while confirmation is blocked. Its byte reservation must
+        # still prevent more than 8 MiB of unacknowledged writes, even after the drainer is idle.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            self.proc[follower].send_signal(signal.SIGSTOP)
+            try:
+                sent = pool.submit(
+                    connection.send_packed_command, connection.pack_commands(commands)
+                )
+                after = self.wait_for(
+                    lambda: (current := view())
+                    and current.voters[leader] >= before.voters[leader] + limit
+                    and current,
+                    timeout=2.5,
+                    poll_interval=0.01,
+                )
+                self.assertEqual(after.voters[leader], before.voters[leader] + limit)
+                self.assertEqual(after.hw, before.hw)
+                self.assertFalse(connection.can_read(timeout=0))
+            finally:
+                self.proc[follower].send_signal(signal.SIGCONT)
+            sent.result(timeout=10)
+        self.assertEqual([connection.read_response() for _ in commands], [b"OK"] * len(commands))
+        self.assertEqual(client.wait(1, 2500), 1)
+        self.assertEqual(client.get(key), value)
 
     def test_shutdown_drains_pending_pipeline_without_false_success(self):
         client, key, leader, follower = self.writer()
@@ -521,7 +564,7 @@ class RaftPipelineTest(RaftDataGroupFixture):
         commands = []
         expected = []
         values = {}
-        for count, size in ((300, 16), (48, 256 * 1024), (1, 5 * 1024 * 1024)):
+        for count, size in ((1, 0), (300, 16), (48, 256 * 1024), (1, 5 * 1024 * 1024)):
             for i in range(count):
                 name = tag + f"{size}-{i}".encode()
                 value = bytes([i % 256]) * size
