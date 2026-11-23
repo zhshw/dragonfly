@@ -76,8 +76,8 @@ def prepare(build, work, faults=False, drain_mib=None, fetch_mib=None, phases=Fa
             replacements.append(
                 (
                     "data_node.cc",
-                    r"const size_t max_batch_bytes =[^;]+;",
-                    f"const size_t max_batch_bytes = {drain_mib}U << 20;",
+                    r"batch.byte_budget =[^;]+;",
+                    f"batch.byte_budget = {drain_mib}U << 20;",
                 )
             )
         if fetch_mib is not None:

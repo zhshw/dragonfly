@@ -204,6 +204,62 @@ TEST_F(PartitionLogTest, AsyncSlowPathsKeepSynchronousOrdering) {
   EXPECT_TRUE(io.requests.empty());
 }
 
+TEST_F(PartitionLogTest, SegmentPrefixSharesBarriersAndPublishesOnlyItsTail) {
+  auto first = MakeDataBatch(0, 3, 1, values_).value();
+  auto second = MakeDataBatch(2, 3, 1, values_).value();
+  auto third = MakeDataBatch(4, 3, 1, values_).value();
+  auto fourth = MakeDataBatch(6, 3, 1, values_).value();
+  const size_t capacity = first.size() + second.size() + third.size();
+  log_.reset();
+  Open(capacity);
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  EXPECT_TRUE(log_->FitsActiveSegment(second.size() + third.size(), 6));
+  EXPECT_FALSE(log_->FitsActiveSegment(second.size() + third.size() + 1, 6));
+  EXPECT_FALSE(log_->FitsActiveSegment(1, int64_t{INT32_MAX} + 1));
+  test::ControlledIO io;
+  bool completed = false;
+  ASSERT_TRUE(log_->TryAppendAsync(
+                      second + third, 3, io.Submitter(), [](size_t) {},
+                      [&](absl::Status status) {
+                        EXPECT_TRUE(status.ok());
+                        completed = true;
+                      })
+                  .value());
+  EXPECT_FALSE(log_->FitsActiveSegment(1, 6));
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().bytes, second + third);
+  io.Complete();
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+
+  // The entire prefix shares one segment fsync and one marker fsync.
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().offset, -1);
+  io.Complete();
+  EXPECT_FALSE(completed);
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().offset, -1);
+  io.Complete();
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(io.requests.empty());
+  EXPECT_EQ(log_->End(), (LogPosition{3, 6}));
+  EXPECT_EQ(fs::file_size(Segment()), capacity);
+
+  // A full segment cannot admit even the first batch; the next round must roll and progress.
+  EXPECT_FALSE(log_->FitsActiveSegment(fourth.size(), 8));
+  EXPECT_FALSE(
+      log_->TryAppendAsync(
+              fourth, 3, io.Submitter(), [](size_t) {}, [](absl::Status) { ADD_FAILURE(); })
+          .value());
+  ASSERT_TRUE(log_->Append(fourth, 3).ok());
+  EXPECT_EQ(fs::file_size(dir_ / "00000000000000000006.log"), fourth.size());
+  log_.reset();
+  Open(capacity);
+  EXPECT_EQ(log_->End(), (LogPosition{3, 8}));
+  EXPECT_EQ(log_->Read(0, 6, SIZE_MAX).value(), first + second + third);
+  EXPECT_EQ(log_->Read(6, 8, SIZE_MAX).value(), fourth);
+}
+
 TEST_F(PartitionLogTest, ReadAppendRecoverAndEpochLookup) {
   ASSERT_EQ(log_->End(), (LogPosition{0, 0}));
   EXPECT_FALSE(PartitionLog::Open(dir_).ok());

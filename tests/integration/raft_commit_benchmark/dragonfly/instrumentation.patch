@@ -36,8 +36,8 @@
 +      .substr(i * commit_benchmark::kPayload, commit_benchmark::kPayload);
 +}
 
- class DataNodeImpl final : public DataNode {
-  public:
+ struct AsyncPendingSet final : PendingDataWrite {
+   AsyncPendingSet(shared_ptr<LocalPartition> local, DbIndex db, string_view key, string_view value,
 @@ -259,10 +271,34 @@
        voters.emplace(member, *ep);
      }
@@ -139,9 +139,9 @@
 +      return status;
 +    return true;
 +  }
-   PendingSet proposal{db, slot, key, value, condition};
-   const auto deadline = steady_clock::now() + seconds(5);
-   if (absl::GetFlag(FLAGS_raft_drain_writes)) {
+   auto epoch = local->raft->LeaderEpoch();
+   if (!epoch) {
+     return local->raft->Visit([&](RaftGroup::State) {
 --- a/fetch_replication.cc
 +++ b/fetch_replication.cc
 @@ -9,6 +9,7 @@

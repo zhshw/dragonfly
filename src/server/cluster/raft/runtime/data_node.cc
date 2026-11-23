@@ -30,7 +30,7 @@
 #include "util/fibers/pool.h"
 #include "util/fibers/synchronization.h"
 
-ABSL_FLAG(bool, raft_drain_writes, false,
+ABSL_FLAG(bool, raft_drain_writes, true,
           "Drain ready ordinary SETs with bounded queue backpressure");
 ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_bytes);
 ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_interval_ms);
@@ -60,6 +60,7 @@ struct PendingSet {
   string_view key;
   string_view value;
   optional<SetCondition> condition;
+  int32_t epoch;
   absl::Status status{};
   bool stored = true;
   optional<SetEffect> effect{};
@@ -71,6 +72,7 @@ struct PendingSet {
 struct SetBatch {
   vector<PendingSet*> requests;
   size_t value_bytes = 0;
+  size_t byte_budget = SIZE_MAX;
   absl::Status status;
   fb2::EmbeddedBlockingCounter appended{1};
 };
@@ -113,11 +115,11 @@ struct LocalPartition {
 };
 
 struct AsyncPendingSet final : PendingDataWrite {
-  AsyncPendingSet(shared_ptr<LocalPartition> local, DbIndex db, string_view key, string_view value)
-      : local(std::move(local)),
-        key(key),
-        value(value),
-        proposal{db, KeySlot(key), this->key, this->value, nullopt} {
+  AsyncPendingSet(shared_ptr<LocalPartition> local, DbIndex db, string_view key, string_view value,
+                  int32_t epoch)
+      : local(std::move(local)), key(key), value(value), proposal{db,        KeySlot(key),
+                                                                  this->key, this->value,
+                                                                  nullopt,   epoch} {
   }
 
   ~AsyncPendingSet() override {
@@ -527,7 +529,10 @@ shared_ptr<PendingDataWrite> DataNodeImpl::TrySet(DbIndex db, string_view key, s
                                   bytes > kQueueBytes - min(kQueueBytes, local->queued_bytes))))
     return nullptr;
 
-  auto request = make_shared<AsyncPendingSet>(local, db, key, value);
+  auto epoch = local->raft->LeaderEpoch();
+  if (!epoch)
+    return nullptr;
+  auto request = make_shared<AsyncPendingSet>(local, db, key, value, *epoch);
   local->async_bytes.fetch_add(bytes);
   local->async_requests.fetch_add(1);
   local->ready_sets.push_back(&request->proposal);
@@ -580,7 +585,14 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
     return Route(slot, nullptr).status();
   }
 
-  PendingSet proposal{db, slot, key, value, condition};
+  auto epoch = local->raft->LeaderEpoch();
+  if (!epoch) {
+    return local->raft->Visit([&](RaftGroup::State) {
+      auto route = Route(slot, local.get());
+      return route.ok() ? ClusterDown() : route.status();
+    });
+  }
+  PendingSet proposal{db, slot, key, value, condition, *epoch};
   const auto deadline = steady_clock::now() + seconds(5);
   if (absl::GetFlag(FLAGS_raft_drain_writes)) {
     if (auto status = QueueSet(local, &proposal); !status.ok()) {
@@ -599,7 +611,8 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
       const size_t size = key.size() + value.size();
       lock_guard lock(local->batch_mu);
       batch = local->open_batch;
-      dispatch = !batch || condition || batch->requests.size() >= kMaxGroupRequests ||
+      dispatch = !batch || condition || batch->requests.back()->epoch != *epoch ||
+                 batch->requests.size() >= kMaxGroupRequests ||
                  batch->value_bytes + size > kMaxGroupPayload;
       if (dispatch) {
         batch = make_shared<SetBatch>();
@@ -670,6 +683,8 @@ absl::Status DataNodeImpl::QueueSet(shared_ptr<LocalPartition> local, PendingSet
       lock_guard lock(local->batch_mu);
       if (stopping_)
         return ClusterDown();
+      if (local->raft->LeaderEpoch() != request->epoch)
+        return ClusterDown();
 
       // One oversized request is admitted alone, so a legal large SET cannot starve.
       if (local->queued_requests == 0 ||
@@ -701,13 +716,13 @@ void DataNodeImpl::DrainSets(shared_ptr<LocalPartition> local) {
             lock_guard lock(local->batch_mu);
 
             // Amortize barriers under backlog without enlarging sparse client batches.
-            const size_t max_batch_bytes =
-                local->queued_bytes >= (4U << 20) ? (4U << 20) : (1U << 20);
+            batch.byte_budget = local->queued_bytes >= (4U << 20) ? (4U << 20) : (1U << 20);
             while (!local->ready_sets.empty() && batch.requests.size() < 32) {
               auto* next = local->ready_sets.front();
               const size_t bytes = next->key.size() + next->value.size();
               if (!batch.requests.empty() &&
-                  (next->condition || batch.value_bytes + bytes > max_batch_bytes))
+                  (next->condition || next->epoch != batch.requests.front()->epoch ||
+                   batch.value_bytes + bytes > batch.byte_budget))
                 break;
               batch.requests.push_back(next);
               batch.value_bytes += bytes;
@@ -761,13 +776,14 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
   const auto timestamp =
       duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
   string records;
-  for (auto* request : batch.requests) {
+  for (size_t i = 0; i < batch.requests.size(); ++i) {
+    auto* request = batch.requests[i];
     auto route = Route(request->slot, &local);
     if (!route.ok()) {
       request->status = route.status();
       continue;
     }
-    if (stopping_ || election.role != QuorumRole::kLeader || !hw ||
+    if (stopping_ || election.role != QuorumRole::kLeader || request->epoch != epoch || !hw ||
         local.effects.applied_offset() < *hw) {
       request->status = ClusterDown();
       continue;
@@ -796,6 +812,21 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
     if (!encoded.ok()) {
       request->status = encoded.status();
       continue;
+    }
+
+    // Drain only the contiguous prefix fitting this segment and the encoded-byte budget.
+    // If even the first valid request does not fit, append it alone through the rollover path.
+    if (batch.byte_budget != SIZE_MAX && !records.empty() &&
+        (encoded->size() > batch.byte_budget - min(batch.byte_budget, records.size()) ||
+         !state.log.FitsActiveSegment(records.size() + encoded->size(), offset + 1))) {
+      lock_guard lock(local.batch_mu);
+      for (size_t j = batch.requests.size(); j > i; --j) {
+        auto* deferred = batch.requests[j - 1];
+        local.ready_sets.push_front(deferred);
+        batch.value_bytes -= deferred->key.size() + deferred->value.size();
+      }
+      batch.requests.resize(i);
+      break;
     }
     request->effect = std::move(effect);
     request->encoded_bytes = encoded->size();

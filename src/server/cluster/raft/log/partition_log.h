@@ -52,6 +52,10 @@ class PartitionLog {
   LogPosition End() const;
   LogPosition EndForEpoch(int32_t requested_epoch) const;
 
+  // Check an encoded append against the active segment's byte and relative-offset limits.
+  // Call on the group worker after the previous append has completed.
+  bool FitsActiveSegment(size_t bytes, int64_t end_offset) const;
+
   // Leader appends contain whole batches of this epoch; follower appends may include
   // earlier epochs and a partial trailing batch from Fetch.
   // For an all-data append, notify after the complete write and before its durability barrier.

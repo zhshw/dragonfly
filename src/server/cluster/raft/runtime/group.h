@@ -10,6 +10,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 #include "server/cluster/raft/bootstrap/raft_directory.h"
 #include "server/cluster/raft/config/quorum_config.h"
@@ -49,6 +50,9 @@ class RaftGroup {
   void Join();
   protocol::RpcHandlers Handlers();
   absl::Status Visit(Operation operation);
+
+  // Nonblocking admission snapshot. The worker must revalidate it before appending.
+  std::optional<int32_t> LeaderEpoch() const;
 
   // Run on the disk worker and recheck after a commit or leadership change until done.
   // Only the calling fiber parks. The operation may use a ticket to track an earlier append.

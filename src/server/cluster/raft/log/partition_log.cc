@@ -271,6 +271,12 @@ absl::Status PartitionLog::AppendAsFollower(string_view batches, int32_t epoch) 
   return AppendBatches(batches, epoch, true, nullopt);
 }
 
+bool PartitionLog::FitsActiveSegment(size_t bytes, int64_t end_offset) const {
+  return !pending_ && static_cast<uint64_t>(active_bytes_) <= segment_bytes_ &&
+         bytes <= segment_bytes_ - active_bytes_ && end_offset >= active_base_ &&
+         end_offset - active_base_ <= INT32_MAX;
+}
+
 absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool follower,
                                          optional<DataWritten> written) {
   if (!io_failure_.ok())
@@ -309,8 +315,7 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
   if (pending.empty())
     return absl::InvalidArgumentError("No complete batch to append");
   const size_t length = bytes.size() - remaining.size();
-  if (active_bytes_ > 0 && (static_cast<uint64_t>(active_bytes_) + length > segment_bytes_ ||
-                            end.end_offset - active_base_ > INT32_MAX)) {
+  if (active_bytes_ > 0 && !FitsActiveSegment(length, end.end_offset)) {
     auto status = SetActive(End().end_offset, O_CREAT | O_EXCL);
     if (!status.ok())
       return io_failure_ = status;
@@ -371,7 +376,7 @@ absl::StatusOr<bool> PartitionLog::TryAppendAsync(string_view bytes, int32_t epo
   }
 
   // Segment creation and checkpoint replacement retain their synchronous directory barriers.
-  if (static_cast<uint64_t>(pos) > segment_bytes_ || end.end_offset - active_base_ > INT32_MAX)
+  if (!FitsActiveSegment(bytes.size(), end.end_offset))
     return false;
   auto publication = marker_.PrepareAppend({start_, active_base_, pos, end.end_offset});
   if (!publication.ok())

@@ -6,8 +6,8 @@
        duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 +  raft_io_trace::Record("encode_begin", -1, epoch, offset, local.id);
    string records;
-   for (auto* request : batch.requests) {
-     auto route = Route(request->slot, &local);
+   for (size_t i = 0; i < batch.requests.size(); ++i) {
+     auto* request = batch.requests[i];
 @@ -717,6 +718,7 @@
    *done = true;
    if (records.empty())

@@ -30,7 +30,8 @@
 #include "util/fibers/uring_proactor.h"
 #endif
 
-ABSL_FLAG(bool, raft_async_io, false, "Use asynchronous io_uring for data quorum appends");
+ABSL_FLAG(bool, raft_async_io, true, "Use asynchronous io_uring for data quorum appends");
+ABSL_FLAG(uint32_t, raft_data_segment_bytes, 1U << 30, "Data quorum log segment size in bytes");
 
 namespace dfly::cluster::raft {
 namespace {
@@ -165,6 +166,11 @@ class RaftGroup::Impl {
   }
 
   RpcHandlers Handlers();
+  optional<int32_t> LeaderEpoch() const {
+    const int32_t epoch = leader_epoch_.load(memory_order_acquire);
+    return epoch < 0 || stopping_ ? nullopt : optional<int32_t>{epoch};
+  }
+
   absl::Status Visit(Operation operation) {
     return RunOnWorker([&] {
       Tick();
@@ -215,6 +221,11 @@ class RaftGroup::Impl {
   }
 
   template <typename Commit> void NotifyProgress(const Commit& before, LogPosition end) {
+    const auto& state = campaign_.state();
+    const int32_t leader_epoch =
+        !failed_ && state.role == QuorumRole::kLeader ? state.election.epoch : -1;
+    if (leader_epoch_.load(memory_order_relaxed) != leader_epoch)
+      leader_epoch_.store(leader_epoch, memory_order_release);
     if (CommitState() != before) {
       commit_changed_.notifyAll();
       fetch_changed_.notifyAll();
@@ -613,6 +624,7 @@ class RaftGroup::Impl {
   QuorumRole role_ = QuorumRole::kUnattached;
   int32_t epoch_ = -1;
   bool failed_ = false;
+  atomic<int32_t> leader_epoch_{-1};
   map<int32_t, EpochNotification> notifications_;
   atomic_bool stopping_{false};
   fb2::Fiber supervisor_;
@@ -791,7 +803,8 @@ absl::StatusOr<unique_ptr<RaftGroup>> RaftGroup::Open(const filesystem::path& di
   }
   const string topic = kind == Kind::kMetadata ? kMetadataTopic : kDataTopic;
   auto group_dir = dir / (topic + "-" + to_string(partition));
-  auto log = PartitionLog::Open(group_dir);
+  auto log = PartitionLog::Open(
+      group_dir, kind == Kind::kData ? absl::GetFlag(FLAGS_raft_data_segment_bytes) : 1U << 30);
   if (!log.ok())
     return log.status();
   VoteTarget target{
@@ -816,6 +829,10 @@ RpcHandlers RaftGroup::Handlers() {
 }
 absl::Status RaftGroup::Visit(Operation operation) {
   return impl_->Visit(operation);
+}
+
+optional<int32_t> RaftGroup::LeaderEpoch() const {
+  return impl_->LeaderEpoch();
 }
 
 absl::Status RaftGroup::VisitUntil(steady_clock::time_point deadline,

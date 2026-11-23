@@ -290,9 +290,10 @@ class RaftDataGroupTest(RaftDataGroupFixture):
             timeout=5,
         )
         self.assertEqual(cli.stdout, b"\x00left\n")
-        with self.assertRaises(redis.exceptions.ResponseError) as moved:
-            self.client(leader_b).set(key_a, b"wrong-owner")
-        self.assertIn(f"{HOST}:{self.resp[leader_a]}", str(moved.exception))
+        for node in (leader_b, follower_a):
+            with self.assertRaises(redis.exceptions.ResponseError) as moved:
+                self.client(node).set(key_a, b"wrong-owner")
+            self.assertIn(f"{HOST}:{self.resp[leader_a]}", str(moved.exception))
 
         # No data group can borrow a controller vote or a vote from the other data group.
         self.stop(follower_a, crash=True)
@@ -409,7 +410,11 @@ class RaftDataGroupTest(RaftDataGroupFixture):
 
 class RaftPipelineTest(RaftDataGroupFixture):
     data_threads = 4
-    data_flags = ("--raft_async_io=true", "--raft_drain_writes=true")
+    segment_bytes = (1 << 20) + (128 << 10)
+    data_flags = (f"--raft_data_segment_bytes={segment_bytes}",)
+
+    # Keep rolled segments until the assertions; snapshot reclamation has separate coverage.
+    snapshot_bytes = {node: 64 << 20 for members in GROUPS.values() for node in members}
 
     def writer(self):
         slots = self.wait_for(self.slots)
@@ -501,13 +506,21 @@ class RaftPipelineTest(RaftDataGroupFixture):
         commands = []
         expected = []
         values = {}
-        for count, size in ((300, 16), (48, 256 * 1024)):
+        for count, size in ((300, 16), (48, 256 * 1024), (1, 5 * 1024 * 1024)):
             for i in range(count):
                 name = tag + f"{size}-{i}".encode()
                 value = bytes([i % 256]) * size
                 values[name] = value
                 commands.append(("SET", name, value))
                 expected.append(b"OK")
+
+        # Requeued suffixes must remain ahead of later writes, including across segment rolls.
+        for i in range(12):
+            last = bytes([i]) * (256 * 1024)
+            commands.append(("SET", key, last))
+            expected.append(b"OK")
+        commands.append(("GET", key))
+        expected.append(last)
         commands.extend(
             [
                 ("SET", key, b"first"),
@@ -558,6 +571,21 @@ class RaftPipelineTest(RaftDataGroupFixture):
                 replies.append(("error", str(error)))
         self.assertEqual(replies, expected)
         values[key] = b"conditional"
+
+        # Exercise the default async/drain flags and prove that a ready batch does not roll
+        # prematurely when its first encoded SET still fits in the current leader segment.
+        segments = sorted((self.root / str(leader) / "__dragonfly_data-10").glob("*.log"))
+        self.assertGreater(len(segments), 2)
+        for previous, following in zip(segments, segments[1:]):
+            with following.open("rb") as log:
+                header = log.read(12)
+            self.assertEqual(len(header), 12)
+            next_batch_bytes = 12 + int.from_bytes(header[8:12], "big")
+            if previous.stat().st_size > self.segment_bytes:
+                with previous.open("rb") as log:
+                    header = log.read(12)
+                self.assertEqual(previous.stat().st_size, 12 + int.from_bytes(header[8:12], "big"))
+            self.assertGreater(previous.stat().st_size + next_batch_bytes, self.segment_bytes)
 
         # Confirmed replies remain recoverable after both data voters are killed.
         for node in GROUPS[10]:
