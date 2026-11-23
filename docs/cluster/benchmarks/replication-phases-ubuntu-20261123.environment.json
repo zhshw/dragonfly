@@ -1,9 +1,0 @@
-{
-  "binary":
-      "/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-replication-phases-20261123/probe/dragonfly",
-  "sha256": "50a827a974abf0fa0f5bc66325bba11f1f87cee44472d8c21b4128c0c8df77c3",
-  "flags": "--raft_async_io=true --raft_drain_writes=true",
-  "instrumented": true,
-  "mount": "/dev/nvme0n1p4 ext4 rw,relatime",
-  "phases": "phase_trace.patch; fsync issue-to-completion includes scheduling"
-}

@@ -38,3 +38,9 @@ _codeql_build_dir/
 /.cocoindex_code/
 tools/ci_test_dashboard/site/data/**/*.json
 tools/ci_test_dashboard/tmp
+
+# Local Raft/cluster benchmark results; keep experiment source patches tracked.
+/docs/cluster/benchmarks/*
+!/docs/cluster/benchmarks/*.patch
+/docs/cluster/replication-benchmark.csv
+/docs/cluster/raft-log-timings.csv

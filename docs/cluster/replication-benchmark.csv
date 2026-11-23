@@ -1,4 +1,0 @@
-run_order,trial,implementation,mode,clients,payload_mib,keys,settle_seconds,warmup_writes,readback_node,write_ms,mib_per_s,first_set_p50_ms,set_p50_ms,set_p95_ms,set_max_ms,restart_to_wait_two_ms
-1,1,async,yes,1,64,256,5.0,32,13,426.5,150.06,1.71,1.58,2.67,6.12,315.7
-6,2,async,yes,1,64,256,5.0,32,13,421.89,151.7,1.39,1.6,2.71,4.02,307.73
-8,3,async,yes,1,64,256,5.0,32,13,402.95,158.83,4.8,1.54,2.44,4.8,309.24

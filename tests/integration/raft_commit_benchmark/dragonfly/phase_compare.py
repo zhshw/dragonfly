@@ -140,7 +140,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--clients", type=int, nargs="+", default=[1, 8, 64])
+    parser.add_argument("--clients", type=int, nargs="+", default=[1, 2, 8])
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--mib", type=int, default=256)
     args = parser.parse_args()

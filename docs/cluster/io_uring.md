@@ -2,18 +2,35 @@
 
 **先验证 leader 等磁盘时能否继续处理 Fetch，让 follower 提前开始落盘。** 这个改动有机会缩短单笔写入从追加到多数提交的时间。并发写入还有另一项收益可测：让同一轮已经就绪的多个批次共享刷盘。两项试验都沿用现有 Kafka 日志批、DFE4 恢复标记和 Fetch 协议。
 
-## 试验实现（默认关闭）
+## 当前实现（默认开启）
 
-Linux 数据组现在提供两个独立开关，便于用同一个二进制比较：
+`raft_async_io`、`raft_drain_writes` 默认均为 `true`；可分别显式设为 `false`。
+Linux 数据组使用异步文件 I/O，Folly / Helio 仍由编译宏选择；非 Linux 保留同步文件追加。
 
 | 开关 | 行为 |
 | --- | --- |
 | `--raft_async_io` | 同段、DFE4 标记窗口内的普通数据追加使用 io_uring，编译时选择 Helio 或 Folly 实现。WRITE、段 FSYNC、标记 FSYNC 分别检查完成结果，短写补写，两个 FSYNC 均使用 `flags=0`。网络仍可使用 epoll。 |
-| `--raft_drain_writes` | worker 可接受下一轮追加时，从就绪 SET 队列取最多 32 笔；积压不足 4 MiB 时每轮约 1 MiB，达到 4 MiB 时每轮约 4 MiB，不主动等满。条件 SET 单独执行；RESP V2 的普通 SET 可按序提前提交，见下节。队列最多 256 笔、8 MiB，满时让提交 fiber 等待；单笔超过字节预算的合法请求仅在队列为空时进入。 |
+| `--raft_drain_writes` | worker 可接受下一轮追加时，从同组同任期就绪 SET 队列取最多 32 笔。按键值积压选择 1/4 MiB 编码字节预算，只追加能装入当前段的连续前缀，不主动等满。条件 SET 单独执行；RESP V2 的普通 SET 可按序提前提交，见下节。队列最多 256 笔、8 MiB 键值，满时让提交 fiber 等待；单笔超过预算的合法请求仅在空队列进入，并单独追加。 |
 
 每组只有一轮追加在途。批次字节和文件描述符保留至完成；`End()` 始终返回已经完成两次同步的 LEO。已写全的尾部可响应新到达的合法 Fetch；follower 提前报告未在本地发布的位置时，该 RPC 等本地发布后重新校验。其他 worker 操作先等在途追加排空，因此换主、截断、快照安装和关闭不能复用正在写的文件。完成回调也核对 leader 角色和任期，失败则封锁存储确认。
 
-换段、超出 DFE4 窗口、控制批及 follower 追加继续走同步路径。drain 遇到不能装入当前段的一轮也回到同步换段路径。队列预算不含已经交给 I/O 的一轮及连接自身的请求缓冲。非 Linux 后端保留同步追加；本次未试验 SQE 链接、`fdatasync`、直接 I/O 或预分配。
+drain 按实际 Kafka 编码长度和段相对 offset 上限截取前缀，余下请求放回队首，继续占用排队预算。
+若首笔也放不下，单独走同步换段路径，下一轮再继续合批。数据段大小由
+`--raft_data_segment_bytes` 控制，默认 1 GiB；回归使用小段覆盖连续换段与恢复。
+超出 DFE4 窗口、控制批及 follower 追加继续走同步路径。队列预算不含已经交给 I/O 的一轮及连接自身的请求缓冲。
+本次未试验 SQE 链接、`fdatasync`、直接 I/O 或预分配。
+
+请求入队前读取非等待的 leader 任期快照，等待容量期间及追加前重新核对；旧任期排队请求
+返回错误，不改挂到新任期。不同任期请求不合成一批。追加完成后的多数持久化、leader 应用
+及按序回复要求不变。本文下方的历史性能表均来自这次段前缀、任期绑定及默认值调整之前，不能作为新版本的性能验收。
+
+本次在 `172.31.23.2` 的 Folly 构建上验证：Debug、Release、ASAN+UBSAN 的日志、Fetch、
+SET 应用、命令分发及 Folly I/O 五组单测通过，sanitizer 开启泄漏检查。段边界回归在三种
+构建下均通过，覆盖小段连续换段、后缀保留 FIFO、同 key 顺序、256 笔 / 8 MiB 窗口饱和、
+5 MiB 合法单笔、9 MiB 拒绝和崩溃读回。该用例将快照阈值设为 64 MiB，保留日志供边界断言。
+Release 的两副本、条件写、WAIT、断连、关闭排空、换主及快照恢复回归通过；Java 协议用例
+因缺少 classpath 跳过。显式关闭两个开关的条件写与 WAIT 回归也通过。
+二进制 `--helpfull` 确认两项默认值为 `true`；随后重跑的 1、2、8 连接 benchmark 见下节链接。
 
 ### 同连接 SET 提交与确认解耦（本轮）
 
@@ -34,15 +51,18 @@ V1 及关闭 drain 时保留串行行为；文件 I/O 仍使用原来的 Folly �
 真实集群断连、同 key、条件写、WAIT、DB 切换、窗口饱和、超限请求、崩溃恢复和关机
 回归通过；新增三个集群用例另在 ASAN+UBSAN（开启泄漏检查）下通过。
 
-未插桩旧/新 Release 和原 cluster 共 27 轮配对测试：单连接 pipeline 64 的复制确认吞吐
+历史未插桩旧/新 Release 和原 cluster 保留 18 轮单连接配对测试：单连接 pipeline 64 的复制确认吞吐
 中位数由 81.48 增至 163.75 MiB/s（2.01 倍），批次 P95 降低 49.4%。单连接逐笔吞吐
-回退 9.5%；64 连接 SET 返回窗口吞吐回退 7.6%，需继续减少提交与完成调度开销。
+回退 9.5%，需继续减少提交与完成调度开销。
 原 cluster 相同 pipeline 负载为 613.00 MiB/s。完整口径、范围、回退及数据见
 [复制 benchmark](replication-benchmark.md#本轮同连接-set-已能提前提交)。
 
-最新逐档 pipeline 64 实测见 [复制 benchmark](replication-benchmark.md#最新结论pipeline-64-逐档测试8-连接停止)：
-最新 Raft 在 1/2/4/8 连接下的副本确认吞吐为 166.75/178.51/189.51/186.90 MiB/s。
-4→8 无收益且批次 P95 增长，已停止更高连接数测试。当前只确认提前提交有效，
+最新实现的 1、2、8 连接重跑见 [复制 benchmark](replication-benchmark.md#latest-pipeline)，
+每连接 pipeline 64，比较改动前 Raft、当前 Raft 和原 cluster。27 轮全部通过；
+当前 Raft 相对已支持 pipeline 的改前版确认吞吐分别变化 +4.2% / −0.3% / +2.4%，
+8 连接 SET 窗口仅提高 0.2%，尚无稳定整体收益。原始数据仅保存在本地和测试机，不纳入 Git。
+历史样本中的 64 连接档位
+及对应结论已删除，pipeline 深度和预热笔数中的 64 保留。
 队首容量回退、票据释放、WAL 排空与应用等待的实际占比尚待 trace/火焰图分析。
 
 ### Folly 编译变体
@@ -74,7 +94,7 @@ ninja -C build-opt dragonfly raft_storage folly_io_test partition_log_test fetch
 ```bash
 python3 tests/integration/raft_commit_benchmark/dragonfly/library_compare.py \
   --helio-build /path/to/helio-build --folly-build /path/to/folly-build \
-  --output-dir "$PWD/folly-comparison"
+  --output-dir "$PWD/docs/cluster/benchmarks/folly-comparison"
 ```
 
 脚本固定 1 / 8 连接、64 MiB、32 笔预热、5 秒静置，两种实现都开启异步追加和 drain。各跑三轮，每轮交换先后顺序，保留二进制哈希、逐轮日志和 CSV；每轮都重启离线 voter 并核对全部 288 个值。故障探针也支持 Folly，`probe.py prepare --faults` 会单独插桩 `folly_io.cc`，不将测量及延迟代码编入正式二进制。
@@ -83,7 +103,7 @@ Folly + liburing 2.15 已通过 Debug / Release 的 37 项单测（新增 2 项�
 
 #### 同版 liburing 2.15 的实测对照
 
-在 `172.31.23.2` 的 i7-13700KF / WD_BLACK SN770 上运行上述脚本，日志实际位于 ext4；网络均为 epoll、每个数据节点 2 个网络线程。使用未插桩 Release 二进制，三票组停掉第三票后测量在线多数写入。共 12 轮，每轮恢复后均读回全部 288 个值。下表各列取三轮中位数；[逐轮 CSV](benchmarks/folly-io-uring-ubuntu-20261123.csv) · [环境、依赖版本及二进制哈希](benchmarks/folly-io-uring-ubuntu-20261123.environment.json)。
+在 `172.31.23.2` 的 i7-13700KF / WD_BLACK SN770 上运行上述脚本，日志实际位于 ext4；网络均为 epoll、每个数据节点 2 个网络线程。使用未插桩 Release 二进制，三票组停掉第三票后测量在线多数写入。共 12 轮，每轮恢复后均读回全部 288 个值。下表各列取三轮中位数；逐轮数据、环境及哈希仅保存在本地 `docs/cluster/benchmarks/folly-io-uring-ubuntu-20261123.*`。
 
 | 连接数 | io_uring 实现 | 写入耗时 ms | MiB/s | SET P50 ms | SET P95 ms | 重启至 WAIT 2 ms |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -94,7 +114,7 @@ Folly + liburing 2.15 已通过 Debug / Release 的 37 项单测（新增 2 项�
 
 Folly 单连接吞吐中位数提高 8.2%，P95 基本持平（增加 0.5%）；8 连接吞吐下降 2.2%，P95 增加 5.2%。三轮吞吐范围明显重叠：单连接 Helio / Folly 分别为 63.98–72.35 / 64.51–76.38 MiB/s，8 连接分别为 154.75–181.78 / 156.15–175.87 MiB/s。样本较少，尚不能判定 Folly 存在稳定的整体性能优势，`WITH_RAFT_FOLLY` 保持默认关闭。
 
-这是相同持久化协议下两种适配及其调度策略的整体对照，不能单独归因于库本身：例如本机 Helio 启用 DEFER_TASKRUN，而 Folly 保持默认关闭。吞吐以 64 MiB 客户端有效负载除以写入耗时；重启至 WAIT 2 包含进程启动、追赶和客户端轮询，不是纯磁盘恢复耗时。当前以在线副本确认完成为终点的对照见 [复制 benchmark](replication-benchmark.md#本轮同连接-set-已能提前提交)。完整日志和二进制保留在远端 `~/workspace/db/dragonfly-io-uring-20261123/results-folly/`。
+这是相同持久化协议下两种适配及其调度策略的整体对照，不能单独归因于库本身：例如本机 Helio 启用 DEFER_TASKRUN，而 Folly 保持默认关闭。吞吐以 64 MiB 客户端有效负载除以写入耗时；重启至 WAIT 2 包含进程启动、追赶和客户端轮询，不是纯磁盘恢复耗时。当前以在线副本确认完成为终点的对照见 [复制 benchmark](replication-benchmark.md#latest-pipeline)。完整日志和二进制保留在远端 `~/workspace/db/dragonfly-io-uring-20261123/results-folly/`。
 
 ### Folly 压测源码审查与后续试验
 
@@ -119,7 +139,7 @@ Folly 单连接吞吐中位数提高 8.2%，P95 基本持平（增加 0.5%）；
 
 | 顺序 | 试验 | 假设及验收重点 |
 | --- | --- | --- |
-| 1 | 扩大就绪 drain：1 → 4 → 8 MiB，仍最多 32 笔 | 不主动等满；观察每轮日志批数、两端同步次数、吞吐、P95 和 8 MiB 队列反压。保留单连接回归，并以 64 连接提供足够排队负载 |
+| 1 | 扩大就绪 drain：1 → 4 → 8 MiB，仍最多 32 笔 | 不主动等满；观察每轮日志批数、两端同步次数、吞吐、P95 和 8 MiB 队列反压。按 1、2、8 连接和每连接 pipeline 64 检查排队负载 |
 | 2 | 配对扩大 Fetch：1 → 4 → 8 MiB | 当前 `kMaxFetchBytes=1 MiB`，只扩大 leader 批次可能仍被 follower 分批同步限制。先测仅 drain，再测 drain+Fetch，区分贡献；核对 follower 提前取数、任期变化和恢复 |
 | 3 | Folly 同线程执行纯 I/O 依赖，减少 worker 往返 | 保留 worker 对可读尾部、任期和持久位置的所有权；独立测 CQE→下一次提交间隔，不能用更少通知掩盖 Fetch 发布延迟 |
 | 4 | 共享 payload / writev、缓冲复用 | 减少序列化后的重复复制与分配；校验短写、iovec 生命周期和内存峰值。连续大块写不必为了填 SQ 拆成许多小写 |
@@ -127,20 +147,20 @@ Folly 单连接吞吐中位数提高 8.2%，P95 基本持平（增加 0.5%）；
 | 6 | WAL `fallocate(FALLOC_FL_KEEP_SIZE)` | 提前分配块而不改变逻辑长度；单独比较新建/换段和稳态，计入预分配成本。保留 DFE4 长度编码，ext4 未写入 extent 转换和两次同步成本仍存在 |
 | 7 | DEFER_TASKRUN、固定缓冲/文件、SQPOLL | 分别对照吞吐、CPU、低负载延迟及关闭线程约束；固定缓冲/文件需要实际对应的操作 API，不能只改选项 |
 
-筛选阶段只调整测试二进制中的 drain / Fetch 常量，保留每组单轮追加模型及两次 FSYNC。使用 Folly + liburing 2.15、相同插桩、真实 ext4、256 KiB SET；比较 `(drain MiB, Fetch MiB)=(1,1),(4,1),(4,4),(8,8)`。每组固定 128 MiB、64 笔预热、5 秒静置，1/8/64 连接各三轮，轮换四种变体顺序。每轮重启离线 voter 并校验所有值，保存逐轮 CSV、源码变换、二进制哈希及 I/O trace。单连接每次仅一笔在途，预期无法展示合批收益；8 连接最多约 2 MiB 未完成负载，64 连接用于压力验证。测试超段或 DFE4 窗口时仍走原同步回退，因此统计实际同步次数，不按配置推算收益。
+筛选阶段只调整测试二进制中的 drain / Fetch 常量，保留每组单轮追加模型及两次 FSYNC。使用 Folly + liburing 2.15、相同插桩、真实 ext4、256 KiB SET；比较 `(drain MiB, Fetch MiB)=(1,1),(4,1),(4,4),(8,8)`。每组固定 128 MiB、64 笔预热、5 秒静置，保留 1/8 连接各三轮，轮换四种变体顺序。每轮重启离线 voter 并校验所有值，保存逐轮 CSV、源码变换、二进制哈希及 I/O trace。单连接每次仅一笔在途，预期无法展示合批收益；8 连接最多约 2 MiB 未完成负载。测试超段或 DFE4 窗口时仍走原同步回退，因此统计实际同步次数，不按配置推算收益。
 
 复现入口为 [drain_compare.py](../../tests/integration/raft_commit_benchmark/dragonfly/drain_compare.py)，要求 `build-opt` 已配置 Folly。`probe.py prepare --drain-mib N --fetch-mib N` 只改结果目录里的源码副本并重新链接，保存变换后的源码；仓库源码和正式二进制不受试验参数影响。
 
 ```bash
 python3 tests/integration/raft_commit_benchmark/dragonfly/drain_compare.py \
-  --build-dir build-opt --output-dir "$PWD/folly-drain-comparison"
+  --build-dir build-opt --output-dir "$PWD/docs/cluster/benchmarks/folly-drain-comparison"
 ```
 
-固定 4 MiB drain/Fetch 在 64 连接下改善吞吐及同步摊销，但 8 连接出现吞吐回退，因此实现改为积压驱动的 1/4 MiB drain：读取就绪队列字节数，达到 4 MiB 才扩大当轮预算。普通数据 Fetch 上限为 4 MiB，元数据和快照仍为 1 MiB。这个实现另用未插桩 Release 二进制对照原固定 1/1 MiB 版本，结果见下文；复测负载提高到 256 MiB，1/8/64 连接各三轮，64 笔预热，每轮完整恢复校验。此前各表均保留其原有版本与负载口径，不能视为本次改进后的数字。
+固定 4 MiB drain/Fetch 在 8 连接出现吞吐回退，当前使用积压驱动的 1/4 MiB drain：读取就绪队列字节数，达到 4 MiB 才扩大当轮预算。普通数据 Fetch 上限为 4 MiB，元数据和快照仍为 1 MiB。这个实现另用未插桩 Release 二进制对照原固定 1/1 MiB 版本，结果见下文；复测负载提高到 256 MiB，保留 1/8 连接各三轮，64 笔预热，每轮完整恢复校验。此前各表均保留其原有版本与负载口径，不能视为本次改进后的数字。
 
 #### 固定批次筛选结果（128 MiB，插桩）
 
-36 轮全部成功，每轮重启离线 voter 后读回 64 笔预热和 512 笔测量值。[逐轮 CSV](benchmarks/folly-drain-screening-ubuntu-20261123.csv) · [环境和二进制哈希](benchmarks/folly-drain-screening-ubuntu-20261123.environment.json)。每列取三轮中位数；leader/follower 批数列先计算该轮平均每次追加包含多少日志批，再取三轮中位数。同步列是两个在线节点在测量窗口内的段同步次数之和，同窗口标记同步次数相同。
+保留的 24 轮全部成功，每轮重启离线 voter 后读回 64 笔预热和 512 笔测量值。逐轮数据及哈希仅保存在本地 `docs/cluster/benchmarks/folly-drain-screening-ubuntu-20261123.*`。每列取三轮中位数；leader/follower 批数列先计算该轮平均每次追加包含多少日志批，再取三轮中位数。同步列是两个在线节点在测量窗口内的段同步次数之和，同窗口标记同步次数相同。
 
 | 连接数 | drain MiB | Fetch MiB | MiB/s | SET P95 ms | leader 平均批数 | follower 平均批数 | 段同步次数 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -152,18 +172,14 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/drain_compare.py \
 | 8 | 4 | 1 | 171.80 | 15.45 | 1.91 | 2.16 | 505 |
 | 8 | 4 | 4 | 169.21 | 15.63 | 2.02 | 2.32 | 474 |
 | 8 | 8 | 8 | 171.66 | 14.43 | 2.06 | 2.27 | 476 |
-| 64 | 1 | 1 | 206.64 | 123.06 | 2.98 | 2.99 | 343 |
-| 64 | 4 | 1 | 173.33 | 103.31 | 3.30 | 2.98 | 327 |
-| 64 | 4 | 4 | 240.46 | 92.64 | 10.67 | 14.22 | 85 |
-| 64 | 8 | 8 | 212.24 | 98.84 | 11.91 | 18.96 | 69 |
 
-64 连接的 4/4 MiB 相对 1/1 MiB 吞吐提高 16.4%，P95 下降 24.7%，同步次数减少 75.2%；仅扩大 drain 的 4/1 MiB 没有收益。8/8 MiB 同步更少却吞吐更低，说明最少同步次数不等于最低总成本。8 连接固定 4/4 MiB 吞吐下降 6.8%、P95 增加 10.8%，因此不直接把所有负载都切到固定大批次。单连接始终一笔在途，各组合表现接近。测量仍是短窗口，最终参数以未插桩复测为准。
+8 连接固定 4/4 MiB 吞吐下降 6.8%、P95 增加 10.8%，因此不直接把所有负载都切到固定大批次。单连接始终一笔在途，各组合表现接近。测量仍是短窗口，最终参数以未插桩复测为准。
 
-远端结果在 `results-folly/drain-comparison-validated/`，对应源码副本在 `results-folly/drain-comparison/*/probe/`。初次运行因 runner 漏传 `RAFT_COMMIT_BENCH_VALUES` 在集群初始化失败，修复后重新跑满 36 轮；失败运行没有进入测量，不计入本表。
+远端结果在 `results-folly/drain-comparison-validated/`，对应源码副本在 `results-folly/drain-comparison/*/probe/`。当前表及 CSV 只保留 1/8 连接的历史样本，未重新测量。
 
 #### 自适应合批复测
 
-两个未插桩 Release 二进制均使用 Folly / liburing 2.15，开启异步追加和 drain，确认语义相同。每轮 256 MiB（1024 × 256 KiB）、64 笔预热、5 秒静置；同一连接只有一笔 SET 在途。各负载三轮，原版与改进版交替先后顺序。18 轮全部通过恢复校验，每轮重启离线 voter 并读回 1088 个预热及测量值。[逐轮 CSV](benchmarks/folly-drain-adaptive-ubuntu-20261123.csv) · [环境及二进制哈希](benchmarks/folly-drain-adaptive-ubuntu-20261123.environment.json)。
+两个未插桩 Release 二进制均使用 Folly / liburing 2.15，开启异步追加和 drain，确认语义相同。每轮 256 MiB（1024 × 256 KiB）、64 笔预热、5 秒静置；同一连接只有一笔 SET 在途。各负载三轮，原版与改进版交替先后顺序。保留的 12 轮全部通过恢复校验，每轮重启离线 voter 并读回 1088 个预热及测量值。逐轮数据及哈希仅保存在本地 `docs/cluster/benchmarks/folly-drain-adaptive-ubuntu-20261123.*`。
 
 | 连接数 | 版本 | 写入耗时 ms | MiB/s | SET P50 ms | SET P95 ms | 重启至 WAIT 2 ms |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -171,20 +187,18 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/drain_compare.py \
 | 1 | 自适应 drain / 4 MiB Fetch | 3142.02 | 81.48 | 2.98 | 3.49 | 1106.00 |
 | 8 | 原固定 1/1 MiB | 1437.68 | 178.06 | 10.66 | 14.67 | 1405.91 |
 | 8 | 自适应 drain / 4 MiB Fetch | 1504.01 | 170.21 | 11.22 | 14.86 | 1204.43 |
-| 64 | 原固定 1/1 MiB | 1302.95 | 196.48 | 65.35 | 124.02 | 1414.37 |
-| 64 | 自适应 drain / 4 MiB Fetch | 1125.05 | 227.55 | 67.04 | 90.33 | 1314.38 |
 
-每列取三轮中位数。64 连接吞吐提高 **15.8%**、P95 下降 **27.2%**；三轮吞吐区间原版 189.49–202.03、改进版 226.67–231.88 MiB/s，区间不重叠。单连接吞吐提高 3.3%、P95 下降 4.9%，但改进版波动较大（76.00–85.82 MiB/s），不能把小幅变化归因于合批。8 连接吞吐下降 **4.4%**、P95 增加 1.3%，因此自适应策略也没有消除低并发代价，不能宣称所有负载都更快。恢复列包含启动和轮询，并同时受更大 Fetch 影响，不是纯刷盘延迟。异步追加及 drain 开关继续默认关闭。
+每列取三轮中位数。单连接吞吐提高 3.3%、P95 下降 4.9%，但改进版波动较大（76.00–85.82 MiB/s），不能把小幅变化归因于合批。8 连接吞吐下降 **4.4%**、P95 增加 1.3%，因此自适应策略也没有消除低并发代价，不能宣称所有负载都更快。恢复列包含启动和轮询，并同时受更大 Fetch 影响，不是纯刷盘延迟。当时异步追加及 drain 开关默认关闭；当前默认值见文首。
 
-实现改动已通过 Debug / Release 各 37 项日志、Fetch 和 Folly 适配单测；7 项真实集群回归覆盖条件写、WAIT、多数丢失、成员提升、换主、整集群崩溃恢复及快照追赶。额外插桩验证中，8 连接的 leader 最大追加为 786,762 字节，64 连接为 3,933,808 字节，确认大小批次分支实际生效；队列峰值分别为 2,097,228 和 8,126,826 字节，均不超过 8 MiB。每端 trace 都完整覆盖 512 笔测量写。延迟 leader 的段同步、标记同步及在途 I/O 关闭排空再次通过。插桩验证数据仅用于检查分支、反压及顺序，不混入上表。
+实现改动已通过 Debug / Release 各 37 项日志、Fetch 和 Folly 适配单测；7 项真实集群回归覆盖条件写、WAIT、多数丢失、成员提升、换主、整集群崩溃恢复及快照追赶。额外插桩验证保留的 8 连接记录中，leader 最大追加为 786,762 字节，队列峰值为 2,097,228 字节，未超过 8 MiB。每端 trace 都完整覆盖 512 笔测量写。延迟 leader 的段同步、标记同步及在途 I/O 关闭排空再次通过。插桩验证数据仅用于检查分支、反压及顺序，不混入上表。
 
 未插桩复测可使用以下命令；两个目录分别保留对应源码构建出的 `dragonfly` 和 `raft_storage`：
 
 ```bash
 python3 tests/integration/raft_commit_benchmark/dragonfly/library_compare.py \
   --baseline-build /path/to/original-build --candidate-build /path/to/adaptive-build \
-  --labels original adaptive --clients 64 8 1 --mib 256 --warmup 64 \
-  --output-dir "$PWD/folly-adaptive-comparison"
+  --labels original adaptive --clients 1 2 8 --mib 256 --warmup 64 \
+  --output-dir "$PWD/docs/cluster/benchmarks/folly-adaptive-comparison"
 ```
 
 远端证据位于 `results-folly/drain-adaptive-release-comparison/`、`drain-adaptive-validation/` 和 `drain-adaptive-integration.log`。本次只落地自适应 drain 和数据 Fetch 容量调整；同线程 I/O 衔接、减少复制、多批 WRITE 在途、共享执行器和 WAL 预分配仍为待验证尝试。
@@ -199,23 +213,23 @@ ninja -C build-opt dragonfly raft_storage partition_log_test fetch_replication_t
 ./build-opt/partition_log_test
 ./build-opt/fetch_replication_test
 python3 tests/integration/raft_commit_benchmark/dragonfly/probe.py prepare \
-  --build-dir build-opt --work-dir "$PWD/io-results"
-python3 tests/integration/raft_commit_benchmark/dragonfly/io_run.py "$PWD/io-results"
+  --build-dir build-opt --work-dir "$PWD/docs/cluster/benchmarks/io-results"
+python3 tests/integration/raft_commit_benchmark/dragonfly/io_run.py "$PWD/docs/cluster/benchmarks/io-results"
 ```
 
-runner 交替运行三组单笔追加探针、三组单连接客户端，以及三组 8 连接的同步 / 异步 / 异步加 drain 对比。每轮预热 32 笔，测量 256 笔 × 256 KiB，第三票离线，完成后重启并逐值核对 288 个值。`summary.json` 包含提交和客户端延迟、两端同步次数、每轮批数及队列峰值。`io-*/<pid>-<tid>.csv` 内存缓冲的时间戳在进程退出时写出；异步同步区间取准备 SQE 前至 CQE 回调，包含提交和内核排队时间，同步区间取 `fsync` 调用前后。
+runner 交替运行三组单笔追加探针、三组单连接客户端，以及三组 8 连接的异步 / 异步加 drain 对比。每轮预热 32 笔，测量 256 笔 × 256 KiB，第三票离线，完成后重启并逐值核对 288 个值。`summary.json` 包含提交和客户端延迟、两端同步次数、每轮批数及队列峰值。`io-*/<pid>-<tid>.csv` 内存缓冲的时间戳在进程退出时写出；异步同步区间取准备 SQE 前至 CQE 回调，包含提交和内核排队时间，同步区间取 `fsync` 调用前后。
 
 上述命令使用当前源码的合批策略；若要固定为下方历史结果的 1/1 MiB 参数，在 `probe.py prepare` 时显式加 `--drain-mib 1 --fetch-mib 1`。这只控制测试副本，不是服务端运行时参数。
 
 故障测试可用 `probe.py prepare --faults` 另建二进制，设置 `RAFT_IO_FAULT_DIR`、`RAFT_IO_TRACE_DIR`、`RAFT_COMMIT_BENCH_VALUES`、`DRAGONFLY_PATH` 和 `RAFT_TEST_DATA_FLAGS="--raft_async_io --raft_drain_writes"` 后运行 `io_fault_trial.py`。它分别延迟 leader 的段和标记同步，重启 follower 强制使用新 Fetch，验证 follower 已同步而客户端仍未收到 OK。单测另外覆盖短写、零进展、同步错误、任期改变后的完成事件，以及段同步后、标记选择后、标记同步后退出进程再恢复。进程崩溃测试不等同于设备掉电测试。
 
-本轮 35 项分区日志 / Fetch 单测在 Debug、Release 和 ASAN+UBSAN 下通过，另有 24 项快照、成员历史和 voter 变更回归通过。真实集群验证了两票组、条件写与 WAIT、整集群崩溃恢复、成员提升与换主、快照追赶、在线多数及失去多数。另以 64 连接验证 drain 反压和恢复读回，队列峰值 8,126,826 字节，未超过 8 MiB；带在途 I/O 的 SIGTERM 关闭会等待该轮完成后再退出。
+本轮 35 项分区日志 / Fetch 单测在 Debug、Release 和 ASAN+UBSAN 下通过，另有 24 项快照、成员历史和 voter 变更回归通过。真实集群验证了两票组、条件写与 WAIT、整集群崩溃恢复、成员提升与换主、快照追赶、在线多数及失去多数。带在途 I/O 的 SIGTERM 关闭会等待该轮完成后再退出。
 
 ## Ubuntu 26.04 NVMe 结果（2026-11-23）
 
-当前原 cluster 与 Folly 异步 Raft 的比较见 [复制确认完成 benchmark](replication-benchmark.md#本轮同连接-set-已能提前提交)。下面只保留历史 Helio 异步追加的独立插桩数据，用于分析 Fetch、刷盘重叠和 drain 摊销，不与当前客户端对照混算。同步 Raft 样本已删除。
+当前原 cluster 与 Folly 异步 Raft 的比较见 [复制确认完成 benchmark](replication-benchmark.md#latest-pipeline)。下面只保留历史 Helio 异步追加的独立插桩数据，用于分析 Fetch、刷盘重叠和 drain 摊销，不与当前客户端对照混算。同步 Raft 样本已删除。
 
-主机 `172.31.23.2`，i7-13700KF、Linux 7.0.0-43 x86_64、GCC 15.2 Release，WD_BLACK SN770 1TB，日志目录位于 `/dev/nvme0n1p4` 的 ext4。网络固定 epoll、数据节点 2 个网络线程。每项三轮交替运行，下表各列取三轮中位数；[逐轮结果 CSV](benchmarks/io-uring-ubuntu-20261123.csv)。最初的 `/tmp` 位于 tmpfs，相关调度诊断数字未计入下表。
+主机 `172.31.23.2`，i7-13700KF、Linux 7.0.0-43 x86_64、GCC 15.2 Release，WD_BLACK SN770 1TB，日志目录位于 `/dev/nvme0n1p4` 的 ext4。网络固定 epoll、数据节点 2 个网络线程。每项三轮交替运行，下表各列取三轮中位数；逐轮结果仅保存在本地 `docs/cluster/benchmarks/io-uring-ubuntu-20261123.csv`。最初的 `/tmp` 位于 tmpfs，相关调度诊断数字未计入下表。
 
 | 负载 / 模式 | P50 ms | P95 ms | MiB/s | 每千笔段同步 / 标记同步 |
 | --- | ---: | ---: | ---: | ---: |
@@ -228,7 +242,7 @@ runner 交替运行三组单笔追加探针、三组单连接客户端，以及�
 
 8 连接下，drain 相比仅启用异步，段和标记的同步次数各下降约 9%，吞吐提高约 6%；drain 排队字节峰值为 2,097,228。进程内探针与客户端测试的计时范围、应用成本和下一笔调度不同，不能把两者延迟直接相减。
 
-这说明新 Fetch 路径和 drain 在本机、该负载下有效，尚不足以作为所有设备默认开启的依据，两个开关保持关闭。没有测量设备掉电，也没有把 tmpfs 的结果外推到 NVMe。
+这些历史样本说明 Fetch 路径和 drain 在本机、该负载下有效，当时两个开关默认关闭；当前默认值见文首。没有测量设备掉电，也没有把 tmpfs 的结果外推到 NVMe。
 
 本轮原始 CSV、逐轮恢复日志、二进制及哈希位于远端 `~/workspace/db/dragonfly-io-uring-20261123/results-disk/`；延迟同步及关闭排空证据在 `results-faults/shutdown-trial.log`。原有远端 `~/workspace/db/dragonfly` 未改动。
 
@@ -248,7 +262,7 @@ runner 交替运行三组单笔追加探针、三组单连接客户端，以及�
 
 [Folly 文件 API 与顺序约定](../../../folly/folly/io/async/IoUringBackend.h#L144) · [Folly 回调派发](../../../folly/folly/io/async/IoUringBackend.cpp#L949) · [EventBase 共享](../../../folly/folly/io/async/IoUringEventBaseLocal.cpp) · [当前追加状态机](../../src/server/cluster/raft/log/partition_log.cc) · [当前缓冲区复制](../../src/server/cluster/raft/quorum/fetch_replication.cc)
 
-重新分析已有 `results-disk/client-1-async-{1,2,3}` 插桩 trace，各取正式计时窗口内数据组 10 的 256 笔异步追加，按节点、epoch、旧 LEO 关联相邻事件。下表各列为三轮分位数的中位数，共 768 笔；这次是复算已有数据，不是新的 Folly 性能测试。[逐轮分位数](benchmarks/io-uring-handoff-ubuntu-20261123.csv)
+重新分析已有 `results-disk/client-1-async-{1,2,3}` 插桩 trace，各取正式计时窗口内数据组 10 的 256 笔异步追加，按节点、epoch、旧 LEO 关联相邻事件。下表各列为三轮分位数的中位数，共 768 笔；这次是复算已有数据，不是新的 Folly 性能测试。逐轮分位数仅保存在本地 `docs/cluster/benchmarks/io-uring-handoff-ubuntu-20261123.csv`。
 
 | Leader 路径 | P50 µs | P95 µs |
 | --- | ---: | ---: |
@@ -297,9 +311,9 @@ sequenceDiagram
 
 ## 批量提交与 Group Commit
 
-Dragonfly 已有组提交。普通 SET 首笔立即派发，同组在 worker 摘取前到达的请求可以合并，当前上限为 32 笔，按积压自适应选择约 1/4 MiB 键值预算。每笔保留自己的 Kafka RecordBatch 和 offset，多批连续追加，共用一轮段同步和标记同步。条件 SET 单独等前序写入应用后再求值。KRaft 的 `maybeAppendBatches` 在一次 `drain()` 中取走就绪批次，逐批追加后统一调用 `log.flush(false)`。[Dragonfly 合批](../../src/server/cluster/raft/runtime/data_node.cc) · [KRaft drain 与 flush](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java#L3092)
+Dragonfly 已有组提交。普通 SET 首笔立即派发，同组同任期在 worker 摘取前到达的请求可以合并，当前上限为 32 笔，按键值积压自适应选择 1/4 MiB 编码字节预算。每笔保留自己的 Kafka RecordBatch 和 offset，多批连续追加，共用一轮段同步和标记同步。条件 SET 单独等前序写入应用后再求值。KRaft 的 `maybeAppendBatches` 在一次 `drain()` 中取走就绪批次，逐批追加后统一调用 `log.flush(false)`。[Dragonfly 合批](../../src/server/cluster/raft/runtime/data_node.cc) · [KRaft drain 与 flush](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java#L3092)
 
-可借用 KRaft 的做法：上一轮 I/O 在途时收集同组同任期的普通写；上一轮完成后，一次取走已经就绪、能装进当前段和预算的连续批次，写段并把标记发布到该轮末端。用笔数和字节数限制排队内存，达到上限时给提交者反压。空闲时立即发出首笔。单连接逐笔等 OK 时没有第二笔可合并，只有并发负载能检验每千笔刷盘次数是否下降。
+当前已实现：上一轮 I/O 在途时收集同组同任期的普通写；上一轮完成后，取走已经就绪、能装进当前段和编码预算的连续批次，写段并把标记发布到该轮末端。未装入的后缀仍在队首等待，首笔放不下时单独换段。用笔数和键值字节数限制排队内存，达到上限时给提交者反压。空闲时立即发出首笔。单连接逐笔等 OK 时没有第二笔可合并，只有并发负载能检验每千笔刷盘次数是否下降；本次实现尚未产生新的每千笔刷盘统计。
 
 任期和投票另存于 `quorum-state`，投票应答前要完成临时文件同步、原子替换和目录同步。第一版仅合并普通数据批；选举持久化、成员变更、条件写及换段继续遵循各自的顺序。[选举状态存储](../../src/server/cluster/raft/storage/file_quorum_state_store.cc) · [DFE4 恢复标记](raft-replication-design.md#日志恢复标记)
 
