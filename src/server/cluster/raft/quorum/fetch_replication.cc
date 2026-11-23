@@ -208,8 +208,15 @@ FetchReplication::ParkedFetch::Tail FetchReplication::CurrentFetchTail() const {
 
 absl::Status FetchReplication::Append(string batches, int32_t expected_epoch,
                                       bool* may_have_appended) {
+  return Append(make_shared<const string>(std::move(batches)), expected_epoch, may_have_appended);
+}
+
+absl::Status FetchReplication::Append(shared_ptr<const string> payload, int32_t expected_epoch,
+                                      bool* may_have_appended) {
   if (may_have_appended)
     *may_have_appended = false;
+  if (!payload)
+    return absl::InvalidArgumentError("Missing Raft append buffer");
   const auto& state = campaign_.state();
   if (auto s = StorageStatus(state); !s.ok())
     return s;
@@ -217,9 +224,7 @@ absl::Status FetchReplication::Append(string batches, int32_t expected_epoch,
       leader_epoch_ != expected_epoch)
     return absl::FailedPreconditionError(
         "Append requires an initialized leader of the specified epoch");
-  shared_ptr<const string> payload;
   if (async_io_) {
-    payload = make_shared<const string>(std::move(batches));
     auto pending = log_.TryAppendAsync(
         payload, expected_epoch, async_io_,
         [this, payload](size_t first) { PublishWritten(*payload, first); },
@@ -240,7 +245,7 @@ absl::Status FetchReplication::Append(string batches, int32_t expected_epoch,
       return absl::OkStatus();
     }
   }
-  const string_view bytes = payload ? string_view(*payload) : string_view(batches);
+  const string_view bytes(*payload);
   auto written = [&](size_t first_batch_size) {
     if (may_have_appended)
       *may_have_appended = true;
@@ -436,7 +441,7 @@ optional<OutboundFetch> FetchReplication::PrepareFetch(int32_t peer_id, int16_t 
 }
 
 absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
-                                                    const FetchResponse& response,
+                                                    FetchResponse response,
                                                     bool* reset_fetch_timeout) {
   if (reset_fetch_timeout)
     *reset_fetch_timeout = false;
@@ -457,7 +462,7 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
       response.responses.front().partitions.front().partition_index != campaign_.target().partition)
     return absl::InvalidArgumentError("Invalid Fetch topic or partition");
 
-  const auto& part = response.responses.front().partitions.front();
+  auto& part = response.responses.front().partitions.front();
   const auto leader = part.current_leader.leader_id;
   const auto epoch = part.current_leader.leader_epoch;
   if (epoch < state.election.epoch || part.error_code == kUnknownLeaderEpoch)
@@ -502,15 +507,25 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
       requested_snapshot_ = cut;
   } else {
     if (part.records.data && !part.records.data->empty()) {
+      shared_ptr<const string> buffer;
+      string_view bytes = *part.records.data;
+      if (fetched_records_) {
+        buffer = make_shared<const string>(std::move(*part.records.data));
+        bytes = *buffer;
+      }
+      vector<PartitionLog::ValidatedBatch> appended;
+
       // Kafka discards an invalid records payload and retries from the durable LEO.
-      auto status = log_.AppendAsFollower(*part.records.data, epoch);
+      auto status = log_.AppendAsFollower(bytes, epoch, fetched_records_ ? &appended : nullptr);
       if (!status.ok() && !log_.io_failure().ok())
         return DurableFailure(status);
       if (status.ok()) {
-        if (auto s = membership_.Appended(*part.records.data, log_.End().end_offset); !s.ok())
+        if (auto s = membership_.Appended(bytes, log_.End().end_offset); !s.ok())
           return DurableFailure(s);
         if (auto s = RefreshMembership(); !s.ok())
           return s;
+        if (fetched_records_)
+          fetched_records_(log_, buffer, appended);
       }
     }
     if (part.high_watermark >= 0)

@@ -60,14 +60,24 @@ def instrument(relative):
                 "    observed_rpc.Finish();",
             ),
             (
-                "      auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, response, &reset);",
+                "      auto s =\n"
+                "          replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response), &reset);",
                 '      dfly_observe::Scope observed_response("raft.fetch.receive", end.end_offset);\n'
-                "      auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, response, &reset);\n"
+                "      auto s =\n"
+                "          replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response), &reset);\n"
                 "      observed_response.Finish();",
             ),
         ]
     elif relative == RAFT + "runtime/data_node.cc":
         edits = [
+            (
+                "                replica->effects.RememberFetched(log, buffer, batches);",
+                '                dfly_observe::Scope observed_cache("raft.fetch.cache_prepare", batches.size());\n'
+                "                replica->effects.RememberFetched(log, buffer, batches);\n"
+                "                observed_cache.Finish();\n"
+                '                dfly_observe::Record("raft.fetch.cache_bytes", dfly_observe::Now(),\n'
+                "                                     replica->effects.cached_bytes(), buffer->capacity());",
+            ),
             (
                 "        // Re-enter once per bounded batch, preserving log order and the completed prefix.\n"
                 "        return owner_->Await([&] {",
@@ -97,9 +107,9 @@ def instrument(relative):
                 "  request->appended.Wait();",
             ),
             (
-                "  string records;\n  for (size_t i = 0; i < batch.requests.size(); ++i)",
+                "  size_t records_size = 0;\n  for (size_t i = 0; i < batch.requests.size(); ++i)",
                 '  dfly_observe::Scope observed_encode("raft.set.encode", batch.requests.size(), batch.value_bytes);\n'
-                "  string records;\n  for (size_t i = 0; i < batch.requests.size(); ++i)",
+                "  size_t records_size = 0;\n  for (size_t i = 0; i < batch.requests.size(); ++i)",
             ),
             (
                 "  bool may_have_appended = false;",
@@ -107,9 +117,20 @@ def instrument(relative):
                 '  dfly_observe::Scope observed_submit("raft.set.submit", batch.requests.size(), records.size());\n'
                 "  bool may_have_appended = false;",
             ),
+            (
+                "  return absl::OkStatus();\n}\n\nabsl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState()",
+                '  dfly_observe::Record("raft.set.cache_bytes", dfly_observe::Now(),\n'
+                "                       local.effects.cached_bytes(), buffer->capacity());\n"
+                "  return absl::OkStatus();\n}\n\nabsl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState()",
+            ),
         ]
     elif relative == RAFT + "data/set_effect.cc":
         edits = [
+            (
+                "      next = std::move(pending_.front());",
+                '      dfly_observe::Record("raft.apply.cache_hit", dfly_observe::Now(), next_offset);\n'
+                "      next = std::move(pending_.front());",
+            ),
             (
                 "      auto bytes = log.Read(next_offset, hw, 1, &base);",
                 '      dfly_observe::Scope observed_read("raft.apply.read");\n'

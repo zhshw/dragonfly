@@ -82,6 +82,7 @@ TEST_F(PartitionSnapshotTest, MemorySnapshotAndRetentionPublishOnlyDurablePrefix
 }
 
 TEST_F(PartitionSnapshotTest, ReceiveFreezeReadAndResumeAfterRestart) {
+  const auto generation = log_->content_generation();
   LogPosition id{2, 122};
   string bytes = test::SnapshotBytes(id.epoch);
   auto writer = log_->BeginSnapshot(id, bytes.size()).value();
@@ -89,11 +90,15 @@ TEST_F(PartitionSnapshotTest, ReceiveFreezeReadAndResumeAfterRestart) {
   EXPECT_FALSE(writer->Append(1, bytes).ok());
   EXPECT_TRUE(writer->Append(0, string_view(bytes).substr(0, 30)).ok());
   EXPECT_FALSE(log_->InstallSnapshot(writer.get(), 0).ok());
+  EXPECT_EQ(log_->content_generation(), generation);
   EXPECT_FALSE(log_->ReadSnapshot(id, 0, 10).ok());
   EXPECT_EQ(writer->position(), 30);
   ASSERT_TRUE(writer->Append(30, string_view(bytes).substr(30)).ok());
   ASSERT_TRUE(log_->InstallSnapshot(writer.get(), 0).ok());
+  EXPECT_GT(log_->content_generation(), generation);
+  const auto installed_generation = log_->content_generation();
   EXPECT_TRUE(log_->InstallSnapshot(writer.get(), 0).ok());
+  EXPECT_EQ(log_->content_generation(), installed_generation);
   EXPECT_EQ(log_->LatestSnapshot().value(), id);
   EXPECT_EQ(log_->StartOffset(), 122);
   EXPECT_EQ(log_->End(), id);

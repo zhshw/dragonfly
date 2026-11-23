@@ -321,8 +321,9 @@ absl::Status PartitionLog::Append(string_view batches, int32_t epoch,
   return AppendBatches(batches, epoch, false, written);
 }
 
-absl::Status PartitionLog::AppendAsFollower(string_view batches, int32_t epoch) {
-  return AppendBatches(batches, epoch, true, nullopt);
+absl::Status PartitionLog::AppendAsFollower(string_view batches, int32_t epoch,
+                                            vector<ValidatedBatch>* appended) {
+  return AppendBatches(batches, epoch, true, nullopt, appended);
 }
 
 bool PartitionLog::FitsActiveSegment(size_t bytes, int64_t end_offset) const {
@@ -332,11 +333,13 @@ bool PartitionLog::FitsActiveSegment(size_t bytes, int64_t end_offset) const {
 }
 
 absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool follower,
-                                         optional<DataWritten> written) {
+                                         optional<DataWritten> written,
+                                         vector<ValidatedBatch>* appended) {
   if (!io_failure_.ok())
     return io_failure_;
   if (pending_)
     return absl::FailedPreconditionError("Quorum append already in flight");
+  vector<ValidatedBatch> validated;
   vector<Batch> pending;
   bool memory = ack_mode_ == AckMode::kMemory;
   LogPosition end = End();
@@ -350,7 +353,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
       return size.status();
     if (follower && *size > remaining.size())
       break;
-    auto batch = DecodeRecordBatch(remaining.substr(0, *size));
+    vector<RecordView> records;
+    auto batch = DecodeRecordBatch(remaining.substr(0, *size), appended ? &records : nullptr);
     if (!batch.ok())
       return batch.status();
     if (batch->control) {
@@ -367,6 +371,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
     pos += *size;
     end = batch->end;
     pending.push_back({end, 0, pos - static_cast<int64_t>(*size), pos});
+    if (appended)
+      validated.push_back({*batch, *size, std::move(records)});
     remaining.remove_prefix(*size);
   }
   if (pending.empty())
@@ -405,6 +411,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
   if (io_failure_.ok()) {
     batches_.insert(batches_.end(), pending.begin(), pending.end());
     active_bytes_ = pos;
+    if (appended)
+      *appended = std::move(validated);
   }
   return io_failure_;
 }
@@ -612,6 +620,7 @@ absl::Status PartitionLog::TruncateTo(int64_t offset, int64_t hw) {
                          [](int64_t key, const Batch& b) { return key < b.end.end_offset; });
   if (offset != StartOffset() && (cut == batches_.begin() || prev(cut)->end.end_offset != offset))
     return absl::InvalidArgumentError("Truncation splits a quorum log batch");
+  ++content_generation_;
   int64_t pos = cut == batches_.begin() ? cut->file_start : prev(cut)->file_end;
   int64_t base = cut == batches_.begin() ? cut->segment_base : prev(cut)->segment_base;
   if (active_base_ != base) {

@@ -36,6 +36,10 @@ sudo docker compose --env-file /data/dragonfly-observability/config/langfuse.env
 所有 span 在线程内存中缓冲，正常退出时写 CSV；达到容量会计数，报告生成器拒绝有丢失的采集。
 采集只记录阶段、时间和数字位置，不记录 key 或 value。
 应用路径另记录 WAL 读取、batch/effect 解码、owner 排队及批次执行；owner span 的 `arg0` 为待执行笔数。
+`raft.set.cache_bytes` 在追加登记后记录缓存预算占用（`arg0`）与本轮 WAL 缓冲 capacity（`arg1`），单位为字节。
+follower 对应 `raft.fetch.cache_bytes`，字段口径相同；`raft.fetch.cache_prepare` 记录已验证记录入缓存的处理时间，
+`raft.apply.cache_hit` 记录每条从缓存取出的 effect，其 `arg0` 为记录起始 offset。失败后重试可能再次从 WAL 读回，命中数不是成功应用数。
+共享缓存按唯一 capacity 计数；这些是瞬时值，不能累加，也不代表含输入、应用和 I/O 引用的总在途内存。
 达到时间预算后可能只完成前缀，剩余项的下一次投递会重复计入 `arg0`；完成笔数应核对 `journal.apply` 次数。
 
 ```sh
@@ -52,6 +56,7 @@ python3 tools/raft-observability/collect.py \
 默认 256 MiB / 256 KiB/value、64 笔预热、5 秒静置；主指标包含原写连接的 `WAIT 1`。
 继续执行离线副本恢复、`WAIT 2` 和全部值读回。测试数据在输出目录下的真实磁盘，不能放 `/tmp` tmpfs。
 Ubuntu 的 Python Redis 和解压工具依赖若未安装到系统，需要沿用集成测试的 `PYTHONPATH`、`PATH` 和 `LD_LIBRARY_PATH`。
+当前隔离仓库的 Redis Python 依赖在 `.python-packages`；运行前设置 `PYTHONPATH="$PWD/.python-packages"`。
 
 CPU 使用 gperftools `2.19.3` 的独立 `libprofiler.so`，通过 `LD_PRELOAD` 注入。
 `SIGUSR2` 在预热后开始、最后 WAIT 后停止，500 Hz；因此 CPU 窗口比精确客户端窗口略宽。

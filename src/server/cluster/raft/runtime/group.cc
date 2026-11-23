@@ -548,8 +548,15 @@ class RaftGroup::Impl {
         return false;
       const auto end = log_->End();
       const auto hw = replication_.HighWatermark();
+      bool idle_response = false;
+      if (response.responses.size() == 1 && response.responses.front().partitions.size() == 1) {
+        const auto& part = response.responses.front().partitions.front();
+        idle_response = part.diverging_epoch.epoch < 0 && part.snapshot_id.epoch < 0 &&
+                        (!part.records.data || part.records.data->empty());
+      }
       bool reset = false;
-      auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, response, &reset);
+      auto s =
+          replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response), &reset);
       if (!s.ok()) {
         VLOG(1) << "Fetch from node " << leader << ": " << s;
         return false;
@@ -562,9 +569,7 @@ class RaftGroup::Impl {
         return true;
 
       // An idle long poll already waited. Re-arm it immediately so the next append can wake it.
-      const auto& part = response.responses.front().partitions.front();
-      return waited && part.diverging_epoch.epoch < 0 && part.snapshot_id.epoch < 0 &&
-             (!part.records.data || part.records.data->empty());
+      return waited && idle_response;
     });
   }
 

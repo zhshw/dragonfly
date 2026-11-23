@@ -63,8 +63,9 @@ struct PendingSet {
   int32_t epoch;
   absl::Status status{};
   bool stored = true;
-  optional<SetEffect> effect{};
+  optional<SetEffectView> effect{};
   size_t encoded_bytes = 0;
+  size_t key_offset = 0;
   LogPosition end{};
   fb2::EmbeddedBlockingCounter appended{1};
 };
@@ -294,7 +295,7 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
     auto apply = [this, replica = local.get()](const PartitionLog& log, int64_t hw) {
       if (auto s = replica->snapshots.Restore(log, hw, &replica->effects); !s.ok())
         return s;
-      auto apply_sets = [&](span<const SetEffect* const> effects, size_t* applied) {
+      auto apply_sets = [&](span<const SetEffectView* const> effects, size_t* applied) {
         // Re-enter once per bounded batch, preserving log order and the completed prefix.
         return owner_->Await([&] {
           const auto deadline = steady_clock::now() + milliseconds(1);
@@ -335,6 +336,11 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
               },
               [replica](ReplicaKey key, const auto& p, int64_t offset, int64_t now) {
                 replica->progress.Observe(key, p, offset, now);
+              });
+          state.replication.SetFetchedRecordsHook(
+              [replica](const PartitionLog& log, const shared_ptr<const string>& buffer,
+                        span<const PartitionLog::ValidatedBatch> batches) {
+                replica->effects.RememberFetched(log, buffer, batches);
               });
           return absl::OkStatus();
         });
@@ -785,7 +791,7 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
   int64_t offset = state.log.End().end_offset;
   const auto timestamp =
       duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-  string records;
+  size_t records_size = 0;
   for (size_t i = 0; i < batch.requests.size(); ++i) {
     auto* request = batch.requests[i];
     auto route = Route(request->slot, &local);
@@ -811,24 +817,22 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
       request->stored = *exists == (*request->condition == SetCondition::kIfExists);
     }
     auto action = request->stored ? SetEffect::Action::kReplace : SetEffect::Action::kNoop;
-    SetEffect effect{local.id,
-                     request->db,
-                     request->slot,
-                     route->owner.generation,
-                     string(request->key),
-                     request->stored ? string(request->value) : string{},
-                     action};
-    auto encoded = MakeSetEffectBatch(offset, epoch, timestamp, effect);
-    if (!encoded.ok()) {
-      request->status = encoded.status();
+    SetEffectView effect{local.id,      request->db,
+                         request->slot, route->owner.generation,
+                         request->key,  request->stored ? request->value : string_view{},
+                         action};
+    auto encoded_size = SetEffectBatchSize(effect);
+    if (!encoded_size.ok() || offset == INT64_MAX) {
+      request->status = encoded_size.ok() ? absl::OutOfRangeError("Raft log offset exhausted")
+                                          : encoded_size.status();
       continue;
     }
 
     // Drain only the contiguous prefix fitting this segment and the encoded-byte budget.
     // If even the first valid request does not fit, append it alone through the rollover path.
-    if (batch.byte_budget != SIZE_MAX && !records.empty() &&
-        (encoded->size() > batch.byte_budget - min(batch.byte_budget, records.size()) ||
-         !state.log.FitsActiveSegment(records.size() + encoded->size(), offset + 1))) {
+    if (batch.byte_budget != SIZE_MAX && records_size != 0 &&
+        (*encoded_size > batch.byte_budget - min(batch.byte_budget, records_size) ||
+         !state.log.FitsActiveSegment(records_size + *encoded_size, offset + 1))) {
       lock_guard lock(local.batch_mu);
       for (size_t j = batch.requests.size(); j > i; --j) {
         auto* deferred = batch.requests[j - 1];
@@ -839,18 +843,26 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
       break;
     }
     request->effect = std::move(effect);
-    request->encoded_bytes = encoded->size();
+    request->encoded_bytes = *encoded_size;
     request->end = {epoch, ++offset};
-    if (records.empty())
-      records = *std::move(encoded);
-    else
-      records.append(*encoded);
+    records_size += *encoded_size;
   }
   *done = true;
-  if (records.empty())
+  if (records_size == 0)
     return absl::OkStatus();
+  string records;
+  records.reserve(records_size);
+  for (auto* request : batch.requests) {
+    if (request->effect) {
+      auto s = AppendSetEffectBatch(request->end.end_offset - 1, epoch, timestamp, *request->effect,
+                                    &records, &request->key_offset);
+      if (!s.ok())
+        return s;
+    }
+  }
   bool may_have_appended = false;
-  auto status = state.replication.Append(std::move(records), epoch, &may_have_appended);
+  auto buffer = make_shared<const string>(std::move(records));
+  auto status = state.replication.Append(buffer, epoch, &may_have_appended);
   if (!status.ok()) {
     if (may_have_appended)
       return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
@@ -858,8 +870,8 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
   }
   for (auto* request : batch.requests) {
     if (request->effect)
-      local.effects.RememberAppended(request->end, request->encoded_bytes,
-                                     std::move(*request->effect));
+      local.effects.RememberAppended(request->end, request->encoded_bytes, *request->effect, buffer,
+                                     request->key_offset);
   }
   return absl::OkStatus();
 }

@@ -47,6 +47,10 @@ class FetchReplication {
   // Move the encoded batches in to share their storage with asynchronous I/O callbacks.
   [[nodiscard]] absl::Status Append(std::string batches, int32_t expected_epoch,
                                     bool* may_have_appended = nullptr);
+
+  // Retain the caller's immutable aggregate, also shared with its committed-effect cache.
+  [[nodiscard]] absl::Status Append(std::shared_ptr<const std::string> batches,
+                                    int32_t expected_epoch, bool* may_have_appended = nullptr);
   void SetAsyncIO(PartitionLog::AsyncIO submit) {
     async_io_ = std::move(submit);
   }
@@ -67,6 +71,15 @@ class FetchReplication {
   void SetDataApplyHooks(AdvertiseApplied advertise, ObserveApplied observe) {
     advertise_applied_ = std::move(advertise);
     observe_applied_ = std::move(observe);
+  }
+
+  // Called on the group worker after a matched follower append and membership validation.
+  // Views refer to this immutable buffer and cover only the successfully appended prefix.
+  using FetchedRecords =
+      std::function<void(const PartitionLog&, const std::shared_ptr<const std::string>&,
+                         std::span<const PartitionLog::ValidatedBatch>)>;
+  void SetFetchedRecordsHook(FetchedRecords hook) {
+    fetched_records_ = std::move(hook);
   }
 
   // A group of valid, empty Fetches at the same leader epoch and tail can share one copy of
@@ -107,7 +120,7 @@ class FetchReplication {
   [[nodiscard]] std::optional<OutboundFetch> PrepareFetch(int32_t peer_id, int16_t version,
                                                           int32_t max_wait_ms, int32_t max_bytes);
   [[nodiscard]] absl::Status ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
-                                                  const protocol::FetchResponse& response,
+                                                  protocol::FetchResponse response,
                                                   bool* reset_fetch_timeout = nullptr);
   std::optional<LogPosition> RequestedSnapshot() const {
     const auto& state = campaign_.state();
@@ -143,6 +156,7 @@ class FetchReplication {
   QuorumReplicaProgress replica_progress_;
   AdvertiseApplied advertise_applied_;
   ObserveApplied observe_applied_;
+  FetchedRecords fetched_records_;
   std::weak_ptr<ParkedFetch> parked_fetch_;
   std::function<void()> wake_fetch_;
   const std::vector<CampaignVoter> static_voters_;

@@ -121,11 +121,11 @@ TEST_F(SetEffectTest, BatchesRespectHighWatermarkEntryBudgetAndRecordBarriers) {
   for (auto* state : {&cached, &replayed}) {
     vector<size_t> sizes;
     vector<string> seen;
-    auto apply = [&](span<const SetEffect* const> effects, size_t* applied) {
+    auto apply = [&](span<const SetEffectView* const> effects, size_t* applied) {
       sizes.push_back(effects.size());
       EXPECT_FALSE(state->SnapshotMigrations(state->applied_position()).ok());
       for (const auto* effect : effects) {
-        seen.push_back(effect->value);
+        seen.emplace_back(effect->value);
         ++*applied;
       }
       return absl::OkStatus();
@@ -164,7 +164,7 @@ TEST_F(SetEffectTest, BatchesLimitBytesAndAllowOneOversizedEffect) {
   for (auto* state : {&cached, &replayed}) {
     vector<size_t> sizes;
     size_t seen = 0;
-    auto apply = [&](span<const SetEffect* const> effects, size_t* applied) {
+    auto apply = [&](span<const SetEffectView* const> effects, size_t* applied) {
       sizes.push_back(effects.size());
       size_t bytes = 0;
       for (const auto* effect : effects) {
@@ -192,16 +192,22 @@ TEST_F(SetEffectTest, BatchedFailureAndTimeBudgetAdvanceOnlyTheCompletedPrefix) 
     auto batch = MakeSetEffectBatch(i, 3, 10, effect).value();
     ASSERT_TRUE(log_->Append(batch, 3).ok());
     bytes.push_back(batch.size());
-    state.RememberAppended({3, i + 1}, batch.size(), effect);
+    if (i % 2 == 0) {
+      state.RememberAppended({3, i + 1}, batch.size(), effect);
+    } else {
+      auto buffer = make_shared<const string>(batch);
+      state.RememberAppended({3, i + 1}, batch.size(), effect, buffer,
+                             batch.size() - 1 - effect.key.size() - effect.value.size());
+    }
   }
   vector<string> seen;
   auto image = [](SlotId, optional<string_view>, string_view) { return absl::OkStatus(); };
   auto status = state.ApplyToBatched(
       *log_, 4,
-      [&](span<const SetEffect* const> effects, size_t* applied) {
+      [&](span<const SetEffectView* const> effects, size_t* applied) {
         EXPECT_EQ(effects.size(), 4u);
-        seen.push_back(effects[0]->value);
-        seen.push_back(effects[1]->value);
+        seen.emplace_back(effects[0]->value);
+        seen.emplace_back(effects[1]->value);
         *applied = 2;
         return absl::ResourceExhaustedError("third SET failed");
       },
@@ -212,8 +218,8 @@ TEST_F(SetEffectTest, BatchedFailureAndTimeBudgetAdvanceOnlyTheCompletedPrefix) 
   EXPECT_EQ(state.SnapshotSlots(), (vector<SnapshotSlotRange>{{42, 42, 8}}));
 
   // A time-limited callback can finish just one entry without dropping or repeating the rest.
-  auto apply_one = [&](span<const SetEffect* const> effects, size_t* applied) {
-    seen.push_back(effects.front()->value);
+  auto apply_one = [&](span<const SetEffectView* const> effects, size_t* applied) {
+    seen.emplace_back(effects.front()->value);
     *applied = 1;
     return absl::OkStatus();
   };
@@ -228,7 +234,7 @@ TEST_F(SetEffectTest, BatchedFailureAndTimeBudgetAdvanceOnlyTheCompletedPrefix) 
   EXPECT_FALSE(invalid
                    .ApplyToBatched(
                        *log_, 4,
-                       [](span<const SetEffect* const>, size_t*) { return absl::OkStatus(); },
+                       [](span<const SetEffectView* const>, size_t*) { return absl::OkStatus(); },
                        image)
                    .ok());
   EXPECT_EQ(invalid.applied_offset(), 0);
@@ -243,7 +249,11 @@ TEST_F(SetEffectTest, LeaderDeliversCachedEffectsOnlyAfterCommitAndDiscardsRepla
   ASSERT_TRUE(log_->Append(first, 3).ok());
   state.RememberAppended({3, 1}, first.size(), first_);
   ASSERT_TRUE(log_->Append(second, 3).ok());
-  state.RememberAppended({3, 2}, second.size(), old);
+  auto buffer = make_shared<const string>(second);
+  weak_ptr<const string> old_buffer = buffer;
+  state.RememberAppended({3, 2}, second.size(), old, buffer,
+                         second.size() - 1 - old.key.size() - old.value.size());
+  buffer.reset();
 
   vector<SetEffect> seen;
   auto apply = [&](const SetEffect& effect) {
@@ -268,8 +278,214 @@ TEST_F(SetEffectTest, LeaderDeliversCachedEffectsOnlyAfterCommitAndDiscardsRepla
   second = MakeSetEffectBatch(1, 4, 20, replacement).value();
   ASSERT_TRUE(log_->AppendAsFollower(second, 4).ok());
   ASSERT_TRUE(state.ApplyTo(*log_, 2, apply).ok());
+  EXPECT_TRUE(old_buffer.expired());
+  EXPECT_EQ(state.cached_bytes(), 0u);
   EXPECT_EQ(seen, (vector<SetEffect>{first_, replacement}));
   EXPECT_EQ(state.applied_bytes(), first.size() + second.size());
+}
+
+TEST_F(SetEffectTest, SharedAggregateRetainsBackingUntilTheLastCachedEffectIsApplied) {
+  vector<SetEffect> originals{first_, first_};
+  originals[1].value.assign(256 << 10, 'v');
+  string aggregate;
+  aggregate.reserve(1 << 20);
+  vector<size_t> key_offsets, sizes;
+  for (size_t i = 0; i < originals.size(); ++i) {
+    const size_t begin = aggregate.size();
+    size_t key_offset = 0;
+    ASSERT_TRUE(AppendSetEffectBatch(i, 3, 10, originals[i], &aggregate, &key_offset).ok());
+    sizes.push_back(aggregate.size() - begin);
+    EXPECT_EQ(key_offset,
+              aggregate.size() - 1 - originals[i].key.size() - originals[i].value.size());
+    key_offsets.push_back(key_offset);
+    ASSERT_TRUE(log_->Append(string_view(aggregate).substr(begin), 3).ok());
+  }
+  const size_t capacity = aggregate.capacity();
+  auto buffer = make_shared<const string>(std::move(aggregate));
+  weak_ptr<const string> lifetime = buffer;
+  CommittedEffects state(10);
+  for (size_t i = 0; i < originals.size(); ++i) {
+    auto temporary = originals[i];
+    state.RememberAppended({3, int64_t(i + 1)}, sizes[i], temporary, buffer, key_offsets[i]);
+    temporary.key.assign("released key");
+    temporary.value.assign("released value");
+    EXPECT_EQ(state.cached_bytes(), capacity);
+  }
+  buffer.reset();
+  auto image = [](SlotId, optional<string_view>, string_view) { return absl::OkStatus(); };
+  size_t seen = 0;
+  auto apply = [&](span<const SetEffectView* const> effects, size_t* applied) {
+    auto owner = lifetime.lock();
+    EXPECT_NE(owner, nullptr);
+    for (const auto* effect : effects) {
+      EXPECT_EQ(effect->key, originals[seen].key);
+      EXPECT_EQ(effect->value, originals[seen].value);
+      EXPECT_EQ(effect->key.data(), owner->data() + key_offsets[seen]);
+      ++seen;
+      ++*applied;
+    }
+    return absl::OkStatus();
+  };
+
+  // A cache hit must work without its closed segment, and retain the shared tail afterwards.
+  const auto segment = dir_ / "00000000000000000000.log";
+  fs::rename(segment, dir_ / "held-segment");
+  ASSERT_TRUE(state.ApplyToBatched(*log_, 1, apply, image).ok());
+  fs::rename(dir_ / "held-segment", segment);
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_EQ(state.cached_bytes(), capacity);
+  ASSERT_TRUE(state.ApplyToBatched(*log_, 2, apply, image).ok());
+  EXPECT_EQ(seen, 2u);
+  EXPECT_TRUE(lifetime.expired());
+  EXPECT_EQ(state.cached_bytes(), 0u);
+  EXPECT_EQ(state.applied_bytes(), sizes[0] + sizes[1]);
+}
+
+TEST_F(SetEffectTest, SharedCacheRejectsExcessCapacityAndInvalidRangesWithoutLosingReplay) {
+  auto batch = MakeSetEffectBatch(0, 3, 10, first_).value();
+  ASSERT_TRUE(log_->Append(batch, 3).ok());
+  const size_t key_offset = batch.size() - 1 - first_.key.size() - first_.value.size();
+  CommittedEffects state(10);
+  auto small = make_shared<const string>(batch);
+  state.RememberAppended({3, 1}, batch.size(), first_, small, SIZE_MAX);
+  EXPECT_EQ(state.cached_bytes(), 0u);
+  state.RememberAppended({3, 1}, batch.size(), first_, small, batch.size());
+  EXPECT_EQ(state.cached_bytes(), 0u);
+  batch.reserve(kMaxBatchSize + 1);
+  auto large = make_shared<const string>(std::move(batch));
+  weak_ptr<const string> lifetime = large;
+  state.RememberAppended({3, 1}, large->size(), first_, large, key_offset);
+  EXPECT_EQ(state.cached_bytes(), 0u);
+  large.reset();
+  EXPECT_TRUE(lifetime.expired());
+  size_t seen = 0;
+  ASSERT_TRUE(state
+                  .ApplyTo(*log_, 1,
+                           [&](const SetEffect& effect) {
+                             EXPECT_EQ(effect, first_);
+                             ++seen;
+                             return absl::OkStatus();
+                           })
+                  .ok());
+  EXPECT_EQ(seen, 1u);
+}
+
+TEST_F(SetEffectTest, FollowerSharesValidatedBufferAcrossCommitAndNoopBoundaries) {
+  const array<int32_t, 1> voters{1};
+  string bytes = MakeLeaderChangeBatch(0, 3, 1, 1, voters, voters).value();
+  auto noop = first_;
+  noop.action = SetEffect::Action::kNoop;
+  noop.value.clear();
+  auto last = first_;
+  last.value.assign(256 << 10, 'v');
+  for (const auto* effect : {&first_, &noop, &last})
+    bytes += MakeSetEffectBatch(effect == &first_ ? 1
+                                : effect == &noop ? 2
+                                                  : 3,
+                                3, 1, *effect)
+                 .value();
+  auto buffer = make_shared<const string>(std::move(bytes));
+  weak_ptr<const string> lifetime = buffer;
+  vector<PartitionLog::ValidatedBatch> appended;
+  ASSERT_TRUE(log_->AppendAsFollower(*buffer, 3, &appended).ok());
+  ASSERT_EQ(appended.size(), 4u);
+  CommittedEffects state(10);
+  state.RememberFetched(*log_, buffer, appended);
+  EXPECT_EQ(state.cached_bytes(), buffer->capacity());
+  const auto retained_bytes = buffer->capacity();
+  const char* first_value = appended[1].records[0].value->data() + 26 + first_.key.size();
+  buffer.reset();
+  vector<string> seen;
+  auto apply = [&](span<const SetEffectView* const> effects, size_t* done) {
+    EXPECT_FALSE(lifetime.expired());
+    for (const auto* effect : effects) {
+      if (seen.empty())
+        EXPECT_EQ(effect->value.data(), first_value);
+      seen.emplace_back(effect->value);
+      ++*done;
+    }
+    return absl::OkStatus();
+  };
+  auto image = [](SlotId, optional<string_view>, string_view) { return absl::OkStatus(); };
+  ASSERT_TRUE(state.ApplyToBatched(*log_, 1, apply, image).ok());
+  EXPECT_TRUE(seen.empty());
+
+  // Roll away from the cached extent; no WAL read is possible while its segment is hidden.
+  ASSERT_TRUE(Append(first_).ok());
+  const auto segment = dir_ / "00000000000000000000.log";
+  fs::rename(segment, dir_ / "held-segment");
+  ASSERT_TRUE(state.ApplyToBatched(*log_, 2, apply, image).ok());
+  EXPECT_EQ(state.cached_bytes(), retained_bytes);
+  EXPECT_FALSE(lifetime.expired());
+  ASSERT_TRUE(state.ApplyToBatched(*log_, 4, apply, image).ok());
+  fs::rename(dir_ / "held-segment", segment);
+  EXPECT_EQ(seen, (vector<string>{first_.value, last.value}));
+  EXPECT_EQ(state.applied_offset(), 4);
+  EXPECT_EQ(state.cached_bytes(), 0u);
+  EXPECT_TRUE(lifetime.expired());
+}
+
+TEST_F(SetEffectTest, FollowerDiscardsCachedTailReplacedAtTheSameEpochAndOffset) {
+  auto bytes = MakeSetEffectBatch(0, 3, 1, first_).value();
+  bytes += MakeSetEffectBatch(1, 3, 1, first_).value();
+  auto buffer = make_shared<const string>(std::move(bytes));
+  weak_ptr<const string> lifetime = buffer;
+  vector<PartitionLog::ValidatedBatch> appended;
+  ASSERT_TRUE(log_->AppendAsFollower(*buffer, 3, &appended).ok());
+  CommittedEffects state(10);
+  state.RememberFetched(*log_, buffer, appended);
+  buffer.reset();
+  vector<string> seen;
+  auto apply = [&](const SetEffect& effect) {
+    seen.push_back(effect.value);
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(state.ApplyTo(*log_, 1, apply).ok());
+  EXPECT_FALSE(lifetime.expired());
+  ASSERT_TRUE(log_->TruncateTo(1, 1).ok());
+  auto replacement = first_;
+  replacement.value = "replacement at the same position";
+  ASSERT_TRUE(Append(replacement).ok());
+  ASSERT_TRUE(state.ApplyTo(*log_, 2, apply).ok());
+  EXPECT_EQ(seen, (vector<string>{first_.value, replacement.value}));
+  EXPECT_TRUE(lifetime.expired());
+  EXPECT_EQ(state.cached_bytes(), 0u);
+}
+
+TEST_F(SetEffectTest, FollowerCacheKeepsMigrationFencingAndFallsBackWhenOverBudget) {
+  string bytes = MakeSetEffectBatch(0, 3, 1, first_).value();
+  auto freeze = Migration();
+  freeze.kind = static_cast<int8_t>(TransferKind::kFreeze);
+  bytes += MakeSlotTransferBatch(1, 3, 1, freeze).value();
+  bytes += MakeSetEffectBatch(2, 3, 1, first_).value();
+  auto buffer = make_shared<const string>(bytes);
+  vector<PartitionLog::ValidatedBatch> appended;
+  ASSERT_TRUE(log_->AppendAsFollower(*buffer, 3, &appended).ok());
+  CommittedEffects state(10);
+  state.RememberFetched(*log_, buffer, appended);
+  size_t applied = 0;
+  auto apply = [&](const SetEffect& effect) {
+    EXPECT_EQ(effect, first_);
+    ++applied;
+    return absl::OkStatus();
+  };
+  EXPECT_TRUE(absl::IsFailedPrecondition(state.ApplyTo(*log_, 3, apply)));
+  EXPECT_EQ(applied, 1u);
+  EXPECT_EQ(state.applied_offset(), 2);
+
+  // A large backing capacity is rejected even when the logical effects are small.
+  auto fallback_log = PartitionLog::Open(dir_ / "fallback").value();
+  bytes.reserve(kMaxBatchSize + 1);
+  auto oversized = make_shared<const string>(std::move(bytes));
+  weak_ptr<const string> lifetime = oversized;
+  ASSERT_TRUE(fallback_log->AppendAsFollower(*oversized, 3, &appended).ok());
+  CommittedEffects fallback(10);
+  fallback.RememberFetched(*fallback_log, oversized, appended);
+  EXPECT_EQ(fallback.cached_bytes(), 0u);
+  oversized.reset();
+  EXPECT_TRUE(lifetime.expired());
+  ASSERT_TRUE(fallback.ApplyTo(*fallback_log, 1, apply).ok());
+  EXPECT_EQ(applied, 2u);
 }
 
 TEST_F(SetEffectTest, FailedApplyAndWrongGroupDoNotAdvanceCursor) {
@@ -337,8 +553,12 @@ TEST_F(SetEffectTest, RejectsUnsupportedPayloadsAndInvalidAddresses) {
     else
       bad.front()[pos] = static_cast<char>(0xff);
     auto batch = MakeDataBatch(0, 3, 1, bad).value();
-    ASSERT_TRUE(log_->Append(batch, 3).ok());
+    auto buffer = make_shared<const string>(std::move(batch));
+    vector<PartitionLog::ValidatedBatch> appended;
+    ASSERT_TRUE(log_->AppendAsFollower(*buffer, 3, &appended).ok());
     CommittedEffects state(10);
+    state.RememberFetched(*log_, buffer, appended);
+    EXPECT_EQ(state.cached_bytes(), 0u);
     EXPECT_FALSE(state.ApplyTo(*log_, 1, apply).ok()) << pos;
     EXPECT_EQ(state.applied_offset(), 0);
     ASSERT_TRUE(log_->TruncateTo(0, 0).ok());

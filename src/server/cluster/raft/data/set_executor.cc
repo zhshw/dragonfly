@@ -11,7 +11,7 @@
 
 namespace dfly::cluster::raft {
 
-absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffect& effect) {
+absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffectView& effect) {
   if (KeySlot(effect.key) != effect.slot)
     return absl::DataLossError("Committed SET key hashes to a different slot");
   if (effect.action == SetEffect::Action::kNoop)

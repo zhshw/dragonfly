@@ -52,6 +52,14 @@ absl::StatusOr<std::string> MakeDataBatch(int64_t offset, int32_t epoch, int64_t
 absl::StatusOr<std::string> MakeSingleRecordBatch(int64_t offset, int32_t epoch,
                                                   int64_t timestamp_ms,
                                                   std::span<const std::string_view> value_parts);
+
+// Plan and append a complete single-record batch without an intermediate buffer. Value parts
+// must not alias output. A rejected batch leaves output unchanged, including any earlier batches.
+// On success value_offset, if requested, locates the first value byte in the aggregate.
+absl::StatusOr<size_t> SingleRecordBatchSize(size_t value_size);
+absl::Status AppendSingleRecordBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                     std::span<const std::string_view> value_parts,
+                                     std::string* output, size_t* value_offset = nullptr);
 absl::StatusOr<std::string> MakeControlBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
                                              std::span<const ControlRecordValue> controls);
 absl::StatusOr<std::string> MakeLeaderChangeBatch(

@@ -61,6 +61,18 @@ TEST(RecordBatchTest, SplitDataValueMatchesContiguousEncoding) {
     auto batch = MakeSingleRecordBatch(7, 2, 123, parts);
     ASSERT_TRUE(batch.ok()) << batch.status();
     ASSERT_EQ(batch, MakeDataBatch(7, 2, 123, values));
+    auto planned = SingleRecordBatchSize(size);
+    ASSERT_TRUE(planned.ok()) << planned.status();
+    ASSERT_EQ(*planned, batch->size());
+    string aggregate = "existing prefix";
+    const size_t begin = aggregate.size();
+    aggregate.reserve(begin + 2 * batch->size());
+    const char* storage = aggregate.data();
+    ASSERT_TRUE(AppendSingleRecordBatch(7, 2, 123, parts, &aggregate).ok());
+    ASSERT_TRUE(AppendSingleRecordBatch(7, 2, 123, parts, &aggregate).ok());
+    EXPECT_EQ(aggregate.data(), storage);
+    EXPECT_EQ(string_view(aggregate).substr(begin), *batch + *batch);
+    EXPECT_EQ(string_view(aggregate).substr(0, begin), "existing prefix");
     vector<RecordView> records;
     auto info = DecodeRecordBatch(*batch, &records);
     ASSERT_TRUE(info.ok()) << info.status();
@@ -76,6 +88,14 @@ TEST(RecordBatchTest, SplitDataValueMatchesContiguousEncoding) {
   const array<string_view, 1> oversized{large};
   EXPECT_FALSE(MakeSingleRecordBatch(0, 2, 123, oversized).ok());
   EXPECT_FALSE(MakeSingleRecordBatch(-1, 2, 123, {}).ok());
+  string unchanged = "prior batches";
+  EXPECT_FALSE(AppendSingleRecordBatch(-1, 2, 123, {}, &unchanged).ok());
+  EXPECT_FALSE(AppendSingleRecordBatch(INT64_MAX, 2, 123, {}, &unchanged).ok());
+  EXPECT_FALSE(AppendSingleRecordBatch(0, -1, 123, {}, &unchanged).ok());
+  EXPECT_FALSE(AppendSingleRecordBatch(0, 2, -1, {}, &unchanged).ok());
+  EXPECT_FALSE(AppendSingleRecordBatch(0, 2, 123, oversized, &unchanged).ok());
+  EXPECT_FALSE(SingleRecordBatchSize(SIZE_MAX).ok());
+  EXPECT_EQ(unchanged, "prior batches");
 }
 
 TEST(RecordBatchTest, RejectsBadCrcAndMalformedRecordsEvenWithValidCrc) {

@@ -24,19 +24,19 @@ constexpr string_view kMagic = "DFKV";
 constexpr uint8_t kVersion = 0;
 constexpr size_t kHeader = 26;
 
-bool ValidAddress(const SetEffect& effect) {
+bool ValidAddress(const SetEffectView& effect) {
   return effect.group_id >= 0 && effect.db != kInvalidDbId && effect.slot <= kMaxSlotNum &&
          effect.generation >= 0;
 }
 
-absl::StatusOr<SetEffect> DecodeSetEffect(string_view payload) {
+absl::StatusOr<SetEffectView> DecodeSetEffectView(string_view payload) {
   if (payload.size() < kHeader || !payload.starts_with(kMagic))
     return absl::DataLossError("Invalid Dragonfly KV record header");
   auto action = static_cast<SetEffect::Action>(static_cast<uint8_t>(payload[5]));
   if (payload[4] != kVersion ||
       (action != SetEffect::Action::kReplace && action != SetEffect::Action::kNoop))
     return absl::UnimplementedError("Unsupported Dragonfly KV record version or operation");
-  SetEffect effect;
+  SetEffectView effect;
   effect.action = action;
   effect.group_id = static_cast<int32_t>(be::Load32(payload.data() + 6));
   effect.db = be::Load16(payload.data() + 10);
@@ -47,15 +47,31 @@ absl::StatusOr<SetEffect> DecodeSetEffect(string_view payload) {
   if (!ValidAddress(effect) || key_size > payload.size() ||
       (action == SetEffect::Action::kNoop && payload.size() != key_size))
     return absl::DataLossError("Invalid Dragonfly KV address or key length");
-  effect.key.assign(payload.substr(0, key_size));
-  effect.value.assign(payload.substr(key_size));
+  effect.key = payload.substr(0, key_size);
+  effect.value = payload.substr(key_size);
   return effect;
+}
+
+absl::StatusOr<SetEffect> DecodeSetEffect(string_view payload) {
+  auto view = DecodeSetEffectView(payload);
+  if (!view.ok())
+    return view.status();
+  return SetEffect{view->group_id,   view->db,          view->slot,
+                   view->generation, string(view->key), string(view->value),
+                   view->action};
 }
 
 }  // namespace
 
 absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
                                           const SetEffect& effect) {
+  string batch;
+  if (auto s = AppendSetEffectBatch(offset, epoch, timestamp_ms, effect, &batch); !s.ok())
+    return s;
+  return batch;
+}
+
+absl::StatusOr<size_t> SetEffectBatchSize(const SetEffectView& effect) {
   if (!ValidAddress(effect))
     return absl::InvalidArgumentError("Invalid Dragonfly SET effect address");
   if ((effect.action == SetEffect::Action::kNoop && !effect.value.empty()) ||
@@ -64,6 +80,13 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
   if (effect.key.size() > kMaxBatchSize - kHeader ||
       effect.value.size() > kMaxBatchSize - kHeader - effect.key.size())
     return absl::ResourceExhaustedError("Dragonfly SET effect exceeds Kafka batch size");
+  return SingleRecordBatchSize(kHeader + effect.key.size() + effect.value.size());
+}
+
+absl::Status AppendSetEffectBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                  const SetEffectView& effect, string* output, size_t* key_offset) {
+  if (auto size = SetEffectBatchSize(effect); !size.ok())
+    return size.status();
   array<char, kHeader> payload{};
   copy(kMagic.begin(), kMagic.end(), payload.begin());
   payload[4] = kVersion;
@@ -75,7 +98,12 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
   be::Store32(payload.data() + 22, effect.key.size());
   const array<string_view, 3> parts{string_view(payload.data(), payload.size()), effect.key,
                                     effect.value};
-  return MakeSingleRecordBatch(offset, epoch, timestamp_ms, parts);
+  size_t payload_offset;
+  auto status =
+      AppendSingleRecordBatch(offset, epoch, timestamp_ms, parts, output, &payload_offset);
+  if (status.ok() && key_offset)
+    *key_offset = payload_offset + kHeader;
+  return status;
 }
 
 CommittedEffects::CommittedEffects(int32_t group_id, int64_t applied_offset)
@@ -145,7 +173,7 @@ absl::Status CommittedEffects::ApplyTransferRecord(string_view payload, LogPosit
                            });
 }
 
-absl::Status CommittedEffects::ValidateEffect(const SetEffect& effect) const {
+absl::Status CommittedEffects::ValidateEffect(const SetEffectView& effect) const {
   if (effect.group_id != group_id_)
     return absl::FailedPreconditionError("SET effect belongs to another replication group");
   if (transfers_.BlocksAccess(effect.slot, effect.generation))
@@ -154,26 +182,95 @@ absl::Status CommittedEffects::ValidateEffect(const SetEffect& effect) const {
 }
 
 void CommittedEffects::RememberAppended(LogPosition end, size_t encoded_bytes, SetEffect effect) {
-  if (!pending_.empty() && (pending_.back().end.epoch != end.epoch ||
-                            pending_.back().end.end_offset >= end.end_offset)) {
-    pending_.clear();
-    pending_bytes_ = 0;
-  }
+  Remember({end, encoded_bytes, std::move(effect)});
+}
+
+void CommittedEffects::RememberAppended(LogPosition end, size_t encoded_bytes,
+                                        const SetEffectView& effect,
+                                        shared_ptr<const string> buffer, size_t key_offset) {
+  if (!buffer || key_offset > buffer->size() || effect.key.size() > buffer->size() - key_offset ||
+      effect.value.size() > buffer->size() - key_offset - effect.key.size())
+    return;
+  auto view = effect;
+  view.key = string_view(*buffer).substr(key_offset, effect.key.size());
+  view.value = string_view(*buffer).substr(key_offset + effect.key.size(), effect.value.size());
+  Remember({end, encoded_bytes, SharedEffect{std::move(buffer), view}});
+}
+
+void CommittedEffects::Remember(PendingEffect effect) {
+  if (!pending_.empty() && (pending_.back().end.epoch != effect.end.epoch ||
+                            pending_.back().end.end_offset >= effect.end.end_offset))
+    ClearCache();
+
+  auto* shared = get_if<SharedEffect>(&effect.effect);
+  size_t charge = effect.encoded_bytes;
+  if (shared)
+    charge = buffer_uses_.contains(shared->buffer.get()) ? 0 : shared->buffer->capacity();
 
   // When a quorum lags, subsequent proposals can still commit via the WAL.
-  if (pending_.size() >= 4096 || encoded_bytes > kMaxBatchSize - pending_bytes_)
+  if (pending_.size() >= 4096 || charge > kMaxBatchSize - pending_bytes_)
     return;
-  pending_.push_back({end, encoded_bytes, std::move(effect)});
-  pending_bytes_ += encoded_bytes;
+  if (shared)
+    ++buffer_uses_[shared->buffer.get()];
+  pending_.push_back(std::move(effect));
+  pending_bytes_ += charge;
+}
+
+void CommittedEffects::SynchronizeCache(const PartitionLog& log) {
+  if (cache_generation_ != log.content_generation() ||
+      (!pending_.empty() && pending_.front().end.epoch != log.End().epoch))
+    ClearCache();
+  cache_generation_ = log.content_generation();
+}
+
+void CommittedEffects::RememberFetched(const PartitionLog& log,
+                                       const shared_ptr<const string>& buffer,
+                                       span<const PartitionLog::ValidatedBatch> batches) {
+  SynchronizeCache(log);
+  if (!buffer || !log.io_failure().ok() || buffer->capacity() > kMaxBatchSize)
+    return;
+  for (const auto& batch : batches) {
+    if (batch.info.control || batch.records.size() != 1 || batch.records.front().key ||
+        !batch.records.front().value)
+      continue;
+    auto effect = DecodeSetEffectView(*batch.records.front().value);
+    if (!effect.ok())
+      continue;
+
+    // Address/generation fencing remains at ordered application, after any migration records.
+    Remember({batch.info.end, batch.encoded_bytes, SharedEffect{buffer, *effect}});
+  }
+}
+
+void CommittedEffects::ForgetFront() {
+  const auto& effect = pending_.front();
+  if (auto* shared = get_if<SharedEffect>(&effect.effect)) {
+    auto it = buffer_uses_.find(shared->buffer.get());
+    if (--it->second == 0) {
+      pending_bytes_ -= shared->buffer->capacity();
+      buffer_uses_.erase(it);
+    }
+  } else {
+    pending_bytes_ -= effect.encoded_bytes;
+  }
+}
+
+void CommittedEffects::ClearCache() {
+  pending_.clear();
+  buffer_uses_.clear();
+  pending_bytes_ = 0;
 }
 
 absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, ApplySet apply,
                                        ApplySlotImage apply_image) {
   return ApplyToBatched(
       log, hw,
-      [&](span<const SetEffect* const> effects, size_t* applied) {
+      [&](span<const SetEffectView* const> effects, size_t* applied) {
         for (const auto* effect : effects) {
-          if (auto s = apply(*effect); !s.ok())
+          SetEffect owned{effect->group_id,   effect->db,          effect->slot,
+                          effect->generation, string(effect->key), string(effect->value),
+                          effect->action};
+          if (auto s = apply(owned); !s.ok())
             return s;
           ++*applied;
         }
@@ -196,21 +293,20 @@ absl::Status CommittedEffects::ApplyToBatched(const PartitionLog& log, int64_t h
   applying_ = true;
   absl::Cleanup reset = [this] { applying_ = false; };
 
-  // A new epoch can replace the old leader's uncommitted suffix. Replay that prefix
-  // from the authoritative WAL even if some of its old entries survived the election.
-  if (!pending_.empty() && pending_.front().end.epoch != log.End().epoch) {
-    pending_.clear();
-    pending_bytes_ = 0;
-  }
+  // Truncation can replace bytes even at the same epoch and offset. Snapshots also fence caches.
+  SynchronizeCache(log);
   constexpr size_t kMaxEntries = 32;
   constexpr size_t kMaxBytes = 1 << 20;
   vector<PendingEffect> ready;
   ready.reserve(kMaxEntries);
   size_t ready_bytes = 0;
   auto flush = [&]() -> absl::Status {
-    array<const SetEffect*, kMaxEntries> effects;
-    for (size_t i = 0; i < ready.size(); ++i)
-      effects[i] = &ready[i].effect;
+    array<SetEffectView, kMaxEntries> views;
+    array<const SetEffectView*, kMaxEntries> effects;
+    for (size_t i = 0; i < ready.size(); ++i) {
+      views[i] = ready[i].View();
+      effects[i] = &views[i];
+    }
     size_t done = 0;
     while (done < ready.size()) {
       size_t completed = 0;
@@ -219,7 +315,7 @@ absl::Status CommittedEffects::ApplyToBatched(const PartitionLog& log, int64_t h
         return absl::InternalError("Invalid completed SET prefix");
       for (size_t i = done; i < done + completed; ++i) {
         const auto& item = ready[i];
-        slot_generations_[item.effect.slot] = item.effect.generation;
+        slot_generations_[views[i].slot] = views[i].generation;
         applied_ = item.end;
         applied_bytes_ += item.encoded_bytes;
       }
@@ -241,11 +337,11 @@ absl::Status CommittedEffects::ApplyToBatched(const PartitionLog& log, int64_t h
   while (next_offset < hw) {
     PendingEffect next;
     while (!pending_.empty() && pending_.front().end.end_offset <= next_offset) {
-      pending_bytes_ -= pending_.front().encoded_bytes;
+      ForgetFront();
       pending_.pop_front();
     }
     if (!pending_.empty() && pending_.front().end.end_offset == next_offset + 1) {
-      pending_bytes_ -= pending_.front().encoded_bytes;
+      ForgetFront();
       next = std::move(pending_.front());
       pending_.pop_front();
     } else {
@@ -282,10 +378,11 @@ absl::Status CommittedEffects::ApplyToBatched(const PartitionLog& log, int64_t h
         return fail(effect.status());
       next = {batch->end, bytes->size(), *std::move(effect)};
     }
-    if (auto s = ValidateEffect(next.effect); !s.ok())
+    const auto effect = next.View();
+    if (auto s = ValidateEffect(effect); !s.ok())
       return fail(s);
     next_offset = next.end.end_offset;
-    if (next.effect.action == SetEffect::Action::kNoop) {
+    if (effect.action == SetEffect::Action::kNoop) {
       if (auto s = flush(); !s.ok())
         return s;
       applied_ = next.end;

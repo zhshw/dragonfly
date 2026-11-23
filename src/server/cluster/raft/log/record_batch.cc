@@ -137,8 +137,8 @@ void PutRecord(int32_t index, optional<string_view> key, string_view value, stri
   records->append(body);
 }
 
-absl::StatusOr<string> FinishBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
-                                   int32_t count, bool control, string batch) {
+absl::Status FinishBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms, int32_t count,
+                         bool control, span<char> batch) {
   if (offset < 0 || count <= 0 || offset > INT64_MAX - count || epoch < 0 || timestamp_ms < 0)
     return absl::InvalidArgumentError("Invalid KRaft batch offset, epoch, count or timestamp");
   if (batch.size() > kMaxBatchSize)
@@ -156,9 +156,9 @@ absl::StatusOr<string> FinishBatch(int64_t offset, int32_t epoch, int64_t timest
   be::Store16(batch.data() + 51, UINT16_MAX);
   be::Store32(batch.data() + 53, UINT32_MAX);
   be::Store32(batch.data() + 57, count);
-  be::Store32(batch.data() + 17,
-              static_cast<uint32_t>(absl::ComputeCrc32c(string_view(batch).substr(21))));
-  return batch;
+  be::Store32(batch.data() + 17, static_cast<uint32_t>(absl::ComputeCrc32c(
+                                     string_view(batch.data(), batch.size()).substr(21))));
+  return absl::OkStatus();
 }
 
 absl::StatusOr<string> BuildBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
@@ -167,7 +167,9 @@ absl::StatusOr<string> BuildBatch(int64_t offset, int32_t epoch, int64_t timesta
     return absl::ResourceExhaustedError("KRaft batch exceeds maximum size");
   string batch(kBatchHeaderSize, '\0');
   batch += records;
-  return FinishBatch(offset, epoch, timestamp_ms, count, control, std::move(batch));
+  if (auto s = FinishBatch(offset, epoch, timestamp_ms, count, control, span(batch)); !s.ok())
+    return s;
+  return batch;
 }
 }  // namespace
 
@@ -234,6 +236,27 @@ absl::StatusOr<std::string> MakeDataBatch(int64_t offset, int32_t epoch, int64_t
 
 absl::StatusOr<string> MakeSingleRecordBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
                                              span<const string_view> value_parts) {
+  string batch;
+  if (auto s = AppendSingleRecordBatch(offset, epoch, timestamp_ms, value_parts, &batch); !s.ok())
+    return s;
+  return batch;
+}
+
+absl::StatusOr<size_t> SingleRecordBatchSize(size_t value_size) {
+  if (value_size > kMaxBatchSize)
+    return absl::ResourceExhaustedError("KRaft data batch exceeds maximum size");
+
+  // Attributes, timestamp/offset deltas, null key and empty headers each occupy one byte.
+  const size_t body_size = 5 + SignedSize(value_size) + value_size;
+  const size_t batch_size = kBatchHeaderSize + SignedSize(body_size) + body_size;
+  if (batch_size > kMaxBatchSize)
+    return absl::ResourceExhaustedError("KRaft data batch exceeds maximum size");
+  return batch_size;
+}
+
+absl::Status AppendSingleRecordBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                     span<const string_view> value_parts, string* output,
+                                     size_t* value_offset) {
   size_t value_size = 0;
   for (string_view part : value_parts) {
     if (part.size() > kMaxBatchSize - value_size)
@@ -241,22 +264,28 @@ absl::StatusOr<string> MakeSingleRecordBatch(int64_t offset, int32_t epoch, int6
     value_size += part.size();
   }
 
-  // Attributes, timestamp/offset deltas, null key and empty headers each occupy one byte.
+  auto batch_size = SingleRecordBatchSize(value_size);
+  if (!batch_size.ok())
+    return batch_size.status();
+  if (offset < 0 || offset == INT64_MAX || epoch < 0 || timestamp_ms < 0)
+    return absl::InvalidArgumentError("Invalid KRaft batch offset, epoch or timestamp");
+  const size_t begin = output->size();
+  if (*batch_size > output->max_size() - begin)
+    return absl::ResourceExhaustedError("KRaft aggregate exceeds maximum string size");
   const size_t body_size = 5 + SignedSize(value_size) + value_size;
-  const size_t batch_size = kBatchHeaderSize + SignedSize(body_size) + body_size;
-  if (batch_size > kMaxBatchSize)
-    return absl::ResourceExhaustedError("KRaft data batch exceeds maximum size");
-  string batch;
-  batch.reserve(batch_size);
-  batch.append(kBatchHeaderSize, '\0');
-  PutSigned(body_size, &batch);
-  batch.append(3, '\0');
-  PutSigned(-1, &batch);
-  PutSigned(value_size, &batch);
+  output->reserve(begin + *batch_size);
+  output->append(kBatchHeaderSize, '\0');
+  PutSigned(body_size, output);
+  output->append(3, '\0');
+  PutSigned(-1, output);
+  PutSigned(value_size, output);
+  if (value_offset)
+    *value_offset = output->size();
   for (string_view part : value_parts)
-    batch.append(part);
-  batch.push_back(0);
-  return FinishBatch(offset, epoch, timestamp_ms, 1, false, std::move(batch));
+    output->append(part);
+  output->push_back(0);
+  return FinishBatch(offset, epoch, timestamp_ms, 1, false,
+                     span(output->data() + begin, *batch_size));
 }
 
 absl::StatusOr<std::string> MakeControlBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "server/cluster/raft/log/log_files.h"
+#include "server/cluster/raft/log/record_batch.h"
 #include "server/cluster/raft/log/snapshot_file.h"
 #include "server/cluster/raft/quorum/election.h"
 
@@ -60,6 +61,12 @@ class PartitionLog {
   }
   LogPosition EndForEpoch(int32_t requested_epoch) const;
 
+  // Invalidates borrowed log caches when truncation or a snapshot can replace records.
+  // Ordinary appends and durability publication do not change this generation.
+  uint64_t content_generation() const {
+    return content_generation_;
+  }
+
   // Memory mode batches ordinary data barriers. Structural changes must flush first.
   bool BufferedFlushDue() const;
   absl::Status FlushBuffered();
@@ -92,7 +99,17 @@ class PartitionLog {
   std::optional<std::string_view> WrittenRecords(int64_t offset, size_t max_bytes) const;
   bool PendingContains(int64_t offset, int32_t epoch) const;
 
-  absl::Status AppendAsFollower(std::string_view batches, int32_t fetch_epoch);
+  struct ValidatedBatch {
+    BatchInfo info;
+    size_t encoded_bytes;
+    std::vector<RecordView> records;
+  };
+
+  // Optionally return the already validated, successfully appended complete prefix.
+  // Record views borrow batches; output is replaced only on success. No second CRC pass is needed
+  // while the caller retains the same immutable bytes. Partial/future-epoch suffixes are excluded.
+  absl::Status AppendAsFollower(std::string_view batches, int32_t fetch_epoch,
+                                std::vector<ValidatedBatch>* appended = nullptr);
 
   absl::Status AppendLeaderChange(int32_t epoch, int64_t timestamp_ms, int32_t leader_id,
                                   std::span<const int32_t> voters,
@@ -151,7 +168,8 @@ class PartitionLog {
   absl::Status SetActive(int64_t base, int flags);
   absl::Status RemoveSuffixSegments();
   absl::Status AppendBatches(std::string_view batches, int32_t epoch, bool follower,
-                             std::optional<DataWritten> written);
+                             std::optional<DataWritten> written,
+                             std::vector<ValidatedBatch>* appended = nullptr);
   absl::Status PublishEnd(int64_t file_end, int64_t end_offset, bool append = false);
 
   std::filesystem::path dir_;
@@ -169,6 +187,7 @@ class PartitionLog {
   std::vector<LogPosition> snapshots_;
   std::vector<int64_t> segment_bases_;
   std::vector<Batch> batches_;
+  uint64_t content_generation_ = 0;
   absl::Status io_failure_;
   std::unique_ptr<PendingAppend> pending_;
 };

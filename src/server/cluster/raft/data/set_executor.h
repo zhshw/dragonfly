@@ -16,10 +16,10 @@ namespace dfly {
 class JournalExecutor;
 
 namespace cluster::raft {
-struct SetEffect;
+struct SetEffectView;
 
 // Apply on a server proactor through the same synchronous transaction used by journal replay.
-absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffect& effect);
+absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffectView& effect);
 
 // Inspect a committed key through the normal shard transaction while the group's proposals
 // are serialized. EXISTS accepts every Redis value type.

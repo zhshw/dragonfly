@@ -125,7 +125,11 @@ TEST_F(FetchReplicationTest, NewlyArrivingFetchReadsWrittenTailBeforeLocalPublic
   auto bytes = Batch(1, 5) + Batch(2, 5);
   const auto expected = bytes;
   const char* data = bytes.data();
-  ASSERT_TRUE(a.fetch.Append(std::move(bytes), 5).ok());
+  auto buffer = make_shared<const string>(std::move(bytes));
+  weak_ptr<const string> lifetime = buffer;
+  ASSERT_TRUE(a.fetch.Append(buffer, 5).ok());
+  buffer.reset();
+  EXPECT_FALSE(lifetime.expired());
   ASSERT_EQ(io.requests.size(), 1u);
   EXPECT_EQ(io.requests.front().bytes.data(), data);
   auto request = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
@@ -148,6 +152,7 @@ TEST_F(FetchReplicationTest, NewlyArrivingFetchReadsWrittenTailBeforeLocalPublic
   io.Complete();
   EXPECT_EQ(a.fetch.HighWatermark(), 1);
   EXPECT_FALSE(a.log->PendingContains(part.fetch_offset, part.last_fetched_epoch));
+  EXPECT_TRUE(lifetime.expired());
   response = Handle(&a, ack);
   EXPECT_EQ(response.responses[0].partitions[0].diverging_epoch.epoch, -1);
   EXPECT_EQ(a.fetch.HighWatermark(), 3);
@@ -412,13 +417,26 @@ TEST_F(FetchReplicationTest, VersionedIdentityAndMalformedRequestsDoNotCountAsVo
 TEST_F(FetchReplicationTest, SmallFetchReturnsCompleteFirstBatchAndDiscardsPartialSuffix) {
   auto a = Make(kA), b = Make(kB);
   Elect(&a, &b);
+  vector<LogPosition> observed;
+  shared_ptr<const string> retained;
+  const char* expected_data = nullptr;
+  b.fetch.SetFetchedRecordsHook([&](const PartitionLog& log, const shared_ptr<const string>& buffer,
+                                    span<const PartitionLog::ValidatedBatch> batches) {
+    ASSERT_EQ(batches.size(), 1u);
+    EXPECT_EQ(log.End(), batches.back().info.end);
+    EXPECT_EQ(buffer->data(), expected_data);
+    observed.push_back(batches.back().info.end);
+    retained = buffer;
+  });
   auto control_size = a.log->Read(0, 1, 1).value().size();
   auto data = Batch(1, 5);
   ASSERT_TRUE(a.fetch.Append(data, 5).ok());
   auto first = b.fetch.PrepareFetch(1, 18, 0, control_size + 12).value();
   auto partial = Handle(&a, first);
   EXPECT_EQ(partial.responses[0].partitions[0].records.data->size(), control_size + 12);
-  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, first.sequence, partial).ok());
+  expected_data = partial.responses[0].partitions[0].records.data->data();
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, first.sequence, std::move(partial)).ok());
+  EXPECT_EQ(observed, (vector<LogPosition>{{5, 1}}));
   EXPECT_EQ(b.log->End(), (LogPosition{5, 1}));
   auto retry = b.fetch.PrepareFetch(1, 18, 0, 1).value();
   auto full = Handle(&a, retry);
@@ -427,10 +445,19 @@ TEST_F(FetchReplicationTest, SmallFetchReturnsCompleteFirstBatchAndDiscardsParti
   broken.responses[0].partitions[0].records.data->back() ^= 0x10;
   broken.responses[0].partitions[0].high_watermark = 200;
   ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, retry.sequence, broken).ok());
+  EXPECT_EQ(observed.size(), 1u);
   EXPECT_EQ(b.log->End().end_offset, 1);
   EXPECT_EQ(b.fetch.HighWatermark(), 1);
   auto last = b.fetch.PrepareFetch(1, 18, 0, 1).value();
-  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, last.sequence, Handle(&a, last)).ok());
+  auto complete = Handle(&a, last);
+  expected_data = complete.responses[0].partitions[0].records.data->data();
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, last.sequence, std::move(complete)).ok());
+  EXPECT_EQ(observed, (vector<LogPosition>{{5, 1}, {5, 2}}));
+  EXPECT_EQ(*retained, data);
+
+  // An old response must not republish its bytes into the application cache.
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, retry.sequence, full).ok());
+  EXPECT_EQ(observed.size(), 2u);
   EXPECT_EQ(b.log->End(), (LogPosition{5, 2}));
 }
 

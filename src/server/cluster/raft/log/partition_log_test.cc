@@ -425,12 +425,30 @@ TEST_F(PartitionLogTest, AppendValidationAndFutureEpochInFetch) {
   EXPECT_FALSE(log_->Append(first + second, 3).ok());
   EXPECT_FALSE(log_->Append(first.substr(0, 35), 3).ok());
   EXPECT_EQ(log_->End().end_offset, 0);
-  ASSERT_TRUE(log_->AppendAsFollower(first + second, 3).ok());
+  const string future_suffix = first + second;
+  vector<PartitionLog::ValidatedBatch> appended;
+  ASSERT_TRUE(log_->AppendAsFollower(future_suffix, 3, &appended).ok());
+  ASSERT_EQ(appended.size(), 1u);
+  EXPECT_EQ(appended[0].info.end, (LogPosition{3, 2}));
+  EXPECT_EQ(appended[0].encoded_bytes, first.size());
+  ASSERT_EQ(appended[0].records.size(), 2u);
+  EXPECT_EQ(appended[0].records[0].value, "foo");
+  EXPECT_GE(appended[0].records[0].value->data(), future_suffix.data());
+  EXPECT_LT(appended[0].records[0].value->data(), future_suffix.data() + first.size());
   EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
-  EXPECT_FALSE(log_->AppendAsFollower(first, 3).ok());
+  EXPECT_FALSE(log_->AppendAsFollower(first, 3, &appended).ok());
+  EXPECT_EQ(appended.size(), 1u);
 
   // A Fetch size limit can include part of the next batch after whole batches.
-  ASSERT_TRUE(log_->AppendAsFollower(second + first.substr(0, 20), 4).ok());
+  const string partial_suffix = second + first.substr(0, 20);
+  ASSERT_TRUE(log_->AppendAsFollower(partial_suffix, 4, &appended).ok());
+  ASSERT_EQ(appended.size(), 1u);
+  EXPECT_EQ(appended[0].info.end, (LogPosition{4, 4}));
+  EXPECT_EQ(log_->End(), (LogPosition{4, 4}));
+  auto corrupt = MakeDataBatch(4, 4, 2, values_).value();
+  corrupt.back() ^= 1;
+  EXPECT_FALSE(log_->AppendAsFollower(corrupt, 4, &appended).ok());
+  EXPECT_EQ(appended[0].info.end, (LogPosition{4, 4}));
   EXPECT_EQ(log_->End(), (LogPosition{4, 4}));
 }
 
@@ -438,9 +456,12 @@ TEST_F(PartitionLogTest, TruncateOnlyUncommittedBatches) {
   auto first = MakeDataBatch(0, 3, 1, values_).value();
   auto second = MakeDataBatch(2, 4, 2, values_).value();
   ASSERT_TRUE(log_->AppendAsFollower(first + second, 4).ok());
+  const auto generation = log_->content_generation();
   EXPECT_FALSE(log_->TruncateTo(0, 2).ok());
   EXPECT_FALSE(log_->TruncateTo(3, 2).ok());
+  EXPECT_EQ(log_->content_generation(), generation);
   ASSERT_TRUE(log_->TruncateTo(2, 2).ok());
+  EXPECT_GT(log_->content_generation(), generation);
   log_.reset();
   Open();
   EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
@@ -479,7 +500,9 @@ TEST_F(PartitionLogTest, PartialDurabilityFailureRequiresReopen) {
   const auto marker = dir_ / "dragonfly-log-end";
   const auto published = fs::file_size(marker);
   fs::resize_file(marker, published + 1);
-  EXPECT_FALSE(log_->Append(batch, 1).ok());
+  vector<PartitionLog::ValidatedBatch> appended;
+  EXPECT_FALSE(log_->AppendAsFollower(batch, 1, &appended).ok());
+  EXPECT_TRUE(appended.empty());
   EXPECT_EQ(log_->End().end_offset, 0);
   EXPECT_FALSE(log_->Read(0, 0, SIZE_MAX).ok());
   EXPECT_FALSE(log_->Append(batch, 1).ok());
