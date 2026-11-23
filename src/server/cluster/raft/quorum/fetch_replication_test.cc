@@ -8,6 +8,7 @@
 #include <stdlib.h>
 
 #include "server/cluster/raft/log/record_batch.h"
+#include "server/cluster/raft/log/testdata/controlled_io.h"
 #include "server/cluster/raft/log/testdata/snapshot_fixture.h"
 
 namespace dfly::cluster::raft {
@@ -111,6 +112,67 @@ class FetchReplicationTest : public testing::Test {
   fs::path dir_;
   int64_t now_ = 1000;
 };
+
+TEST_F(FetchReplicationTest, NewlyArrivingFetchReadsWrittenTailBeforeLocalPublication) {
+  auto a = Make(kA), b = Make(kB);
+  Elect(&a, &b);
+  for (int i = 0; i < 2; ++i) {
+    auto request = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, request.sequence, Handle(&a, request)).ok());
+  }
+  test::ControlledIO io;
+  a.fetch.SetAsyncIO(io.Submitter());
+  const auto bytes = Batch(1, 5) + Batch(2, 5);
+  ASSERT_TRUE(a.fetch.Append(bytes, 5).ok());
+  auto request = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
+  EXPECT_TRUE(Handle(&a, request).responses[0].partitions[0].records.data->empty());
+  io.Complete();
+
+  // This Fetch arrives after WRITE completion and while the segment sync is still pending.
+  request = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
+  auto response = Handle(&a, request);
+  EXPECT_EQ(response.responses[0].partitions[0].records.data, bytes);
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, request.sequence, response).ok());
+  EXPECT_EQ(b.log->End(), (LogPosition{5, 3}));
+  EXPECT_EQ(a.log->End(), (LogPosition{5, 1}));
+  EXPECT_EQ(a.fetch.HighWatermark(), 1);
+  auto ack = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
+  const auto& part = ack.request.topics[0].partitions[0];
+  EXPECT_TRUE(a.log->PendingContains(part.fetch_offset, part.last_fetched_epoch));
+  io.Complete();
+  EXPECT_EQ(a.fetch.HighWatermark(), 1);
+  io.Complete();
+  EXPECT_EQ(a.fetch.HighWatermark(), 1);
+  EXPECT_FALSE(a.log->PendingContains(part.fetch_offset, part.last_fetched_epoch));
+  response = Handle(&a, ack);
+  EXPECT_EQ(response.responses[0].partitions[0].diverging_epoch.epoch, -1);
+  EXPECT_EQ(a.fetch.HighWatermark(), 3);
+}
+
+TEST_F(FetchReplicationTest, AsyncFailureAndLateCompletionCannotCommit) {
+  for (bool failure : {false, true}) {
+    auto a = Make(kA, failure ? 11 : 10, {kVoters.front()});
+    ASSERT_FALSE(a.campaign.Recover({}, {}));
+    ASSERT_TRUE(a.fetch.SyncRole(now_).ok());
+    const auto epoch = a.campaign.state().election.epoch;
+    test::ControlledIO io;
+    a.fetch.SetAsyncIO(io.Submitter());
+    ASSERT_TRUE(a.fetch.Append(Batch(1, epoch), epoch).ok());
+    io.Complete();
+    if (failure) {
+      io.Complete(-EIO);
+      EXPECT_TRUE(a.campaign.state().storage_error);
+      EXPECT_FALSE(a.fetch.HighWatermark());
+      EXPECT_EQ(a.log->End().end_offset, 1);
+    } else {
+      ASSERT_FALSE(a.campaign.ObserveLeader(epoch + 1, nullopt, nullopt));
+      io.Complete();
+      io.Complete();
+      EXPECT_EQ(a.campaign.state().election.epoch, epoch + 1);
+      EXPECT_EQ(a.fetch.HighWatermark(), 1);
+    }
+  }
+}
 
 TEST_F(FetchReplicationTest, LeaderAppendsOnceAndCommitsOnlyReportedDurableVoterEnds) {
   auto a = Make(kA), b = Make(kB);

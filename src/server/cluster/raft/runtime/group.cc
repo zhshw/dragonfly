@@ -11,7 +11,9 @@
 #include <chrono>
 #include <tuple>
 
+#include "base/flags.h"
 #include "base/logging.h"
+#include "raft_io_config.h"
 #include "server/cluster/raft/bootstrap/raft_directory.h"
 #include "server/cluster/raft/quorum/describe.h"
 #include "server/cluster/raft/quorum/fetch_replication.h"
@@ -20,7 +22,15 @@
 #include "server/cluster/raft/transport/peer_connection.h"
 #include "util/fibers/event_count.h"
 #include "util/fibers/fiberqueue_threadpool.h"
+#include "util/fibers/pool.h"
 #include "util/fibers/proactor_base.h"
+#if DFLY_RAFT_USE_FOLLY
+#include "server/cluster/raft/storage/folly_io.h"
+#elif defined(__linux__)
+#include "util/fibers/uring_proactor.h"
+#endif
+
+ABSL_FLAG(bool, raft_async_io, false, "Use asynchronous io_uring for data quorum appends");
 
 namespace dfly::cluster::raft {
 namespace {
@@ -34,6 +44,7 @@ constexpr int32_t kElectionTimeoutMs = 1000;
 constexpr int32_t kFetchTimeoutMs = 2000;
 constexpr uint32_t kRequestTimeoutMs = 1000;
 constexpr int32_t kMaxFetchBytes = 1 << 20;
+constexpr int32_t kMaxDataFetchBytes = 4 << 20;
 
 int64_t NowMs() {
   return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
@@ -77,6 +88,7 @@ class RaftGroup::Impl {
         replication_(campaign_, epochs_, *log_, TopicId(kind)),
         snapshots_(campaign_, epochs_, replication_, *log_, std::move(validate)),
         changes_(campaign_, epochs_, replication_, kRequestTimeoutMs),
+        kind_(kind),
         observer_(observer),
         apply_(std::move(apply)) {
     if (kind == Kind::kData)
@@ -104,7 +116,36 @@ class RaftGroup::Impl {
     return Synchronize();
   }
 
+  ~Impl() {
+    Join();
+#if DFLY_RAFT_USE_FOLLY
+
+    // Join the completion producer before destroying the recipient worker queue.
+    folly_io_.reset();
+#endif
+    if (disk_pool_)
+      disk_pool_->Stop();
+  }
+
   void Start(fb2::ProactorBase* owner) {
+#ifdef __linux__
+    if (kind_ == Kind::kData && absl::GetFlag(FLAGS_raft_async_io)) {
+#if DFLY_RAFT_USE_FOLLY
+      folly_io_ = make_unique<FollyIo>();
+      LOG(INFO) << "Raft file I/O: io_uring (Folly)";
+#else
+      disk_pool_.reset(fb2::Pool::IOUring(256, 1));
+      disk_pool_->Run();
+      LOG(INFO) << "Raft file I/O: io_uring (Helio)";
+#endif
+      RunOnWorker([&] {
+        replication_.SetAsyncIO(
+            [this](int fd, int64_t offset, string_view bytes, PartitionLog::IoCallback done) {
+              SubmitIO(fd, offset, bytes, std::move(done));
+            });
+      });
+    }
+#endif
     supervisor_ = owner->LaunchFiber([this, owner] { ManagePeers(owner); });
   }
 
@@ -118,6 +159,9 @@ class RaftGroup::Impl {
     RequestStop();
     if (supervisor_.IsJoinable())
       supervisor_.Join();
+
+    // Completion callbacks retain the log and its descriptors until both barriers drain.
+    RunOnWorker([] {});
   }
 
   RpcHandlers Handlers();
@@ -150,21 +194,80 @@ class RaftGroup::Impl {
     return tuple{state.role, state.election.epoch, replication_.HighWatermark(), failed_};
   }
 
-  template <typename F> auto RunOnWorker(F&& operation) -> decltype(operation()) {
-    return worker_.Await([&] {
-      const auto commit = CommitState();
-      const auto end = log_->End();
-      absl::Cleanup notify = [&] {
-        if (CommitState() != commit) {
-          commit_changed_.notifyAll();
-          fetch_changed_.notifyAll();
-        } else if (log_->End() != end) {
-          fetch_changed_.notifyAll();
-        }
-      };
-      return operation();
-    });
+  template <typename F>
+  auto RunOnWorker(F&& operation, bool allow_pending = false) -> decltype(operation()) {
+    util::detail::ResultMover<decltype(operation())> result;
+    while (true) {
+      auto key = io_changed_.prepareWait();
+      bool ran = worker_.Await([&] {
+        if (log_->AppendPending() && !allow_pending)
+          return false;
+        const auto commit = CommitState();
+        const auto end = log_->End();
+        result.Apply(operation);
+        NotifyProgress(commit, end);
+        return true;
+      });
+      if (ran)
+        return std::move(result).get();
+      io_changed_.wait(key.epoch());
+    }
   }
+
+  template <typename Commit> void NotifyProgress(const Commit& before, LogPosition end) {
+    if (CommitState() != before) {
+      commit_changed_.notifyAll();
+      fetch_changed_.notifyAll();
+    } else if (log_->End() != end) {
+      fetch_changed_.notifyAll();
+    }
+  }
+
+#ifdef __linux__
+  void SubmitIO(int fd, int64_t offset, string_view bytes, PartitionLog::IoCallback done) {
+#if DFLY_RAFT_USE_FOLLY
+
+    // Folly retries a full queue in its own event loop; no network proactor or fiber is involved.
+    auto completion = make_shared<PartitionLog::IoCallback>(std::move(done));
+    folly_io_->Submit(fd, offset, bytes, [this, completion](int result) {
+      return worker_.GetQueue(0)->TryAdd([this, completion, result] {
+        const auto commit = CommitState();
+        const auto end = log_->End();
+        (*completion)(result);
+        if (!log_->AppendPending()) {
+          Tick();
+          io_changed_.notifyAll();
+        }
+        NotifyProgress(commit, end);
+      });
+    });
+#else
+    auto* proactor = static_cast<fb2::UringProactor*>(disk_pool_->at(0));
+    auto completion = make_shared<PartitionLog::IoCallback>(std::move(done));
+    proactor->Dispatch([this, proactor, fd, offset, bytes, completion] {
+      auto entry = proactor->GetSubmitEntry([this, completion](auto*, int result, auto, auto) {
+        // CQE callbacks cannot block on the bounded worker queue.
+        fb2::Fiber([this, completion, result] {
+          worker_.Add([this, completion, result] {
+            const auto commit = CommitState();
+            const auto end = log_->End();
+            (*completion)(result);
+            if (!log_->AppendPending()) {
+              Tick();
+              io_changed_.notifyAll();
+            }
+            NotifyProgress(commit, end);
+          });
+        }).Detach();
+      });
+      if (offset < 0)
+        entry.PrepFSync(fd, 0);
+      else
+        entry.PrepWrite(fd, bytes.data(), bytes.size(), offset, 0);
+    });
+#endif
+  }
+#endif
 
   bool LocalVoter() const {
     return !observer_ && ranges::any_of(campaign_.voters(), [&](const CampaignVoter& peer) {
@@ -390,7 +493,8 @@ class RaftGroup::Impl {
       if (failed_ || campaign_.state().role != QuorumRole::kFollower ||
           campaign_.state().election.leader_id != leader)
         return nullopt;
-      return replication_.PrepareFetch(leader, version, 100, kMaxFetchBytes);
+      const auto max_bytes = kind_ == Kind::kData ? kMaxDataFetchBytes : kMaxFetchBytes;
+      return replication_.PrepareFetch(leader, version, 100, max_bytes);
     });
     if (!fetch)
       return false;
@@ -491,10 +595,16 @@ class RaftGroup::Impl {
   FetchReplication replication_;
   SnapshotTransfer snapshots_;
   VoterChanges changes_;
+  const Kind kind_;
   const bool observer_;
   ApplyCommitted apply_;
   fb2::EventCount fetch_changed_;
   fb2::EventCount commit_changed_;
+  fb2::EventCount io_changed_;
+  unique_ptr<fb2::Pool> disk_pool_;
+#if DFLY_RAFT_USE_FOLLY
+  unique_ptr<FollyIo> folly_io_;
+#endif
   int64_t applied_ = -1;
   map<int32_t, int64_t> discovery_after_;
   fb2::FiberQueueThreadPool worker_{1};
@@ -616,12 +726,32 @@ error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
   bool can_wait = false;
   shared_ptr<const FetchReplication::ParkedFetch> parked;
   auto respond = [&](bool initial) {
-    return OnWorker([&] {
-      auto contact = initial ? optional<int64_t>{NowMs()} : nullopt;
-      auto s = replication_.HandleFetch(request, version, contact, WallMs(), response, &can_wait,
-                                        initial ? &parked : nullptr);
-      return s.ok() ? error_code{} : make_error_code(errc::io_error);
-    });
+    while (true) {
+      auto io_key = io_changed_.prepareWait();
+      auto result = RunOnWorker(
+          [&] {
+            if (!log_->AppendPending())
+              Tick();
+            if (failed_ || stopping_)
+              return make_error_code(errc::state_not_recoverable);
+
+            // A follower may persist the exposed tail first. Revalidate its original request
+            // after local publication, without recording contact or claiming divergence early.
+            if (request.topics.size() == 1 && request.topics.front().partitions.size() == 1) {
+              const auto& part = request.topics.front().partitions.front();
+              if (log_->PendingContains(part.fetch_offset, part.last_fetched_epoch))
+                return make_error_code(errc::resource_unavailable_try_again);
+            }
+            auto contact = initial ? optional<int64_t>{NowMs()} : nullopt;
+            auto s = replication_.HandleFetch(request, version, contact, WallMs(), response,
+                                              &can_wait, initial ? &parked : nullptr);
+            return s.ok() ? error_code{} : make_error_code(errc::io_error);
+          },
+          true);
+      if (result != errc::resource_unavailable_try_again)
+        return result;
+      io_changed_.wait(io_key.epoch());
+    }
   };
   if (auto ec = respond(true); ec || !can_wait || steady_clock::now() >= deadline)
     return ec;

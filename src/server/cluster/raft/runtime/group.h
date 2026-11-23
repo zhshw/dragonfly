@@ -25,7 +25,7 @@ class ElectionCampaign;
 class FetchReplication;
 class PartitionLog;
 
-// All access to a partition's log, including application callbacks, runs on its disk worker.
+// All partition state, including application and I/O completion callbacks, runs on its worker.
 class RaftGroup {
  public:
   enum class Kind { kMetadata, kData };

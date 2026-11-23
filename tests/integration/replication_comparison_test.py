@@ -52,7 +52,7 @@ def paused(process):
 
 
 class ReplicationComparison:
-    """Both runners use the same node IDs, slots, data and one outstanding SET per client."""
+    """Both runners share topology/data; default to one SET in flight per client."""
 
     def setUp(self):
         super().setUp()
@@ -73,9 +73,11 @@ class ReplicationComparison:
         leader = self.leader
         mib = int(os.getenv("REPLICATION_TEST_MIB", "64"))
         clients = int(os.getenv("REPLICATION_TEST_CLIENTS", "1"))
+        pipeline_depth = int(os.getenv("REPLICATION_TEST_PIPELINE", "1"))
         settle_seconds = float(os.getenv("REPLICATION_TEST_SETTLE_SECONDS", "5"))
         warmup_writes = int(os.getenv("REPLICATION_TEST_WARMUP_WRITES", "32"))
         self.assertGreater(mib, 0)
+        self.assertGreater(pipeline_depth, 0)
         self.assertGreaterEqual(settle_seconds, 0)
         self.assertGreaterEqual(warmup_writes, 0)
         rng = random.Random(42)
@@ -94,9 +96,19 @@ class ReplicationComparison:
             latencies = []
             barrier.wait(timeout=10)
             start = time.monotonic()
-            for key, value in records:
+            for offset in range(0, len(records), pipeline_depth):
                 sent = time.monotonic()
-                self.assertTrue(writer.set(key, value))
+                chunk = records[offset : offset + pipeline_depth]
+                if pipeline_depth == 1:
+                    self.assertTrue(writer.set(*chunk[0]))
+                else:
+                    # Use the reserved writing connection so WAIT covers this exact stream.
+                    connection = writer.connection
+                    connection.send_packed_command(
+                        connection.pack_commands(("SET", key, value) for key, value in chunk)
+                    )
+                    for _ in chunk:
+                        self.assertTrue(writer.parse_response(connection, "SET"))
                 last_ack = time.monotonic()
                 latencies.append((last_ack - sent) * 1000)
             return start, last_ack, latencies
@@ -137,12 +149,20 @@ class ReplicationComparison:
                     self.assertEqual(writer.wait(1, 5000), 1)
                 samples = write_batch(data)
 
+                # Include every connection's replica confirmation in the replication metric.
+                # Reuse the writers and pool; each connection is accessed by one task at a time.
+                confirmations = [executor.submit(writer.wait, 1, 5000) for writer in writers]
+                for confirmation in confirmations:
+                    self.assertEqual(confirmation.result(), 1)
+                replication_end = time.monotonic()
+
             write_ms = round(
                 (max(end for _, end, _ in samples) - min(s for s, _, _ in samples)) * 1000, 2
             )
             latencies = [ms for _, _, times in samples for ms in times]
-            for writer in writers:
-                self.assertEqual(writer.wait(1, 5000), 1)
+            replication_ms = (replication_end - min(s for s, _, _ in samples)) * 1000
+            replication_tail_ms = (replication_end - max(end for _, end, _ in samples)) * 1000
+            self.assertGreaterEqual(replication_tail_ms, 0)
 
             # Include process launch and reconnection in time to recover. Legacy WAIT takes a
             # fresh replica snapshot per invocation, so retry if the new process is not online.
@@ -162,19 +182,35 @@ class ReplicationComparison:
                 dict(
                     mode=self.mode,
                     clients=clients,
+                    pipeline_depth=pipeline_depth,
                     payload_mib=mib,
                     keys=len(data),
                     settle_seconds=settle_seconds,
                     warmup_writes=warmup_writes,
                     readback_node=13,
                     write_ms=write_ms,
+                    measure_start_ns=int(min(s for s, _, _ in samples) * 1_000_000_000),
+                    measure_end_ns=int(max(end for _, end, _ in samples) * 1_000_000_000),
                     mib_per_s=round(mib * 1000 / write_ms, 2),
-                    first_set_p50_ms=round(
-                        percentile([times[0] for _, _, times in samples], 0.5), 2
+                    replication_ms=round(replication_ms, 2),
+                    replication_mib_per_s=round(mib * 1000 / replication_ms, 2),
+                    replication_tail_ms=round(replication_tail_ms, 2),
+                    replication_end_ns=int(replication_end * 1_000_000_000),
+                    confirmed_replicas=1,
+                    first_set_p50_ms=(
+                        round(percentile([times[0] for _, _, times in samples], 0.5), 2)
+                        if pipeline_depth == 1
+                        else None
                     ),
-                    set_p50_ms=round(percentile(latencies, 0.5), 2),
-                    set_p95_ms=round(percentile(latencies, 0.95), 2),
-                    set_max_ms=round(max(latencies), 2),
+                    set_p50_ms=(
+                        round(percentile(latencies, 0.5), 2) if pipeline_depth == 1 else None
+                    ),
+                    set_p95_ms=(
+                        round(percentile(latencies, 0.95), 2) if pipeline_depth == 1 else None
+                    ),
+                    set_max_ms=round(max(latencies), 2) if pipeline_depth == 1 else None,
+                    pipeline_batch_p50_ms=round(percentile(latencies, 0.5), 2),
+                    pipeline_batch_p95_ms=round(percentile(latencies, 0.95), 2),
                     restart_to_wait_two_ms=recovery_ms,
                 )
             ),

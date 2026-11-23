@@ -95,6 +95,19 @@ option(DF_USE_SSL "Provide support for SSL connections" ON)
 
 find_package(OpenSSL)
 
+option(WITH_RAFT_FOLLY "Use Folly for Raft io_uring file operations" OFF)
+set(RAFT_FOLLY_SOURCE_DIR "" CACHE PATH "Optional Folly source tree for the Raft I/O build")
+if(WITH_RAFT_FOLLY)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "WITH_RAFT_FOLLY requires Linux")
+  endif()
+  if(RAFT_FOLLY_SOURCE_DIR)
+    add_subdirectory("${RAFT_FOLLY_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/folly" EXCLUDE_FROM_ALL)
+  else()
+    find_package(folly CONFIG REQUIRED)
+  endif()
+endif()
+
 # AFL++ configuration - must be before sanitizer checks
 if(USE_AFL)
   message(STATUS "AFL++ fuzzing mode active")

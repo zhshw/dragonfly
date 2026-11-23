@@ -44,6 +44,17 @@ class RecoveryMarker {
   absl::StatusOr<std::optional<DurableEnd>> Read(int dir_fd);
   absl::Status Publish(int dir_fd, const DurableEnd& end, bool append = false);
 
+  struct AppendPublication {
+    int fd;
+    int64_t length;
+  };
+
+  // Only the existing DFE4 window can publish without replacing files. The owner must
+  // serialize mutations until SelectAppend and its asynchronous fsync have completed.
+  absl::StatusOr<std::optional<AppendPublication>> PrepareAppend(const DurableEnd& end) const;
+  absl::Status SelectAppend(AppendPublication publication);
+  void FinishAppend(AppendPublication publication);
+
  private:
   int fd_ = -1;
   DurableEnd checkpoint_;

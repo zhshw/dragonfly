@@ -42,8 +42,13 @@ class FetchReplication {
   [[nodiscard]] absl::Status SyncRole(int64_t timestamp_ms);
   // A successful data write can survive a later flush error or be replicated before it.
   // may_have_appended lets the client distinguish an uncertain outcome from a rejection.
+  // With AsyncIO enabled success may mean accepted: callers must still wait for HW/application.
+  // The owner drains the pending append before changing term, truncating or installing snapshots.
   [[nodiscard]] absl::Status Append(std::string_view batches, int32_t expected_epoch,
                                     bool* may_have_appended = nullptr);
+  void SetAsyncIO(PartitionLog::AsyncIO submit) {
+    async_io_ = std::move(submit);
+  }
   std::optional<int64_t> HighWatermark() const;
   int64_t LogEndOffset() const {
     return log_.End().end_offset;
@@ -125,6 +130,8 @@ class FetchReplication {
   absl::StatusOr<std::vector<CampaignVoter>> ConfiguredVoters(
       const MembershipHistory& history) const;
   void UpdateHighWatermark();
+  void PublishWritten(std::string_view batches, size_t first_batch_size);
+  absl::Status Appended(std::string_view batches);
   ParkedFetch::Tail CurrentFetchTail() const;
   absl::Status DurableFailure(absl::Status status);
 
@@ -151,6 +158,7 @@ class FetchReplication {
   std::optional<int32_t> request_peer_;
   uint64_t sequence_ = 0;
   absl::Status io_error_;
+  PartitionLog::AsyncIO async_io_;
 };
 
 }  // namespace dfly::cluster::raft

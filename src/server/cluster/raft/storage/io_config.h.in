@@ -1,0 +1,8 @@
+// Copyright 2026, DragonflyDB authors. All rights reserved.
+// See LICENSE for licensing terms.
+//
+
+#pragma once
+
+// Both implementations use io_uring. This selects the file I/O library at build time only.
+#cmakedefine01 DFLY_RAFT_USE_FOLLY

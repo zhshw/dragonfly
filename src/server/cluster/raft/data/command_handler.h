@@ -6,6 +6,7 @@
 
 #include <absl/status/statusor.h>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@
 #include "server/cluster/cluster_defs.h"
 #include "server/cluster/raft/data/write_position.h"
 #include "server/common_types.h"
+#include "util/fibers/synchronization.h"
 
 namespace dfly::cluster::raft {
 
@@ -43,11 +45,31 @@ struct DataReplicationState {
   bool connected_to_leader = false;
 };
 
+// Owns completion independently of the connection. Published by ready reaching zero only after
+// majority durability and local application (or failure); position also fences unknown outcomes.
+struct PendingDataWrite {
+  virtual ~PendingDataWrite() = default;
+  util::fb2::EmbeddedBlockingCounter ready{1};
+  absl::Status status;
+  DataWritePosition position;
+};
+
 // Installed before Service::Init and kept alive until Service::Shutdown completes.
 // Methods run on client fibers. SET returns only after the group's committed effect is applied.
 class DataCommandHandler {
  public:
   virtual ~DataCommandHandler() = default;
+  virtual bool SupportsAsyncSet() const {
+    return false;
+  }
+
+  // Never waits. Null means no admission and no side effects: retry when the command is head.
+  // Accepted writes own their input, enter the log in submission order, and survive disconnect.
+  virtual std::shared_ptr<PendingDataWrite> TrySet(DbIndex db, std::string_view key,
+                                                   std::string_view value) {
+    return nullptr;
+  }
+
   virtual absl::Status Set(DbIndex db, std::string_view key, std::string_view value,
                            DataWritePosition* position) = 0;
   virtual absl::StatusOr<bool> SetIf(DbIndex db, std::string_view key, std::string_view value,

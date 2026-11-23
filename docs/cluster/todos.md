@@ -37,9 +37,9 @@ KRaft 用排他 offset 和 leader epoch 标识快照。副本缺少可读日志�
 - [x] **落后副本追赶**　落后位置仍在日志内时沿用普通 Fetch，早于保留起点时通过 FetchSnapshot 分块补齐。检查快照身份、大小和内容，安装后继续复制新写入。[FetchSnapshot 测试](../../src/server/cluster/raft/quorum/snapshot_transfer_test.cc)
 - [x] **进程验收**　让一台 voter 离线至组内清掉旧前缀，验证它追平、能接任 leader 并读回快照和后缀中的值。迁槽冻结期间重启数据节点，再验证操作恢复、归属和邻槽数据。[进程测试](../../tests/integration/raft_data_group_test.py)
 - [x] **复制对比**　在旧版异步和 Raft 两种集群写入相同的大值，停止一台副本后恢复并逐键校验。暂停一台和两台副本，分别检查 SET、WAIT、另一组的可用性，以及少数派日志的可见性。[配对测试](../../tests/integration/replication_comparison_test.py)
-- [x] **传输阻塞与恢复**　旧版全量同步时暂停副本读取，验证写入反压和缓冲排空。Raft 副本下载部分快照时将其暂停并强杀，验证多数仍可提交，恢复后完整快照和尾部写入均可读回。与上游 KRaft 的多数提交、Fetch 批次边界、快照分块用例逐项对照。[阻塞与快照恢复实测](replication-benchmark.md#阻塞与快照恢复)
-- [x] **复制延迟**　用日志追加唤醒空 Fetch，用提交进度唤醒写入方。对照异步与 Raft 在 64 MiB、128 MiB 串行写入时的延迟、吞吐量和重启追平时间，并验证少数派写入和并发 NX。[写入与追平实测](replication-benchmark.md#落后一个副本时写入及恢复) · [组内唤醒](raft-replication-design.md#组内唤醒与上游实现)
-- [x] **KRaft 复制优化**　挂起的 Fetch 可在 leader 刷盘前取得普通数据批，日志段追加复用恢复文件。并发普通 SET 可共享刷盘，提交后由 leader 直接应用缓存的效果。覆盖阻塞刷盘、换主丢弃旧缓存和 DFE2 整群升级重启。[数据组复制优化项](replication-benchmark.md#数据组复制优化项)
+- [x] **传输阻塞与恢复**　旧版全量同步时暂停副本读取，验证写入反压和缓冲排空。Raft 副本下载部分快照时将其暂停并强杀，验证多数仍可提交，恢复后完整快照和尾部写入均可读回。[快照中断用例](../../tests/integration/raft_snapshot_stall_test.py) · [旧版复制回归](../../tests/dragonfly/replication_test.py)
+- [x] **复制延迟**　用日志追加唤醒空 Fetch，用提交进度唤醒写入方。原 cluster 与 Folly 异步 Raft 在 256 MiB、1/8/64 连接下对照副本确认完成吞吐和重启追平时间，并验证少数派写入和并发 NX。[写入与追平实测](replication-benchmark.md#最新结论pipeline-64-逐档测试8-连接停止) · [组内唤醒](raft-replication-design.md#组内唤醒与上游实现)
+- [x] **KRaft 复制优化**　挂起的 Fetch 可在 leader 刷盘前取得普通数据批，日志段追加复用恢复文件。并发普通 SET 可共享刷盘，提交后由 leader 直接应用缓存的效果。覆盖阻塞刷盘、换主丢弃旧缓存和 DFE2 整群升级重启。[数据组复制优化项](replication-benchmark.md#当前实现与后续试验)
 
 双引擎分片的进程用例逐字节比较了 leader 与落后 voter 的快照，文件超过 1 MiB，需要多次 FetchSnapshot。尾部新写达到 `WAIT 2` 后，让恢复的 voter 当选并再次重启，验证两个引擎分片上的值和增量写入。七节点用例还验证了冻结时两个源 voter 从快照恢复、随后迁槽完成及整群重启。Kafka 对照执行了 `MockLogTest` 和 `KafkaRaftClientSnapshotTest` 中的快照提示、分块响应与监听器通知用例。[上游日志测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/MockLogTest.java) · [上游快照测试](../../../kafka/raft/src/test/java/org/apache/kafka/raft/KafkaRaftClientSnapshotTest.java)
 

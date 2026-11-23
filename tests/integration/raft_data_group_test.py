@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import socket
 import subprocess
@@ -31,6 +32,7 @@ class RaftDataGroupFixture(unittest.TestCase):
     new_controller = None
     controller_admin = False
     data_threads = 1
+    data_flags = ()
     snapshot_bytes = {}
     snapshot_interval_ms = 0
 
@@ -141,6 +143,8 @@ class RaftDataGroupFixture(unittest.TestCase):
             "--logtostderr",
         ]
         if node in self.resp:
+            flags += shlex.split(os.environ.get("RAFT_TEST_DATA_FLAGS", ""))
+            flags += self.data_flags
             flags += [
                 "--raft_role=data",
                 f"--raft_listen={HOST}:{self.raft[node]}",
@@ -401,6 +405,171 @@ class RaftDataGroupTest(RaftDataGroupFixture):
             leader = next(n for n in members if self.resp[n] == row[2][1])
             result = probe(leader, "__dragonfly_data", gid, len(members))
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class RaftPipelineTest(RaftDataGroupFixture):
+    data_threads = 4
+    data_flags = ("--raft_async_io=true", "--raft_drain_writes=true")
+
+    def writer(self):
+        slots = self.wait_for(self.slots)
+        master, follower = slots[0][2:4]
+        by_port = {port: node for node, port in self.resp.items()}
+        key = self.key_for_range(*slots[0][:2])
+        client = redis.Redis(
+            host=HOST, port=master[1], single_connection_client=True, socket_timeout=10
+        )
+        self.addCleanup(client.close)
+        client.ping()
+        return client, key, by_port[master[1]], by_port[follower[1]]
+
+    def test_pipeline_admits_before_majority_and_survives_disconnect(self):
+        client, key, leader, follower = self.writer()
+        self.assertTrue(client.set(key, b"initial"))
+        self.assertEqual(client.wait(1, 2500), 1)
+
+        def view():
+            return describe(self.raft[leader], b"__dragonfly_data", 10)
+
+        for disconnect in (False, True):
+            before = self.wait_for(view)
+            commands = [("SET", key, f"{disconnect}-{i}".encode()) for i in range(64)]
+            self.proc[follower].send_signal(signal.SIGSTOP)
+            try:
+                connection = client.connection
+                connection.send_packed_command(connection.pack_commands(commands))
+
+                # The old serial path appends just one write here. Require all 64 while no
+                # follower can acknowledge, and verify that no OK has reached the client.
+                def admitted():
+                    current = view()
+                    if current and current.voters[leader] >= before.voters[leader] + 64:
+                        return current
+
+                after = self.wait_for(admitted, timeout=2.5, poll_interval=0.01)
+                self.assertEqual(after.hw, before.hw)
+                self.assertFalse(connection.can_read(timeout=0))
+                if disconnect:
+                    client.close()
+            finally:
+                self.proc[follower].send_signal(signal.SIGCONT)
+            if not disconnect:
+                self.assertEqual([connection.read_response() for _ in commands], [b"OK"] * 64)
+                self.assertEqual(client.wait(1, 2500), 1)
+            with self.client(leader) as reader:
+                self.wait_for(lambda: reader.get(key) == commands[-1][2])
+
+    def test_shutdown_drains_pending_pipeline_without_false_success(self):
+        client, key, leader, follower = self.writer()
+        self.assertTrue(client.set(key, b"confirmed"))
+        self.assertEqual(client.wait(1, 2500), 1)
+        before = describe(self.raft[leader], b"__dragonfly_data", 10)
+        commands = [("SET", b"{" + key + b"}:pending", str(i)) for i in range(32)]
+        connection = client.connection
+        self.proc[follower].send_signal(signal.SIGSTOP)
+        try:
+            connection.send_packed_command(connection.pack_commands(commands))
+            self.wait_for(
+                lambda: describe(self.raft[leader], b"__dragonfly_data", 10).voters[leader]
+                >= before.voters[leader] + len(commands),
+                timeout=2.5,
+                poll_interval=0.01,
+            )
+            self.assertFalse(connection.can_read(timeout=0))
+            self.stop(leader)
+            for _ in commands:
+                try:
+                    reply = connection.read_response()
+                except redis.exceptions.ResponseError as error:
+                    self.assertIsInstance(
+                        error, (redis.exceptions.TryAgainError, redis.exceptions.ClusterDownError)
+                    )
+                except redis.exceptions.ConnectionError:
+                    break
+                else:
+                    self.fail(f"unexpected success without a majority: {reply!r}")
+        finally:
+            self.proc[follower].send_signal(signal.SIGCONT)
+        self.start(leader)
+        slots = self.wait_for(self.slots)
+        with redis.Redis(host=HOST, port=slots[0][2][1]) as recovered:
+            self.assertEqual(recovered.get(key), b"confirmed")
+
+    def test_pipeline_barriers_saturation_and_recovery(self):
+        client, key, leader, _ = self.writer()
+        tag = b"{" + key + b"}:"
+        commands = []
+        expected = []
+        values = {}
+        for count, size in ((300, 16), (48, 256 * 1024)):
+            for i in range(count):
+                name = tag + f"{size}-{i}".encode()
+                value = bytes([i % 256]) * size
+                values[name] = value
+                commands.append(("SET", name, value))
+                expected.append(b"OK")
+        commands.extend(
+            [
+                ("SET", key, b"first"),
+                ("SET", key, b"last"),
+                ("GET", key),
+                ("SET", key, b"x" * (9 * 1024 * 1024)),
+                ("SET", key, b"ignored", "NX"),
+                ("GET", key),
+                ("SET", key, b"conditional", "XX"),
+                ("WAIT", 1, 2500),
+                ("GET", key),
+                ("SELECT", 1),
+                ("GET", key),
+                ("SET", key, b"db-one"),
+                ("GET", key),
+                ("RESET",),
+                ("GET", key),
+                ("WAIT", 1, 2500),
+            ]
+        )
+        expected.extend(
+            [
+                b"OK",
+                b"OK",
+                b"last",
+                ("error", "Dragonfly SET effect exceeds Kafka batch size"),
+                None,
+                b"last",
+                b"OK",
+                1,
+                b"conditional",
+                b"OK",
+                None,
+                b"OK",
+                b"db-one",
+                b"RESET",
+                b"conditional",
+                1,
+            ]
+        )
+        connection = client.connection
+        connection.send_packed_command(connection.pack_commands(commands))
+        replies = []
+        for _ in commands:
+            try:
+                replies.append(connection.read_response())
+            except redis.exceptions.ResponseError as error:
+                replies.append(("error", str(error)))
+        self.assertEqual(replies, expected)
+        values[key] = b"conditional"
+
+        # Confirmed replies remain recoverable after both data voters are killed.
+        for node in GROUPS[10]:
+            self.stop(node, crash=True)
+        for node in GROUPS[10]:
+            self.start(node)
+        slots = self.wait_for(self.slots)
+        with redis.Redis(host=HOST, port=slots[0][2][1]) as recovered:
+            for name, value in values.items():
+                self.assertEqual(recovered.get(name), value)
+            self.assertTrue(recovered.select(1))
+            self.assertEqual(recovered.get(key), b"db-one")
 
 
 class ControllerAdminTest(RaftDataGroupFixture):

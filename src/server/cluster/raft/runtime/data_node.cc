@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 
 #include "base/flags.h"
 #include "base/logging.h"
@@ -29,6 +30,8 @@
 #include "util/fibers/pool.h"
 #include "util/fibers/synchronization.h"
 
+ABSL_FLAG(bool, raft_drain_writes, false,
+          "Drain ready ordinary SETs with bounded queue backpressure");
 ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_bytes);
 ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_interval_ms);
 
@@ -62,6 +65,7 @@ struct PendingSet {
   optional<SetEffect> effect{};
   size_t encoded_bytes = 0;
   LogPosition end{};
+  fb2::EmbeddedBlockingCounter appended{1};
 };
 
 struct SetBatch {
@@ -84,6 +88,17 @@ struct LocalPartition {
   // the open batch need the mutex; all validation and appends run on the group worker.
   fb2::Mutex batch_mu;
   shared_ptr<SetBatch> open_batch;
+  deque<PendingSet*> ready_sets;
+  size_t queued_bytes = 0;
+  size_t queued_requests = 0;
+  bool draining = false;
+  size_t drainers = 0;
+  size_t set_waiters = 0;
+
+  // Reservations include completed writes until their ordered replies release the ticket.
+  atomic_size_t async_bytes{0};
+  atomic_size_t async_requests{0};
+  fb2::EventCount queue_changed;
   int32_t id;
   CommittedEffects effects;
   DataSnapshotter snapshots;
@@ -95,6 +110,25 @@ struct LocalPartition {
   unique_ptr<RaftGroup> raft;
   unique_ptr<SlotMigrationDriver> migrations;
   RpcHandlers handlers;
+};
+
+struct AsyncPendingSet final : PendingDataWrite {
+  AsyncPendingSet(shared_ptr<LocalPartition> local, DbIndex db, string_view key, string_view value)
+      : local(std::move(local)),
+        key(key),
+        value(value),
+        proposal{db, KeySlot(key), this->key, this->value, nullopt} {
+  }
+
+  ~AsyncPendingSet() override {
+    local->async_bytes.fetch_sub(key.size() + value.size());
+    local->async_requests.fetch_sub(1);
+  }
+
+  shared_ptr<LocalPartition> local;
+  string key;
+  string value;
+  PendingSet proposal;
 };
 
 class DataNodeImpl final : public DataNode {
@@ -162,10 +196,19 @@ class DataNodeImpl final : public DataNode {
       migration_fiber_.Join();
     if (snapshot_fiber_.IsJoinable())
       snapshot_fiber_.Join();
-    if (auto group = partition_.load())
+    if (auto group = partition_.load()) {
       group->raft->Join();
+      group->queue_changed.await([&] {
+        lock_guard lock(group->batch_mu);
+        return group->drainers == 0 && group->set_waiters == 0;
+      });
+    }
     observer_->Join();
   }
+  bool SupportsAsyncSet() const override {
+    return absl::GetFlag(FLAGS_raft_drain_writes);
+  }
+  shared_ptr<PendingDataWrite> TrySet(DbIndex db, string_view key, string_view value) override;
   absl::Status Set(DbIndex db, string_view key, string_view value,
                    DataWritePosition* position) override;
   absl::StatusOr<bool> SetIf(DbIndex db, string_view key, string_view value, SetCondition condition,
@@ -193,6 +236,10 @@ class DataNodeImpl final : public DataNode {
   }
   absl::StatusOr<bool> ProposeSet(DbIndex db, string_view key, string_view value,
                                   optional<SetCondition> condition, DataWritePosition* position);
+  absl::Status QueueSet(shared_ptr<LocalPartition> local, PendingSet* request);
+  void DrainSets(shared_ptr<LocalPartition> local);
+  absl::Status WaitApplied(shared_ptr<LocalPartition> local, const PendingSet& proposal,
+                           steady_clock::time_point deadline, DataWritePosition* position);
   absl::Status AppendSetBatch(LocalPartition& local, SetBatch& batch, RaftGroup::State state,
                               bool* done);
   absl::Status OpenPartition(const MetadataImage& image, const Broker& local);
@@ -462,6 +509,58 @@ absl::StatusOr<optional<string>> DataNodeImpl::Get(DbIndex db, string_view key) 
   return value;
 }
 
+shared_ptr<PendingDataWrite> DataNodeImpl::TrySet(DbIndex db, string_view key, string_view value) {
+  auto local = partition_.load();
+  if (!local || stopping_ || !SupportsAsyncSet())
+    return nullptr;
+  constexpr size_t kQueueBytes = 8U << 20;
+  constexpr size_t kQueueRequests = 256;
+  const size_t bytes = key.size() + value.size();
+  unique_lock lock(local->batch_mu, try_to_lock);
+  if (!lock.owns_lock() || stopping_)
+    return nullptr;
+  const size_t reserved = local->async_bytes.load();
+  const size_t requests = local->async_requests.load();
+  if ((requests &&
+       (requests >= kQueueRequests || bytes > kQueueBytes - min(kQueueBytes, reserved))) ||
+      (local->queued_requests && (local->queued_requests >= kQueueRequests ||
+                                  bytes > kQueueBytes - min(kQueueBytes, local->queued_bytes))))
+    return nullptr;
+
+  auto request = make_shared<AsyncPendingSet>(local, db, key, value);
+  local->async_bytes.fetch_add(bytes);
+  local->async_requests.fetch_add(1);
+  local->ready_sets.push_back(&request->proposal);
+  local->queued_bytes += bytes;
+  ++local->queued_requests;
+  ++local->set_waiters;
+  const bool launch = !exchange(local->draining, true);
+  if (launch)
+    ++local->drainers;
+  lock.unlock();
+  const auto deadline = steady_clock::now() + seconds(5);
+
+  // Post locally so admission never yields, even if the owner's dispatch queue is full. The
+  // ticket owns input and completion; this fiber never accesses the command or its connection.
+  fb2::Fiber("raft-set-confirm", [this, local, request, launch, deadline] {
+    if (launch)
+      owner_->Dispatch([this, local] { DrainSets(local); });
+    request->proposal.appended.Wait();
+    request->status = request->proposal.status;
+    if (request->status.ok())
+      request->status = WaitApplied(local, request->proposal, deadline, &request->position);
+    else if (absl::IsDeadlineExceeded(request->status))
+      request->status = absl::UnavailableError("-TRYAGAIN Data group is catching up");
+    request->ready.Dec();
+    {
+      lock_guard lock(local->batch_mu);
+      --local->set_waiters;
+    }
+    local->queue_changed.notifyAll();
+  }).Detach();
+  return request;
+}
+
 absl::Status DataNodeImpl::Set(DbIndex db, string_view key, string_view value,
                                DataWritePosition* position) {
   return ProposeSet(db, key, value, nullopt, position).status();
@@ -483,52 +582,69 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
 
   PendingSet proposal{db, slot, key, value, condition};
   const auto deadline = steady_clock::now() + seconds(5);
-  shared_ptr<SetBatch> batch;
-  bool dispatch;
-  {
-    // The first request dispatches immediately. Only writes already waiting when the worker
-    // picks up the batch share its flush. Conditional SET evaluates against committed KV alone.
-    constexpr size_t kMaxGroupPayload = 1U << 20;
-    constexpr size_t kMaxGroupRequests = 32;
-    const size_t size = key.size() + value.size();
-    lock_guard lock(local->batch_mu);
-    batch = local->open_batch;
-    dispatch = !batch || condition || batch->requests.size() >= kMaxGroupRequests ||
-               batch->value_bytes + size > kMaxGroupPayload;
-    if (dispatch) {
-      batch = make_shared<SetBatch>();
-      local->open_batch = condition ? nullptr : batch;
+  if (absl::GetFlag(FLAGS_raft_drain_writes)) {
+    if (auto status = QueueSet(local, &proposal); !status.ok()) {
+      if (absl::IsDeadlineExceeded(status))
+        return absl::UnavailableError("-TRYAGAIN Data group is catching up");
+      return status;
     }
-    batch->value_bytes += size;
-    batch->requests.push_back(&proposal);
-  }
-
-  if (dispatch) {
-    auto seal = [&] {
-      lock_guard lock(local->batch_mu);
-      if (local->open_batch == batch)
-        local->open_batch.reset();
-    };
-    batch->status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
-      seal();
-      return AppendSetBatch(*local, *batch, state, done);
-    });
-
-    // VisitUntil can stop before invoking the callback, for example during shutdown.
-    if (!batch->status.ok())
-      seal();
-    batch->appended.Dec();
   } else {
-    batch->appended.Wait();
-  }
+    shared_ptr<SetBatch> batch;
+    bool dispatch;
+    {
+      // The first request dispatches immediately. Only writes already waiting when the worker
+      // picks up the batch share its flush. Conditional SET evaluates against committed KV alone.
+      constexpr size_t kMaxGroupPayload = 1U << 20;
+      constexpr size_t kMaxGroupRequests = 32;
+      const size_t size = key.size() + value.size();
+      lock_guard lock(local->batch_mu);
+      batch = local->open_batch;
+      dispatch = !batch || condition || batch->requests.size() >= kMaxGroupRequests ||
+                 batch->value_bytes + size > kMaxGroupPayload;
+      if (dispatch) {
+        batch = make_shared<SetBatch>();
+        local->open_batch = condition ? nullptr : batch;
+      }
+      batch->value_bytes += size;
+      batch->requests.push_back(&proposal);
+    }
 
-  if (!proposal.status.ok())
-    return proposal.status;
-  if (!batch->status.ok()) {
-    if (absl::IsDeadlineExceeded(batch->status))
-      return absl::UnavailableError("-TRYAGAIN Data group is catching up");
-    return batch->status;
+    if (dispatch) {
+      auto seal = [&] {
+        lock_guard lock(local->batch_mu);
+        if (local->open_batch == batch)
+          local->open_batch.reset();
+      };
+      batch->status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
+        seal();
+        return AppendSetBatch(*local, *batch, state, done);
+      });
+
+      // VisitUntil can stop before invoking the callback, for example during shutdown.
+      if (!batch->status.ok())
+        seal();
+      batch->appended.Dec();
+    } else {
+      batch->appended.Wait();
+    }
+
+    if (!proposal.status.ok())
+      return proposal.status;
+    if (!batch->status.ok()) {
+      if (absl::IsDeadlineExceeded(batch->status))
+        return absl::UnavailableError("-TRYAGAIN Data group is catching up");
+      return batch->status;
+    }
   }
+  auto status = WaitApplied(local, proposal, deadline, position);
+  if (!status.ok())
+    return status;
+  return proposal.stored;
+}
+
+absl::Status DataNodeImpl::WaitApplied(shared_ptr<LocalPartition> local, const PendingSet& proposal,
+                                       steady_clock::time_point deadline,
+                                       DataWritePosition* position) {
   if (proposal.stored)
     *position = {local->id, proposal.end.epoch, proposal.end.end_offset};
   auto status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
@@ -540,7 +656,100 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
   });
   if (!status.ok())
     return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
-  return proposal.stored;
+  return absl::OkStatus();
+}
+
+absl::Status DataNodeImpl::QueueSet(shared_ptr<LocalPartition> local, PendingSet* request) {
+  constexpr size_t kQueueBytes = 8U << 20;
+  constexpr size_t kQueueRequests = 256;
+  const size_t bytes = request->key.size() + request->value.size();
+  bool launch = false;
+  while (true) {
+    auto key = local->queue_changed.prepareWait();
+    {
+      lock_guard lock(local->batch_mu);
+      if (stopping_)
+        return ClusterDown();
+
+      // One oversized request is admitted alone, so a legal large SET cannot starve.
+      if (local->queued_requests == 0 ||
+          (local->queued_requests < kQueueRequests &&
+           bytes <= kQueueBytes - min(kQueueBytes, local->queued_bytes))) {
+        local->ready_sets.push_back(request);
+        local->queued_bytes += bytes;
+        ++local->queued_requests;
+        launch = !exchange(local->draining, true);
+        if (launch)
+          ++local->drainers;
+        break;
+      }
+    }
+    local->queue_changed.wait_until(key.epoch(), steady_clock::now() + milliseconds(100));
+  }
+  if (launch)
+    owner_->Dispatch([this, local] { DrainSets(local); });
+  request->appended.Wait();
+  return request->status;
+}
+
+void DataNodeImpl::DrainSets(shared_ptr<LocalPartition> local) {
+  while (true) {
+    SetBatch batch;
+    auto status = local->raft->VisitUntil(
+        steady_clock::now() + seconds(5), [&](RaftGroup::State state, bool* done) {
+          if (batch.requests.empty()) {
+            lock_guard lock(local->batch_mu);
+
+            // Amortize barriers under backlog without enlarging sparse client batches.
+            const size_t max_batch_bytes =
+                local->queued_bytes >= (4U << 20) ? (4U << 20) : (1U << 20);
+            while (!local->ready_sets.empty() && batch.requests.size() < 32) {
+              auto* next = local->ready_sets.front();
+              const size_t bytes = next->key.size() + next->value.size();
+              if (!batch.requests.empty() &&
+                  (next->condition || batch.value_bytes + bytes > max_batch_bytes))
+                break;
+              batch.requests.push_back(next);
+              batch.value_bytes += bytes;
+              local->ready_sets.pop_front();
+              if (next->condition)
+                break;
+            }
+          }
+          return AppendSetBatch(*local, batch, state, done);
+        });
+    bool again;
+    {
+      lock_guard lock(local->batch_mu);
+
+      // Shutdown or storage failure may prevent VisitUntil from taking any requests.
+      if (batch.requests.empty()) {
+        batch.requests.assign(local->ready_sets.begin(), local->ready_sets.end());
+        local->ready_sets.clear();
+        for (const auto* request : batch.requests)
+          batch.value_bytes += request->key.size() + request->value.size();
+      }
+      local->queued_bytes -= batch.value_bytes;
+      local->queued_requests -= batch.requests.size();
+      again = !local->ready_sets.empty();
+      if (!again)
+        local->draining = false;
+    }
+    local->queue_changed.notifyAll();
+    for (auto* request : batch.requests) {
+      if (request->status.ok() && !status.ok())
+        request->status = status;
+      request->appended.Dec();
+    }
+    if (!again) {
+      {
+        lock_guard lock(local->batch_mu);
+        --local->drainers;
+      }
+      local->queue_changed.notifyAll();
+      return;
+    }
+  }
 }
 
 absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch,

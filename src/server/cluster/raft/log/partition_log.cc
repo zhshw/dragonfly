@@ -275,6 +275,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
                                          optional<DataWritten> written) {
   if (!io_failure_.ok())
     return io_failure_;
+  if (pending_)
+    return absl::FailedPreconditionError("Quorum append already in flight");
   vector<Batch> pending;
   LogPosition end = End();
   int64_t pos = 0;
@@ -336,6 +338,121 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
   return io_failure_;
 }
 
+absl::StatusOr<bool> PartitionLog::TryAppendAsync(string_view bytes, int32_t epoch, AsyncIO submit,
+                                                  function<void(size_t)> written, AppendDone done) {
+  if (!io_failure_.ok())
+    return io_failure_;
+  if (pending_)
+    return absl::FailedPreconditionError("Quorum append already in flight");
+  if (!submit || bytes.empty())
+    return false;
+  auto pending = make_unique<PendingAppend>();
+  auto end = End();
+  int64_t pos = active_bytes_;
+  auto remaining = bytes;
+  while (!remaining.empty()) {
+    auto size = RecordBatchSize(remaining);
+    if (!size.ok())
+      return size.status();
+    auto batch = DecodeRecordBatch(remaining.substr(0, *size));
+    if (!batch.ok())
+      return batch.status();
+    if (batch->control)
+      return false;
+    if (batch->base_offset != end.end_offset || batch->end.epoch < end.epoch ||
+        batch->end.epoch != epoch)
+      return absl::InvalidArgumentError("Append does not match quorum log offset or epoch");
+    if (*size > static_cast<uint64_t>(INT64_MAX - pos))
+      return absl::OutOfRangeError("Quorum log file offset overflow");
+    pending->batches.push_back({batch->end, active_base_, pos, pos + int64_t(*size)});
+    pos += *size;
+    end = batch->end;
+    remaining.remove_prefix(*size);
+  }
+
+  // Segment creation and checkpoint replacement retain their synchronous directory barriers.
+  if (static_cast<uint64_t>(pos) > segment_bytes_ || end.end_offset - active_base_ > INT32_MAX)
+    return false;
+  auto publication = marker_.PrepareAppend({start_, active_base_, pos, end.end_offset});
+  if (!publication.ok())
+    return io_failure_ = publication.status();
+  if (!*publication)
+    return false;
+  pending->publication = **publication;
+  pending->bytes = bytes;
+  pending->submit = std::move(submit);
+  pending->written = std::move(written);
+  pending->done = std::move(done);
+  pending_ = std::move(pending);
+  WritePending();
+  return true;
+}
+
+void PartitionLog::WritePending() {
+  auto* p = pending_.get();
+  p->submit(
+      log_fd_, active_bytes_ + p->progress, string_view(p->bytes).substr(p->progress),
+      [this](int result) {
+        auto* p = pending_.get();
+        if (result == -EINTR) {
+          WritePending();
+          return;
+        }
+        if (result <= 0 || size_t(result) > p->bytes.size() - p->progress) {
+          FinishPending(result < 0 ? absl::ErrnoToStatus(-result, "Writing quorum log")
+                                   : absl::DataLossError("Invalid asynchronous write length"));
+          return;
+        }
+        p->progress += result;
+        if (p->progress < p->bytes.size()) {
+          WritePending();
+          return;
+        }
+        p->readable = true;
+        p->written(p->batches.front().file_end - p->batches.front().file_start);
+        p->submit(log_fd_, -1, {}, [this](int result) {
+          if (result != 0) {
+            FinishPending(absl::ErrnoToStatus(result < 0 ? -result : EIO, "Syncing quorum log"));
+            return;
+          }
+          auto status = marker_.SelectAppend(pending_->publication);
+          if (!status.ok()) {
+            FinishPending(status);
+            return;
+          }
+          pending_->submit(pending_->publication.fd, -1, {}, [this](int result) {
+            FinishPending(result == 0 ? absl::OkStatus()
+                                      : absl::ErrnoToStatus(result < 0 ? -result : EIO,
+                                                            "Syncing quorum recovery marker"));
+          });
+        });
+      });
+}
+
+void PartitionLog::FinishPending(absl::Status status) {
+  auto pending = std::move(pending_);
+  io_failure_ = status;
+  if (status.ok()) {
+    marker_.FinishAppend(pending->publication);
+    active_bytes_ = pending->batches.back().file_end;
+    batches_.insert(batches_.end(), pending->batches.begin(), pending->batches.end());
+  }
+  pending->done(status);
+}
+
+optional<string_view> PartitionLog::WrittenRecords(int64_t offset, size_t max_bytes) const {
+  if (!pending_ || !pending_->readable || offset != End().end_offset)
+    return nullopt;
+  const auto& first = pending_->batches.front();
+  return string_view(pending_->bytes)
+      .substr(0, max(max_bytes, size_t(first.file_end - first.file_start)));
+}
+
+bool PartitionLog::PendingContains(int64_t offset, int32_t epoch) const {
+  return pending_ && pending_->readable && epoch == pending_->batches.back().end.epoch &&
+         offset > End().end_offset && offset <= pending_->batches.back().end.end_offset;
+}
+
 absl::Status PartitionLog::AppendLeaderChange(int32_t epoch, int64_t timestamp_ms, int32_t leader,
                                               span<const int32_t> voters,
                                               span<const int32_t> granting_voters) {
@@ -390,6 +507,8 @@ absl::StatusOr<string> PartitionLog::Read(int64_t offset, int64_t max_offset, si
 }
 
 absl::Status PartitionLog::TruncateTo(int64_t offset, int64_t hw) {
+  if (pending_)
+    return absl::FailedPreconditionError("Drain quorum append before truncation");
   if (!io_failure_.ok())
     return io_failure_;
   if (hw < 0 || offset < hw || (!snapshots_.empty() && offset < snapshots_.back().end_offset) ||

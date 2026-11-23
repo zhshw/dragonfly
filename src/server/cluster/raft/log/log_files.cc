@@ -157,6 +157,32 @@ absl::StatusOr<optional<DurableEnd>> RecoveryMarker::Read(int dir_fd) {
   return end;
 }
 
+absl::StatusOr<optional<RecoveryMarker::AppendPublication>> RecoveryMarker::PrepareAppend(
+    const DurableEnd& end) const {
+  const int64_t delta = end.offset - checkpoint_.offset;
+  if (fd_ == -1 || end.start != checkpoint_.start || end.segment_base != checkpoint_.segment_base ||
+      delta < 0 || delta > kMaxDelta)
+    return nullopt;
+  struct stat st;
+  if (fstat(fd_, &st) != 0)
+    return DiskError("Stat quorum log recovery marker");
+  if (st.st_size != published_size_)
+    return absl::DataLossError("Invalid quorum log recovery marker length");
+  return AppendPublication{fd_, PublishedLength(delta)};
+}
+
+absl::Status RecoveryMarker::SelectAppend(AppendPublication publication) {
+  if (publication.fd != fd_)
+    return absl::FailedPreconditionError("Recovery marker changed during append");
+  if (ftruncate(fd_, publication.length) == -1)
+    return DiskError("Selecting quorum log recovery boundary");
+  return absl::OkStatus();
+}
+
+void RecoveryMarker::FinishAppend(AppendPublication publication) {
+  published_size_ = publication.length;
+}
+
 absl::Status RecoveryMarker::Publish(int dir_fd, const DurableEnd& end, bool append) {
   if (fd_ != -1) {
     struct stat st;

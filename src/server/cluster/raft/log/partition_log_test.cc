@@ -8,10 +8,12 @@
 #include <absl/crc/crc32c.h>
 #include <gtest/gtest.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 
 #include <fstream>
 
 #include "server/cluster/raft/log/record_batch.h"
+#include "server/cluster/raft/log/testdata/controlled_io.h"
 
 namespace dfly::cluster::raft {
 namespace {
@@ -58,6 +60,149 @@ class PartitionLogTest : public testing::Test {
   fs::path dir_;
   unique_ptr<PartitionLog> log_;
 };
+
+TEST_F(PartitionLogTest, AsyncAppendPublishesOnlyAfterBothBarriersAndHandlesShortWrites) {
+  auto first = MakeDataBatch(0, 3, 1, values_).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  auto bytes = MakeDataBatch(2, 3, 1, values_).value();
+  test::ControlledIO io;
+  bool written = false, completed = false;
+  EXPECT_FALSE(log_->TryAppendAsync(
+                       bytes, 4, io.Submitter(), [](size_t) {}, [](absl::Status) { ADD_FAILURE(); })
+                   .ok());
+  EXPECT_FALSE(log_->TryAppendAsync(
+                       string_view(bytes).substr(0, bytes.size() - 1), 3, io.Submitter(),
+                       [](size_t) {}, [](absl::Status) { ADD_FAILURE(); })
+                   .ok());
+  EXPECT_TRUE(io.requests.empty());
+  auto started = log_->TryAppendAsync(
+      bytes, 3, io.Submitter(),
+      [&](size_t first_size) {
+        written = true;
+        EXPECT_EQ(first_size, bytes.size());
+      },
+      [&](absl::Status status) {
+        completed = true;
+        EXPECT_TRUE(status.ok());
+      });
+  ASSERT_TRUE(started.ok() && *started);
+  EXPECT_FALSE(log_->TruncateTo(0, 0).ok());
+  EXPECT_FALSE(log_->Append(bytes, 3).ok());
+  EXPECT_FALSE(log_->WrittenRecords(2, 1));
+  io.Complete(-EINTR);
+  io.Complete(7);
+  EXPECT_FALSE(written);
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().offset, int64_t(first.size() + 7));
+  io.Complete();
+  EXPECT_TRUE(written);
+  EXPECT_EQ(log_->WrittenRecords(2, 1), bytes);
+  EXPECT_TRUE(log_->PendingContains(4, 3));
+  EXPECT_FALSE(log_->PendingContains(4, 4));
+  EXPECT_FALSE(log_->WrittenRecords(1, 100));
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  io.Complete();
+  EXPECT_FALSE(completed);
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  io.Complete();
+  EXPECT_TRUE(completed);
+  EXPECT_FALSE(log_->AppendPending());
+  EXPECT_EQ(log_->End(), (LogPosition{3, 4}));
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{3, 4}));
+  EXPECT_EQ(log_->Read(0, 4, SIZE_MAX).value(), first + bytes);
+}
+
+TEST_F(PartitionLogTest, AsyncFailuresFenceAppendAndPreserveAcknowledgedPrefix) {
+  for (int step = 0; step < 4; ++step) {
+    SCOPED_TRACE(step);
+    log_.reset();
+    fs::remove_all(dir_);
+    Open();
+    const auto first = MakeDataBatch(0, 3, 1, values_).value();
+    ASSERT_TRUE(log_->Append(first, 3).ok());
+    const auto bytes = MakeDataBatch(2, 3, 1, values_).value();
+    test::ControlledIO io;
+    bool failed = false;
+    ASSERT_TRUE(log_->TryAppendAsync(
+                        bytes, 3, io.Submitter(), [](size_t) {},
+                        [&](absl::Status status) { failed = !status.ok(); })
+                    .value());
+    for (int i = 0; i < (step == 3 ? 0 : step); ++i)
+      io.Complete();
+    io.Complete(step == 3 ? 0 : -EIO);
+    EXPECT_TRUE(failed);
+    EXPECT_FALSE(log_->AppendPending());
+    EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+    EXPECT_FALSE(log_->Append(bytes, 3).ok());
+    log_.reset();
+    Open();
+    EXPECT_EQ(log_->Read(0, 2, SIZE_MAX).value(), first);
+    EXPECT_TRUE(log_->End().end_offset == 2 || log_->End().end_offset == 4);
+  }
+}
+
+TEST_F(PartitionLogTest, CrashAtAsyncPublicationBoundariesRecoversCompletePrefixes) {
+  for (int phase = 0; phase < 3; ++phase) {
+    SCOPED_TRACE(phase);
+    log_.reset();
+    fs::remove_all(dir_);
+    Open();
+    auto first = MakeDataBatch(0, 3, 1, values_).value();
+    auto bytes = MakeDataBatch(2, 3, 1, values_).value();
+    ASSERT_TRUE(log_->Append(first, 3).ok());
+    log_.reset();
+    auto pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      auto log = PartitionLog::Open(dir_).value();
+      test::ControlledIO io;
+      if (!log->TryAppendAsync(
+                  bytes, 3, io.Submitter(), [](size_t) {}, [](absl::Status) {})
+               .value())
+        _exit(1);
+      io.Complete();
+      if (phase == 0) {
+        // Crash after segment sync, before delivering its completion to select the marker.
+        if (fsync(io.requests.front().fd) != 0)
+          _exit(2);
+      } else {
+        io.Complete();
+        if (phase == 2)
+          io.Complete();
+      }
+      _exit(0);
+    }
+    int status;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    Open();
+    EXPECT_EQ(log_->Read(0, 2, SIZE_MAX).value(), first);
+    if (phase == 0)
+      EXPECT_EQ(log_->End().end_offset, 2);
+    else
+      EXPECT_EQ(log_->Read(2, 4, SIZE_MAX).value(), bytes);
+  }
+}
+
+TEST_F(PartitionLogTest, AsyncSlowPathsKeepSynchronousOrdering) {
+  test::ControlledIO io;
+  const array<int32_t, 1> voters{1};
+  auto bytes = MakeLeaderChangeBatch(0, 3, 1, 1, voters, voters).value();
+  auto start = [&] {
+    return log_->TryAppendAsync(
+        bytes, 3, io.Submitter(), [](size_t) {}, [](absl::Status) { ADD_FAILURE(); });
+  };
+  EXPECT_FALSE(start().value());
+  ASSERT_TRUE(log_->Append(bytes, 3).ok());
+  log_.reset();
+  Open(bytes.size());
+  bytes = MakeDataBatch(1, 3, 1, values_).value();
+  EXPECT_FALSE(start().value());
+  EXPECT_TRUE(io.requests.empty());
+}
 
 TEST_F(PartitionLogTest, ReadAppendRecoverAndEpochLookup) {
   ASSERT_EQ(log_->End(), (LogPosition{0, 0}));

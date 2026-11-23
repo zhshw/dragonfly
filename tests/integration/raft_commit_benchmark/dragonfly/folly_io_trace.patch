@@ -1,0 +1,21 @@
+--- a/folly_io.cc
++++ b/folly_io.cc
+@@ -6,6 +6,7 @@
+
+ #include <folly/io/async/IoUringBackend.h>
+ #include <folly/io/async/ScopedEventBaseThread.h>
++#include "io_trace.h"
+
+ #if !FOLLY_HAS_LIBURING
+ #error "Raft Folly I/O requires Folly built with liburing support"
+@@ -51,7 +52,9 @@
+     event_base->runInEventBaseThread(
+         [event_base, fd, offset, bytes, done = std::move(done)]() mutable {
+           auto* backend = static_cast<folly::IoUringBackend*>(event_base->getBackend());
+-          auto completion = [event_base, done = std::move(done)](int result) mutable {
++          raft_io_trace::Record(offset < 0 ? "fsync_issue" : "write_issue", fd, 0, 0);
++          auto completion = [event_base, fd, offset, done = std::move(done)](int result) mutable {
++            raft_io_trace::Record(offset < 0 ? "fsync_complete" : "write_complete", fd, 0, 0);
+             if (!done(result))
+               new CompletionRetry(event_base, result, std::move(done));
+           };

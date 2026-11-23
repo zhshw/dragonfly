@@ -1,14 +1,14 @@
 --- a/data_node.cc
 +++ b/data_node.cc
-@@ -9,6 +9,7 @@
-
+@@ -10,6 +10,7 @@
  #include <atomic>
  #include <chrono>
+ #include <deque>
 +#include <fstream>
 
  #include "base/flags.h"
  #include "base/logging.h"
-@@ -24,6 +25,7 @@
+@@ -25,6 +26,7 @@
  #include "server/cluster/raft/transport/peer_connection.h"
  #include "server/cluster/raft/transport/raft_listener.h"
  #include "server/journal/executor.h"
@@ -16,7 +16,7 @@
  #include "util/accept_server.h"
  #include "util/fibers/fiberqueue_threadpool.h"
  #include "util/fibers/pool.h"
-@@ -91,11 +93,21 @@
+@@ -101,11 +103,21 @@
    // The group worker applies one committed effect at a time on the owner proactor.
    // Keeping its executor lets journal replay activate each DB once across all shards.
    JournalExecutor apply_executor;
@@ -38,7 +38,7 @@
 
  class DataNodeImpl final : public DataNode {
   public:
-@@ -242,10 +254,34 @@
+@@ -259,10 +271,34 @@
        voters.emplace(member, *ep);
      }
      auto local = make_shared<LocalPartition>(id, identity_.cluster_id, *service_, owner_);
@@ -73,7 +73,7 @@
          // Re-enter the service on a proactor. Client writes wait outside shard transactions.
          return owner_->Await([&] { return ExecuteSetEffect(replica->apply_executor, effect); });
        };
-@@ -481,6 +517,68 @@
+@@ -498,6 +534,68 @@
      return Route(slot, nullptr).status();
    }
 
@@ -141,7 +141,7 @@
 +  }
    PendingSet proposal{db, slot, key, value, condition};
    const auto deadline = steady_clock::now() + seconds(5);
-   shared_ptr<SetBatch> batch;
+   if (absl::GetFlag(FLAGS_raft_drain_writes)) {
 --- a/fetch_replication.cc
 +++ b/fetch_replication.cc
 @@ -9,6 +9,7 @@
@@ -164,16 +164,19 @@
    if (!local_member && active_voter_offset_ && leader_hw_->value() &&
        leader_hw_->value()->offset > *active_voter_offset_)
      (void)campaign_.Resign(leader_epoch_);
-@@ -229,10 +235,14 @@
-     parked->ready_.store(true, memory_order_release);
-     wake_fetch_();
-   };
+@@ -217,6 +223,8 @@
+       leader_epoch_ != expected_epoch)
+     return absl::FailedPreconditionError(
+         "Append requires an initialized leader of the specified epoch");
 +  if (commit_benchmark::active)
 +    commit_benchmark::active->append = commit_benchmark::Now();
-   if (auto s = log_.Append(batches, expected_epoch, written); !s.ok())
-     return log_.io_failure().ok() ? s : DurableFailure(s);
-   if (may_have_appended)
-     *may_have_appended = true;
+   if (async_io_) {
+     auto payload = make_shared<string>(batches);
+     auto pending = log_.TryAppendAsync(
+@@ -264,6 +272,8 @@
+ }
+
+ absl::Status FetchReplication::Appended(string_view batches) {
 +  if (commit_benchmark::active)
 +    commit_benchmark::active->durable = commit_benchmark::Now();
    if (auto s = membership_.Appended(batches, log_.End().end_offset); !s.ok())

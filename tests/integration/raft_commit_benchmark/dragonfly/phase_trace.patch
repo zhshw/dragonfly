@@ -1,0 +1,33 @@
+--- a/data_node.cc
++++ b/data_node.cc
+@@ -669,6 +669,7 @@
+   int64_t offset = state.log.End().end_offset;
+   const auto timestamp =
+       duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
++  raft_io_trace::Record("encode_begin", -1, epoch, offset, local.id);
+   string records;
+   for (auto* request : batch.requests) {
+     auto route = Route(request->slot, &local);
+@@ -717,6 +718,7 @@
+   *done = true;
+   if (records.empty())
+     return absl::OkStatus();
++  raft_io_trace::Record("encode_end", -1, epoch, offset, local.id);
+   bool may_have_appended = false;
+   auto status = state.replication.Append(records, epoch, &may_have_appended);
+   if (!status.ok()) {
+--- a/group.cc
++++ b/group.cc
+@@ -347,8 +347,12 @@
+     snapshots_.SyncRole();
+     changes_.Poll(NowMs());
+     if (auto hw = replication_.HighWatermark(); hw && apply_ && *hw != applied_) {
++      raft_io_trace::Record("apply_begin", -1, campaign_.state().election.epoch, *hw,
++                            campaign_.target().partition);
+       if (auto s = apply_(*log_, *hw); !s.ok())
+         return s;
++      raft_io_trace::Record("apply_end", -1, campaign_.state().election.epoch, *hw,
++                            campaign_.target().partition);
+       applied_ = *hw;
+     }
+     auto role = campaign_.state().role;

@@ -27,6 +27,18 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
     return {};
   }
 
+  bool SupportsAsyncSet() const override {
+    return async_enabled_;
+  }
+
+  shared_ptr<PendingDataWrite> TrySet(DbIndex, string_view key, string_view value) override {
+    if (pending_.size() == 2)
+      return nullptr;
+    submitted_.emplace_back(key, value);
+    pending_.push_back(make_shared<PendingDataWrite>());
+    return pending_.back();
+  }
+
   absl::Status Set(DbIndex db, string_view key, string_view value,
                    DataWritePosition* pos) override {
     ++sets_;
@@ -94,6 +106,9 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
   vector<SlotRange> routes_{{0, 16383}};
   size_t known_nodes_ = 1;
   size_t assigned_groups_ = 1;
+  bool async_enabled_ = false;
+  vector<shared_ptr<PendingDataWrite>> pending_;
+  vector<pair<string, string>> submitted_;
   bool ready_ = false;
   unsigned sets_ = 0;
   unsigned reads_ = 0;
@@ -160,6 +175,126 @@ TEST_F(DataDispatchTest, PipelinedCommandsFallBackToOrderedSynchronousDispatch) 
     EXPECT_EQ(sets_, 0u);
   });
   EXPECT_THAT(Run({"GET", "k"}), facade::ArgType(facade::RespExpr::NIL));
+}
+
+TEST_F(DataDispatchTest, AsyncSetsSubmitBeforeConfirmationAndKeepBarriers) {
+  async_enabled_ = true;
+  pp_->at(0)->Await([&] {
+    ConnectionContext connection(nullptr, acl::UserCredentials{});
+    connection.ns = &namespaces->GetDefaultNamespace();
+    connection.skip_acl_validation = true;
+    facade::CapturingReplyBuilder capture;
+    auto command = [&](initializer_list<string_view> parts) {
+      auto cmd = make_unique<CommandContext>(&capture, &connection);
+      cmd->Assign(parts.begin(), parts.end(), parts.size());
+      return cmd;
+    };
+    auto first = command({"SET", "same", "first"});
+    auto second = command({"SET", "same", "second"});
+    EXPECT_EQ(service_->DispatchCommandSimple(first.get(), facade::AsyncPreference::PREFER_ASYNC,
+                                              nullptr),
+              facade::DispatchResult::OK);
+    EXPECT_EQ(
+        service_->DispatchCommandSimple(second.get(), facade::AsyncPreference::ONLY_ASYNC, nullptr),
+        facade::DispatchResult::OK);
+    ASSERT_EQ(pending_.size(), 2u);
+    EXPECT_EQ(submitted_[0], make_pair(string("same"), string("first")));
+    EXPECT_EQ(submitted_[1], make_pair(string("same"), string("second")));
+    EXPECT_FALSE(first->CanReply());
+    EXPECT_FALSE(second->CanReply());
+    EXPECT_FALSE(connection.conn_state.raft_last_write);
+    EXPECT_EQ(sets_, 0u);
+    EXPECT_EQ(capture.Take().index(), 0u);
+
+    // Saturation must not admit, defer, or send anything; the command retries at the head.
+    auto full = command({"SET", "other", "third"});
+    EXPECT_EQ(
+        service_->DispatchCommandSimple(full.get(), facade::AsyncPreference::ONLY_ASYNC, nullptr),
+        facade::DispatchResult::WOULD_BLOCK);
+    EXPECT_FALSE(full->IsDeferredReply());
+    EXPECT_EQ(pending_.size(), 2u);
+    for (auto parts : {initializer_list<string_view>{"GET", "same"},
+                       {"WAIT", "1", "1"},
+                       {"SET", "same", "conditional", "NX"},
+                       {"SET", "same", "conditional", "XX"},
+                       {"SELECT", "1"},
+                       {"RESET"},
+                       {"AUTH", "password"},
+                       {"SET", "bad"},
+                       {"UNKNOWN"}}) {
+      auto barrier = command(parts);
+      EXPECT_EQ(service_->DispatchCommandSimple(barrier.get(), facade::AsyncPreference::ONLY_ASYNC,
+                                                nullptr),
+                facade::DispatchResult::WOULD_BLOCK);
+      EXPECT_FALSE(barrier->IsDeferredReply());
+    }
+    EXPECT_EQ(reads_, 0u);
+    EXPECT_EQ(capture.Take().index(), 0u);
+
+    // Completion order cannot update WAIT's position; only sending the ordered reply does.
+    pending_[1]->position = {10, 3, 9};
+    pending_[1]->ready.Dec();
+    EXPECT_TRUE(second->CanReply());
+    EXPECT_FALSE(first->CanReply());
+    EXPECT_FALSE(connection.conn_state.raft_last_write);
+    pending_[0]->position = {10, 3, 8};
+    pending_[0]->ready.Dec();
+    first->SendReply();
+    EXPECT_EQ(get<facade::payload::SimpleString>(capture.Take()), "OK");
+    EXPECT_EQ(connection.conn_state.raft_last_write->end_offset, 8);
+    second->SendReply();
+    EXPECT_EQ(get<facade::payload::SimpleString>(capture.Take()), "OK");
+    EXPECT_EQ(connection.conn_state.raft_last_write->end_offset, 9);
+  });
+}
+
+TEST_F(DataDispatchTest, AsyncSetErrorsAndDroppedCommandsKeepOwnedCompletion) {
+  async_enabled_ = true;
+  pp_->at(0)->Await([&] {
+    ConnectionContext connection(nullptr, acl::UserCredentials{});
+    connection.ns = &namespaces->GetDefaultNamespace();
+    connection.req_auth = true;
+    facade::CapturingReplyBuilder capture;
+    auto command = [&] {
+      auto cmd = make_unique<CommandContext>(&capture, &connection);
+      array<string_view, 3> parts{"SET", "key", "value"};
+      cmd->Assign(parts.begin(), parts.end(), parts.size());
+      return cmd;
+    };
+    auto denied = command();
+    EXPECT_EQ(
+        service_->DispatchCommandSimple(denied.get(), facade::AsyncPreference::ONLY_ASYNC, nullptr),
+        facade::DispatchResult::ERROR);
+    EXPECT_TRUE(denied->IsDeferredReply());
+    EXPECT_TRUE(denied->CanReply());
+    EXPECT_EQ(capture.Take().index(), 0u);
+    denied->SendReply();
+    EXPECT_TRUE(facade::CapturingReplyBuilder::TryExtractError(capture.Take()));
+    EXPECT_TRUE(pending_.empty());
+    connection.req_auth = false;
+    connection.skip_acl_validation = true;
+    auto failed = command();
+    EXPECT_EQ(
+        service_->DispatchCommandSimple(failed.get(), facade::AsyncPreference::ONLY_ASYNC, nullptr),
+        facade::DispatchResult::OK);
+    ASSERT_EQ(pending_.size(), 1u);
+    pending_[0]->position = {10, 3, 8};
+    pending_[0]->status = absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");
+    pending_[0]->ready.Dec();
+    failed->SendReply();
+    EXPECT_TRUE(facade::CapturingReplyBuilder::TryExtractError(capture.Take()));
+    EXPECT_EQ(connection.conn_state.raft_last_write->end_offset, 8);
+    auto dropped = command();
+    EXPECT_EQ(service_->DispatchCommandSimple(dropped.get(), facade::AsyncPreference::ONLY_ASYNC,
+                                              nullptr),
+              facade::DispatchResult::OK);
+    ASSERT_EQ(pending_.size(), 2u);
+    dropped.reset();
+    pending_[1]->position = {10, 3, 9};
+    pending_[1]->ready.Dec();
+    EXPECT_EQ(connection.conn_state.raft_last_write->end_offset, 8);
+    EXPECT_EQ(capture.Take().index(), 0u);
+  });
 }
 
 TEST_F(DataDispatchTest, ClusterDiscoveryUsesOnlyRuntimeTopology) {

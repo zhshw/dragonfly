@@ -1,0 +1,25 @@
+{
+  "kernel":
+      "Linux zhangshenwang-System-Product-Name 7.0.0-43-generic #43-Ubuntu SMP PREEMPT_DYNAMIC Fri Oct 23 13:25:25 UTC 2026 x86_64 GNU/Linux",
+  "mount": "/dev/nvme0n1p4 ext4 rw,relatime",
+  "binaries": {
+    "original": {
+      "path":
+          "/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-folly/drain-original-release/dragonfly",
+      "sha256": "8632135214badedea9af8d67dfc106e79791fe3bae3ef94cfb09871ddd6dbaf8"
+    },
+    "adaptive": {
+      "path":
+          "/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-folly/drain-adaptive-release/dragonfly",
+      "sha256": "14a092bdf6d662dff5b89f630f6cdebc3bcf18bbb3d126da69d371d49b78d607"
+    }
+  },
+  "clients": [
+    64,
+    8,
+    1
+  ],
+  "payload_mib": 256,
+  "warmup_writes": 64,
+  "settle_seconds": 5
+}

@@ -8,6 +8,7 @@
 #include <absl/status/statusor.h>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -26,8 +27,8 @@ struct FetchPosition {
   LogPosition position;
 };
 
-// One writer per partition. Open and mutation are synchronous disk-worker operations.
-// Each successful append is durable before its resulting LEO can be reported to a peer.
+// One writer per partition. Mutations and I/O completions run on the serialized group worker.
+// End() reports only durable data; an asynchronous append keeps its unpublished tail separate.
 class PartitionLog {
  public:
   static absl::StatusOr<std::unique_ptr<PartitionLog>> Open(const std::filesystem::path& dir,
@@ -58,6 +59,19 @@ class PartitionLog {
   using DataWritten = absl::FunctionRef<void(size_t)>;
   absl::Status Append(std::string_view batches, int32_t leader_epoch,
                       std::optional<DataWritten> written = std::nullopt);
+  // The submitter must invoke callbacks on the serialized group worker. Offset -1 requests
+  // fsync(flags=0); other offsets request a write. Return false for the synchronous slow path.
+  using IoCallback = std::function<void(int)>;
+  using AsyncIO = std::function<void(int, int64_t, std::string_view, IoCallback)>;
+  using AppendDone = std::function<void(absl::Status)>;
+  absl::StatusOr<bool> TryAppendAsync(std::string_view bytes, int32_t epoch, AsyncIO submit,
+                                      std::function<void(size_t)> written, AppendDone done);
+  bool AppendPending() const {
+    return pending_ != nullptr;
+  }
+  std::optional<std::string_view> WrittenRecords(int64_t offset, size_t max_bytes) const;
+  bool PendingContains(int64_t offset, int32_t epoch) const;
+
   absl::Status AppendAsFollower(std::string_view batches, int32_t fetch_epoch);
 
   absl::Status AppendLeaderChange(int32_t epoch, int64_t timestamp_ms, int32_t leader_id,
@@ -89,6 +103,19 @@ class PartitionLog {
     int64_t file_end;
   };
 
+  struct PendingAppend {
+    std::string bytes;
+    std::vector<Batch> batches;
+    log_files::RecoveryMarker::AppendPublication publication;
+    AsyncIO submit;
+    std::function<void(size_t)> written;
+    AppendDone done;
+    size_t progress = 0;
+    bool readable = false;
+  };
+  void WritePending();
+  void FinishPending(absl::Status status);
+
   PartitionLog(std::filesystem::path dir, size_t segment_bytes)
       : dir_(std::move(dir)), segment_bytes_(segment_bytes) {
   }
@@ -115,6 +142,7 @@ class PartitionLog {
   std::vector<int64_t> segment_bases_;
   std::vector<Batch> batches_;
   absl::Status io_failure_;
+  std::unique_ptr<PendingAppend> pending_;
 };
 
 }  // namespace dfly::cluster::raft

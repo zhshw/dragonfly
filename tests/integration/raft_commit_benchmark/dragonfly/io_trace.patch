@@ -1,0 +1,104 @@
+--- a/partition_log.cc
++++ b/partition_log.cc
+@@ -14,6 +14,7 @@
+ #include <algorithm>
+ #include <cerrno>
+ #include <charconv>
++#include "io_trace.h"
+
+ #include "server/cluster/raft/log/log_files.h"
+ #include "server/cluster/raft/log/record_batch.h"
+@@ -323,14 +324,19 @@
+     batch.file_end += active_bytes_;
+   }
+   pos = pending.back().file_end;
++  raft_io_trace::Record("append", log_fd_, epoch, end.end_offset, length, pending.size());
+   io_failure_ = WriteAt(log_fd_, active_bytes_, bytes.substr(0, length));
+   if (!io_failure_.ok())
+     return io_failure_;
+   if (written)
+     (*written)(pending.front().file_end - pending.front().file_start);
++  raft_io_trace::Record("segment_begin", log_fd_, epoch, end.end_offset);
+   if (fsync(log_fd_) != 0)
+     return io_failure_ = DiskError("Syncing quorum log append");
++  raft_io_trace::Record("segment_end", log_fd_, epoch, end.end_offset);
++  raft_io_trace::Record("marker_begin", log_fd_, epoch, end.end_offset);
+   io_failure_ = PublishEnd(pos, end.end_offset, true);
++  raft_io_trace::Record("marker_end", log_fd_, epoch, end.end_offset);
+   if (io_failure_.ok()) {
+     batches_.insert(batches_.end(), pending.begin(), pending.end());
+     active_bytes_ = pos;
+@@ -383,6 +389,7 @@
+   pending->submit = std::move(submit);
+   pending->written = std::move(written);
+   pending->done = std::move(done);
++  raft_io_trace::Record("append", log_fd_, epoch, end.end_offset, bytes.size(), pending->batches.size());
+   pending_ = std::move(pending);
+   WritePending();
+   return true;
+--- a/group.cc
++++ b/group.cc
+@@ -10,6 +10,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <tuple>
++#include "io_trace.h"
+
+ #include "base/flags.h"
+ #include "base/logging.h"
+@@ -212,8 +213,13 @@
+ #else
+     auto* proactor = static_cast<fb2::UringProactor*>(disk_pool_->at(0));
+     auto completion = make_shared<PartitionLog::IoCallback>(std::move(done));
+-    proactor->Dispatch([this, proactor, fd, offset, bytes, completion] {
+-      auto entry = proactor->GetSubmitEntry([this, completion](auto*, int result, auto, auto) {
++    const auto position = log_->End();
++    proactor->Dispatch([this, proactor, fd, offset, bytes, completion, position] {
++      raft_io_trace::Record(offset < 0 ? "fsync_issue" : "write_issue", fd,
++                             position.epoch, position.end_offset);
++      auto entry = proactor->GetSubmitEntry([this, completion, fd, offset, position](auto*, int result, auto, auto) {
++        raft_io_trace::Record(offset < 0 ? "fsync_complete" : "write_complete", fd,
++                               position.epoch, position.end_offset);
+         // CQE callbacks cannot block on the bounded worker queue.
+         fb2::Fiber([this, completion, result] {
+           worker_.Add([this, completion, result] {
+@@ -684,6 +690,10 @@
+
+ error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
+                                   FetchResponse* response) {
++  if (request.topics.size() == 1 && request.topics.front().partitions.size() == 1) {
++    const auto& p = request.topics.front().partitions.front();
++    raft_io_trace::Record("fetch_queued", -1, p.current_leader_epoch, p.fetch_offset, campaign_.target().partition);
++  }
+   const auto deadline = steady_clock::now() + milliseconds(request.max_wait_ms);
+   auto key = fetch_changed_.prepareWait();
+   bool can_wait = false;
+@@ -704,6 +714,10 @@
+               const auto& part = request.topics.front().partitions.front();
+               if (log_->PendingContains(part.fetch_offset, part.last_fetched_epoch))
+                 return make_error_code(errc::resource_unavailable_try_again);
++            }
++            if (initial && request.topics.size() == 1 && request.topics.front().partitions.size() == 1) {
++              const auto& p = request.topics.front().partitions.front();
++              raft_io_trace::Record("fetch_served", -1, p.current_leader_epoch, p.fetch_offset, campaign_.target().partition);
+             }
+             auto contact = initial ? optional<int64_t>{NowMs()} : nullopt;
+             auto s = replication_.HandleFetch(request, version, contact, WallMs(), response,
+--- a/data_node.cc
++++ b/data_node.cc
+@@ -10,6 +10,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <deque>
++#include "io_trace.h"
+ #include <fstream>
+
+ #include "base/flags.h"
+@@ -682,6 +683,7 @@
+         local->ready_sets.push_back(request);
+         local->queued_bytes += bytes;
+         ++local->queued_requests;
++        raft_io_trace::Record("queued", -1, 0, local->id, local->queued_bytes, local->queued_requests);
+         launch = !exchange(local->draining, true);
+         if (launch)
+           ++local->drainers;

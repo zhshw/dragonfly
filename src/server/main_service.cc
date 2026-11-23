@@ -29,6 +29,7 @@ extern "C" {
 #include <absl/strings/str_format.h>
 #include <xxhash.h>
 
+#include <coroutine>
 #include <csignal>
 #include <filesystem>
 
@@ -1458,10 +1459,58 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId& cid,
   return nullopt;
 }
 
+namespace {
+
+// The connection resumes this coroutine only at the head of its reply queue. Dropping the
+// command destroys the frame, while the independently owned write continues to completion.
+struct RaftSetReply {
+  struct promise_type {
+    promise_type(CommandContext* cmd, const shared_ptr<cluster::raft::PendingDataWrite>& write)
+        : cmd(cmd), write(write.get()) {
+    }
+    RaftSetReply get_return_object() {
+      cmd->SetDeferredReply();
+      cmd->Resolve(&write->ready, coroutine_handle<promise_type>::from_promise(*this));
+      return {};
+    }
+    suspend_always initial_suspend() noexcept {
+      return {};
+    }
+    suspend_never final_suspend() noexcept {
+      return {};
+    }
+    void return_void() noexcept {
+    }
+    void unhandled_exception() noexcept {
+      std::terminate();
+    }
+    CommandContext* cmd;
+    cluster::raft::PendingDataWrite* write;
+  };
+};
+
+RaftSetReply ReplyRaftSet(CommandContext* cmd, shared_ptr<cluster::raft::PendingDataWrite> write) {
+  if (write->position.end_offset >= 0)
+    cmd->server_conn_cntx()->conn_state.raft_last_write = write->position;
+  if (write->status.ok())
+    cmd->rb()->SendSimpleString("OK");
+  else
+    cmd->rb()->SendError(write->status.message());
+  co_return;
+}
+
+}  // namespace
+
 optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, const ParsedArgs& args,
-                                                      CommandContext* cmd) {
+                                                      CommandContext* cmd,
+                                                      AsyncPreference async_pref) {
   auto* cntx = cmd->server_conn_cntx();
+  const bool async_set = cid.name() == "SET" && args.size() == 2 &&
+                         async_pref != AsyncPreference::ONLY_SYNC &&
+                         raft_data_commands_->SupportsAsyncSet();
   auto reject = [&](string_view message) {
+    if (async_set)
+      cmd->SetDeferredReply();
     cmd->SendError(message);
     return DispatchResult::ERROR;
   };
@@ -1485,6 +1534,16 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
       }
       if (ServerState::tlocal()->ShouldDenyOnOOM())
         return reject(kOutOfMemory);
+      if (async_set) {
+        if (auto write = raft_data_commands_->TrySet(cntx->db_index(), args[0], args[1])) {
+          ReplyRaftSet(cmd, std::move(write));
+          return DispatchResult::OK;
+        }
+        if (async_pref == AsyncPreference::ONLY_ASYNC)
+          return DispatchResult::WOULD_BLOCK;
+
+        // The head may wait for capacity using the synchronous API. Followers must never wait.
+      }
       cluster::raft::DataWritePosition position;
       absl::StatusOr<bool> stored = true;
       if (condition) {
@@ -1547,8 +1606,13 @@ DispatchResult Service::DispatchCommand(
   bool raft_client =
       raft_data_commands_ &&
       !static_cast<CommandContext*>(parsed_cmd)->server_conn_cntx()->journal_emulated;
-  // Raft requests must stay in connection order. V2 retries as the head when ONLY_ASYNC blocks.
-  if (raft_client && async_pref == AsyncPreference::ONLY_ASYNC)
+  const bool raft_async_set = raft_client && !parsed_cmd->mc_command() && args.size() == 3 &&
+                              absl::EqualsIgnoreCase(args.Front(), "SET") &&
+                              raft_data_commands_->SupportsAsyncSet();
+
+  // Only ordinary SET may pass an outstanding write. Reads, conditionals and connection state
+  // changes retry at the head, after all preceding writes have applied and replied in order.
+  if (raft_client && !raft_async_set && async_pref == AsyncPreference::ONLY_ASYNC)
     return DispatchResult::WOULD_BLOCK;
   if (raft_client && parsed_cmd->mc_command()) {
     invoke_pre_dispatch();
@@ -1591,7 +1655,7 @@ DispatchResult Service::DispatchCommand(
     case AsyncPreference::ONLY_SYNC:
       break;
     case AsyncPreference::ONLY_ASYNC:
-      if (!cid->SupportsAsync())
+      if (!raft_async_set && !cid->SupportsAsync())
         return DispatchResult::WOULD_BLOCK;
       [[fallthrough]];
     case AsyncPreference::PREFER_ASYNC:
@@ -1599,6 +1663,11 @@ DispatchResult Service::DispatchCommand(
         parsed_cmd->SetDeferredReply();
       break;
   };
+
+  // A paused connection must drain earlier replies before waiting at the pause barrier.
+  if (raft_async_set && async_pref == AsyncPreference::ONLY_ASYNC &&
+      ServerState::tlocal()->IsPaused())
+    return DispatchResult::WOULD_BLOCK;
 
   invoke_pre_dispatch();
 
@@ -1624,6 +1693,8 @@ DispatchResult Service::DispatchCommand(
     // Check pause state only if it is a top level transaction.
     if (dfly_cntx->transaction == nullptr &&
         PauseConnection(cid, conn->IsPrivileged(), dfly_cntx) && dfly_cntx->conn_closing) {
+      if (raft_async_set && async_pref != AsyncPreference::ONLY_SYNC)
+        cmd_cntx->SetDeferredReply();
       cmd_cntx->SendError("connection is closing");  // resolves a deferred reply as well
       return DispatchResult::ERROR;
     }
@@ -1653,12 +1724,14 @@ DispatchResult Service::DispatchCommand(
       }
     }
     DCHECK(!err->status);
+    if (raft_async_set && async_pref != AsyncPreference::ONLY_SYNC)
+      cmd_cntx->SetDeferredReply();
     cmd_cntx->SendError(*err);
     return DispatchResult::ERROR;
   }
 
   if (raft_client) {
-    if (auto result = DispatchRaftCommand(*cid, args_no_cmd, cmd_cntx))
+    if (auto result = DispatchRaftCommand(*cid, args_no_cmd, cmd_cntx, async_pref))
       return *result;
   }
 

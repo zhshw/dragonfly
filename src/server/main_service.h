@@ -213,7 +213,8 @@ class Service : public facade::ServiceInterface {
 
   std::optional<facade::DispatchResult> DispatchRaftCommand(const CommandId& cid,
                                                             const facade::ParsedArgs& args,
-                                                            CommandContext* cmd_cntx);
+                                                            CommandContext* cmd_cntx,
+                                                            facade::AsyncPreference async_pref);
 
   util::ProactorPool& pp_;
   cluster::raft::DataCommandHandler* raft_data_commands_ = nullptr;

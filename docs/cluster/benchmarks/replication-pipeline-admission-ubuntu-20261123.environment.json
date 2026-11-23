@@ -1,0 +1,31 @@
+{
+  "binary":
+      "/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-pipeline-admission-release/dragonfly",
+  "sha256": "71080870a7317f772da29d2c8aae50c82a1e5827b4efa47cb64a6bf759769d02",
+  "harness_sha256": "1af60ab0159fcf6b8a96ff22e770f3a488266c3e32b7b5f637c6f5977bd22f3b",
+  "flags": "--raft_async_io=true --raft_drain_writes=true",
+  "primary_metric": "replication_mib_per_s",
+  "distinct_keys": true,
+  "pipeline_connection": "Same reserved connection for packed SET commands and final WAIT",
+  "mount": "/dev/nvme0n1p4 ext4 rw,relatime",
+  "builds": {
+    "baseline": {
+      "binary":
+          "/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-folly/drain-adaptive-release/dragonfly",
+      "sha256": "14a092bdf6d662dff5b89f630f6cdebc3bcf18bbb3d126da69d371d49b78d607",
+      "mode": "raft"
+    },
+    "candidate": {
+      "binary":
+          "/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-pipeline-admission-release/dragonfly",
+      "sha256": "71080870a7317f772da29d2c8aae50c82a1e5827b4efa47cb64a6bf759769d02",
+      "mode": "raft"
+    },
+    "cluster": {
+      "binary":
+          "/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-pipeline-admission-release/dragonfly",
+      "sha256": "71080870a7317f772da29d2c8aae50c82a1e5827b4efa47cb64a6bf759769d02",
+      "mode": "yes"
+    }
+  }
+}

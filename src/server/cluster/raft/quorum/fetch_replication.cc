@@ -217,22 +217,53 @@ absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoc
       leader_epoch_ != expected_epoch)
     return absl::FailedPreconditionError(
         "Append requires an initialized leader of the specified epoch");
+  if (async_io_) {
+    auto payload = make_shared<string>(batches);
+    auto pending = log_.TryAppendAsync(
+        *payload, expected_epoch, async_io_,
+        [this, payload](size_t first) { PublishWritten(*payload, first); },
+        [this, payload, expected_epoch](absl::Status status) {
+          if (!status.ok()) {
+            DurableFailure(status).IgnoreError();
+          } else if (campaign_.state().role == QuorumRole::kLeader &&
+                     campaign_.state().election.epoch == expected_epoch &&
+                     leader_epoch_ == expected_epoch) {
+            Appended(*payload).IgnoreError();
+          }
+        });
+    if (!pending.ok())
+      return log_.io_failure().ok() ? pending.status() : DurableFailure(pending.status());
+    if (*pending) {
+      if (may_have_appended)
+        *may_have_appended = true;
+      return absl::OkStatus();
+    }
+  }
   auto written = [&](size_t first_batch_size) {
     if (may_have_appended)
       *may_have_appended = true;
-    auto parked = parked_fetch_.lock();
-    if (!parked || parked->tail_ != CurrentFetchTail())
-      return;
-    parked_fetch_.reset();
-    parked->first_batch_size_ = first_batch_size;
-    parked->bytes_.assign(batches.substr(0, max(first_batch_size, parked->max_bytes_)));
-    parked->ready_.store(true, memory_order_release);
-    wake_fetch_();
+    PublishWritten(batches, first_batch_size);
   };
   if (auto s = log_.Append(batches, expected_epoch, written); !s.ok())
     return log_.io_failure().ok() ? s : DurableFailure(s);
   if (may_have_appended)
     *may_have_appended = true;
+  return Appended(batches);
+}
+
+void FetchReplication::PublishWritten(string_view batches, size_t first_batch_size) {
+  auto parked = parked_fetch_.lock();
+  if (parked && parked->tail_ == CurrentFetchTail()) {
+    parked_fetch_.reset();
+    parked->first_batch_size_ = first_batch_size;
+    parked->bytes_.assign(batches.substr(0, max(first_batch_size, parked->max_bytes_)));
+    parked->ready_.store(true, memory_order_release);
+  }
+  if (wake_fetch_)
+    wake_fetch_();
+}
+
+absl::Status FetchReplication::Appended(string_view batches) {
   if (auto s = membership_.Appended(batches, log_.End().end_offset); !s.ok())
     return DurableFailure(s);
   if (auto s = RefreshMembership(); !s.ok())
@@ -325,6 +356,8 @@ absl::Status FetchReplication::HandleFetch(const FetchRequest& request, int16_t 
       if (!bytes.ok())
         return DurableFailure(bytes.status());
       part.records.data = *std::move(bytes);
+      if (auto written = log_.WrittenRecords(fetch.fetch_offset, max(0, request.max_bytes)))
+        part.records.data->assign(*written);
       if (!contact_ms)
         break;
       replica_progress_.Record(source, batch_start, log_.End().end_offset, wall_ms);
