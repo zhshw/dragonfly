@@ -180,7 +180,7 @@ def header_constants(headers, flexible):
     return constants
 
 
-def generate(schema_dir, names, stem, source="Kafka message schemas"):
+def generate(schema_dir, names, stem, source="Kafka message schemas", frame_responses=False):
     notice = NOTICE.replace("Kafka message schemas", source)
     header = [
         notice,
@@ -253,6 +253,27 @@ def generate(schema_dir, names, stem, source="Kafka message schemas"):
             decl = f"CodecError {function}({signature})"
             header.append(decl + ";")
             functions.extend([decl + " {", f"return detail::{function}Message({args});", "}", ""])
+        if frame_responses and schema["type"] == "response":
+            header.extend(
+                [
+                    "",
+                    "// Encode a complete response frame without an intermediate body copy.",
+                    "// On failure the destination keeps its previous value.",
+                ]
+            )
+            decl = (
+                f"CodecError EncodeResponseFrame(const {name}& message, int16_t version, "
+                "int32_t correlation_id, std::string* out)"
+            )
+            header.append(decl + ";")
+            functions.extend(
+                [
+                    decl + " {",
+                    "return detail::EncodeResponseFrameMessage(message, version, correlation_id, out);",
+                    "}",
+                    "",
+                ]
+            )
         header.append("")
     impl.extend(["}  // namespace detail", "", *functions])
     for filename, lines in [(stem + ".h", header), (stem + ".cc", impl)]:
@@ -282,6 +303,7 @@ if __name__ == "__main__":
             kafka / "clients/src/main/resources/common/message",
             [api + "Request", api + "Response"],
             stem,
+            frame_responses=api == "Fetch",
         )
     generate(
         kafka / "clients/src/main/resources/common/message",

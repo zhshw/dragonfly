@@ -163,4 +163,9 @@ struct FetchResponse {
 CodecError Encode(const FetchResponse& message, int16_t version, std::string* out);
 CodecError Decode(std::string_view bytes, int16_t version, FetchResponse* out);
 
+// Encode a complete response frame without an intermediate body copy.
+// On failure the destination keeps its previous value.
+CodecError EncodeResponseFrame(const FetchResponse& message, int16_t version,
+                               int32_t correlation_id, std::string* out);
+
 }  // namespace dfly::cluster::raft::protocol

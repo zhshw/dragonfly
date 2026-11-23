@@ -230,14 +230,16 @@ class Reader {
   bool flexible_;
 };
 
-class Writer {
+template <bool kMeasure> class WriterImpl {
  public:
-  Writer(int16_t version, std::string* bytes, bool flexible = true)
+  WriterImpl(int16_t version, std::string* bytes, bool flexible = true)
       : version(version), bytes_(bytes), flexible_(flexible) {
   }
 
   template <typename T>
   requires(std::is_integral_v<T> && !std::is_same_v<T, bool>) bool Field(T value) {
+    if constexpr (kMeasure)
+      return AddSize(sizeof(T));
     auto bits = static_cast<std::make_unsigned_t<T>>(value);
     for (int i = sizeof(T) - 1; i >= 0; --i)
       bytes_->push_back(static_cast<char>(bits >> (8 * i)));
@@ -249,8 +251,7 @@ class Writer {
   }
 
   bool Field(const Uuid& value) {
-    bytes_->append(reinterpret_cast<const char*>(value.data()), value.size());
-    return true;
+    return Append({reinterpret_cast<const char*>(value.data()), value.size()});
   }
 
   bool LegacyClientId(const std::optional<std::string>& value) {
@@ -259,8 +260,7 @@ class Writer {
     if (value->size() > kMaxStringLength)
       return false;
     Field(static_cast<int16_t>(value->size()));
-    bytes_->append(*value);
-    return true;
+    return Append(*value);
   }
 
   bool Field(const std::string& value) {
@@ -270,8 +270,7 @@ class Writer {
       Varint(value.size() + 1);
     else
       Field(static_cast<int16_t>(value.size()));
-    bytes_->append(value);
-    return true;
+    return Append(value);
   }
 
   bool Field(const std::optional<std::string>& value) {
@@ -280,7 +279,7 @@ class Writer {
     if (value)
       return Field(*value);
     Varint(0);
-    return true;
+    return Fits();
   }
 
   bool Field(const RecordBytes& value) {
@@ -289,8 +288,7 @@ class Writer {
     if (value.data->size() > std::numeric_limits<int32_t>::max())
       return false;
     Length(static_cast<int32_t>(value.data->size()));
-    bytes_->append(*value.data);
-    return true;
+    return Append(*value.data);
   }
 
   template <typename T> bool Field(const std::optional<std::vector<T>>& values) {
@@ -327,15 +325,39 @@ class Writer {
         return false;
       Varint(id);
       Varint(payload.size());
-      bytes_->append(payload);
+      if (!Append(payload))
+        return false;
     }
-    return true;
+    return Fits();
   }
 
   template <typename... Fields>
   requires(sizeof...(Fields) > 0) bool Tags(const TaggedFields& unknown, Fields... known) {
-    auto fields = unknown;
-    return (AddTag(known, &fields) && ...) && Tags(fields);
+    if constexpr (kMeasure) {
+      // Retain only tag lengths during preflight, never copies of opaque payloads.
+      std::map<uint32_t, size_t> fields;
+      for (const auto& [id, payload] : unknown)
+        fields.emplace(id, payload.size());
+      if (!(MeasureTag(known, &fields) && ...))
+        return false;
+      if (!flexible_)
+        return Absent(fields);
+      if (fields.size() > kMaxTaggedFields)
+        return false;
+      Varint(fields.size());
+      for (const auto& [id, size] : fields) {
+        if (size > std::numeric_limits<int32_t>::max())
+          return false;
+        Varint(id);
+        Varint(size);
+        if (!AddSize(size))
+          return false;
+      }
+      return Fits();
+    } else {
+      auto fields = unknown;
+      return (AddTag(known, &fields) && ...) && Tags(fields);
+    }
   }
 
   template <typename T> bool Absent(const T& value, const std::type_identity_t<T>& fallback = T{}) {
@@ -348,22 +370,49 @@ class Writer {
 
   void Varint(uint32_t value) {
     while (value >= 128) {
-      bytes_->push_back(static_cast<char>((value & 127) | 128));
+      Field(static_cast<uint8_t>((value & 127) | 128));
       value >>= 7;
     }
-    bytes_->push_back(static_cast<char>(value));
+    Field(static_cast<uint8_t>(value));
+  }
+
+  size_t size() const requires(kMeasure) {
+    return size_;
   }
 
   const int16_t version;
   CodecError error = CodecError::kInvalidData;
 
  private:
+  bool Fits() const {
+    return !kMeasure || size_ <= std::numeric_limits<int32_t>::max();
+  }
+
+  bool AddSize(size_t size) {
+    constexpr size_t kMaxSize = std::numeric_limits<int32_t>::max();
+    if (size_ > kMaxSize || size > kMaxSize - size_) {
+      size_ = kMaxSize + 1;
+      return false;
+    }
+    size_ += size;
+    return true;
+  }
+
+  bool Append(std::string_view bytes) {
+    if constexpr (kMeasure) {
+      return AddSize(bytes.size());
+    } else {
+      bytes_->append(bytes);
+      return true;
+    }
+  }
+
   bool Length(int32_t size) {
     if (flexible_)
       Varint(static_cast<uint32_t>(size) + 1);
     else
       Field(size);
-    return true;
+    return Fits();
   }
 
   template <typename T> bool AddTag(Tagged<T> tag, TaggedFields* fields) {
@@ -377,16 +426,40 @@ class Writer {
       error = CodecError::kUnsupportedField;
       return false;
     }
-    Writer field(version, &(*fields)[tag.id]);
+    WriterImpl<false> field(version, &(*fields)[tag.id]);
     if (field.Field(tag.value))
       return true;
     error = field.error;
     return false;
   }
 
+  template <typename T> bool MeasureTag(Tagged<T> tag, std::map<uint32_t, size_t>* fields) {
+    if (fields->contains(tag.id))
+      return false;
+    if (!tag.present)
+      return true;
+    if (version < tag.first_version) {
+      if (tag.ignorable)
+        return true;
+      error = CodecError::kUnsupportedField;
+      return false;
+    }
+    WriterImpl<true> field(version, nullptr);
+    if (!field.Field(tag.value)) {
+      error = field.error;
+      return false;
+    }
+    fields->emplace(tag.id, field.size());
+    return true;
+  }
+
   std::string* bytes_;
   bool flexible_;
+  size_t size_ = 0;
 };
+
+using Writer = WriterImpl<false>;
+using SizeWriter = WriterImpl<true>;
 
 template <typename T> CodecError EncodeMessage(const T& value, int16_t version, std::string* out) {
   if (version < T::kMinVersion || version > T::kMaxVersion)
@@ -395,6 +468,36 @@ template <typename T> CodecError EncodeMessage(const T& value, int16_t version, 
   Writer writer(version, &buffer, version >= T::kFirstFlexibleVersion);
   if (!writer.Field(value))
     return writer.error;
+  *out = std::move(buffer);
+  return CodecError::kOk;
+}
+
+// Preflight and write a complete response into one allocation. The body and header retain
+// their schema/version validation, and failures leave the caller's destination unchanged.
+template <typename T>
+CodecError EncodeResponseFrameMessage(const T& value, int16_t version, int32_t correlation_id,
+                                      std::string* out) {
+  if (version < T::kMinVersion || version > T::kMaxVersion)
+    return CodecError::kUnsupportedVersion;
+  SizeWriter size(version, nullptr, version >= T::kFirstFlexibleVersion);
+  if (!size.Field(value))
+    return size.error;
+  const size_t header_size = sizeof(correlation_id) + (T::HeaderVersion(version) >= 1);
+  if (size.size() > std::numeric_limits<int32_t>::max() - header_size)
+    return CodecError::kInvalidData;
+  const size_t payload_size = header_size + size.size();
+  std::string buffer;
+  buffer.reserve(sizeof(int32_t) + payload_size);
+  Writer header(0, &buffer);
+  header.Field(static_cast<int32_t>(payload_size));
+  header.Field(correlation_id);
+  if (T::HeaderVersion(version) >= 1)
+    header.Tags({});
+  Writer writer(version, &buffer, version >= T::kFirstFlexibleVersion);
+  if (!writer.Field(value))
+    return writer.error;
+  if (buffer.size() != sizeof(int32_t) + payload_size)
+    return CodecError::kInvalidData;
   *out = std::move(buffer);
   return CodecError::kOk;
 }

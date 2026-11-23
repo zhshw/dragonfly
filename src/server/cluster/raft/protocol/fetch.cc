@@ -327,4 +327,9 @@ CodecError Decode(std::string_view bytes, int16_t version, FetchResponse* out) {
   return detail::DecodeMessage(bytes, version, out);
 }
 
+CodecError EncodeResponseFrame(const FetchResponse& message, int16_t version,
+                               int32_t correlation_id, std::string* out) {
+  return detail::EncodeResponseFrameMessage(message, version, correlation_id, out);
+}
+
 }  // namespace dfly::cluster::raft::protocol

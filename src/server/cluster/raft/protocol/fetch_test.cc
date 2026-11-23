@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include "server/cluster/raft/protocol/flexible_message.h"
 #include "server/cluster/raft/protocol/rpc_frame.h"
 
 namespace dfly::cluster::raft::protocol {
@@ -166,6 +167,9 @@ TEST(FetchCodecTest, DecodeAndEncodeAllJavaBodies) {
     EXPECT_EQ(request_body, encoded);
     EXPECT_EQ(CodecError::kOk, Encode(MakeReply(version), version, &encoded));
     EXPECT_EQ(std::string_view(response).substr(version >= 12 ? 9 : 8), encoded);
+    ASSERT_EQ(CodecError::kOk,
+              EncodeResponseFrame(MakeReply(version), version, kCorrelation, &encoded));
+    EXPECT_EQ(response, encoded);
     FetchResponse reply;
     ASSERT_EQ(FrameStatus::kComplete,
               DecodeResponseFrame(response, kMaxFrame, version, kCorrelation, &reply).status);
@@ -225,17 +229,73 @@ TEST(FetchCodecTest, RetainsDivergingEpochSnapshotAndNullableRecords) {
   partition.snapshot_id.epoch = 5;
   partition.snapshot_id.end_offset = 21;
   partition.aborted_transactions.reset();
+  partition.unknown_tags[127] = std::string(128, 'p');
+  res.responses[0].unknown_tags[128] = "topic";
+  res.unknown_tags[255] = "response";
+  res.node_endpoints.push_back({2, "host", 9092, "rack", {{128, "node"}}});
   for (auto records : {std::optional<std::string>{}, std::optional<std::string>(""),
-                       std::optional<std::string>(std::string(65536, 'a'))}) {
+                       std::optional<std::string>(std::string(4 << 20, 'a'))}) {
     partition.records.data = std::move(records);
     std::string bytes;
     ASSERT_EQ(CodecError::kOk, Encode(res, 18, &bytes));
     FetchResponse decoded;
     ASSERT_EQ(CodecError::kOk, Decode(bytes, 18, &decoded));
     EXPECT_EQ(res, decoded);
+
+    // The independent body encoder and Java fixtures pin the complete frame's wire format.
+    std::string expected;
+    detail::Writer header(0, &expected);
+    header.Field(static_cast<int32_t>(5 + bytes.size()));
+    header.Field(kCorrelation);
+    header.Tags({});
+    expected.append(bytes);
+    std::string frame = "previous";
+    ASSERT_EQ(CodecError::kOk, EncodeResponseFrame(res, 18, kCorrelation, &frame));
+    EXPECT_EQ(expected, frame);
+    ASSERT_EQ(FrameStatus::kComplete,
+              DecodeResponseFrame(frame, frame.size(), 18, kCorrelation, &decoded).status);
+    EXPECT_EQ(res, decoded);
+    EXPECT_EQ(FrameStatus::kNeedMore,
+              DecodeResponseFrame(std::string_view(frame).substr(0, frame.size() - 1), frame.size(),
+                                  18, kCorrelation, &decoded)
+                  .status);
+    EXPECT_EQ(res, decoded);
   }
   std::string bytes;
   EXPECT_EQ(CodecError::kUnsupportedField, Encode(res, 11, &bytes));
+}
+
+TEST(FetchCodecTest, FramePreflightRejectsInvalidFieldsWithoutReplacingOutput) {
+  auto response = MakeReply(18);
+  response.responses[0].partitions[0].records.data = std::string(4 << 20, 'v');
+  response.node_endpoints.push_back({2, std::string(32768, 'h'), 9092, {}, {}});
+  std::string output = "unchanged";
+  EXPECT_EQ(CodecError::kInvalidData, EncodeResponseFrame(response, 18, kCorrelation, &output));
+  EXPECT_EQ("unchanged", output);
+  response.node_endpoints[0].host = "host";
+  EXPECT_EQ(CodecError::kUnsupportedField,
+            EncodeResponseFrame(response, 15, kCorrelation, &output));
+  EXPECT_EQ("unchanged", output);
+  response.unknown_tags[0] = "collides with node_endpoints";
+  EXPECT_EQ(CodecError::kInvalidData, EncodeResponseFrame(response, 18, kCorrelation, &output));
+  EXPECT_EQ("unchanged", output);
+  response.node_endpoints.clear();
+  EXPECT_EQ(CodecError::kInvalidData, EncodeResponseFrame(response, 18, kCorrelation, &output));
+  EXPECT_EQ("unchanged", output);
+  EXPECT_EQ(CodecError::kUnsupportedVersion,
+            EncodeResponseFrame(response, 19, kCorrelation, &output));
+  EXPECT_EQ("unchanged", output);
+
+  // Exercise signed frame-length overflow without allocating a multi-gigabyte payload.
+  detail::SizeWriter size(18, nullptr);
+  const std::string chunk(32767, 'v');
+  size_t count = 0;
+  while (size.Field(chunk))
+    ++count;
+  EXPECT_EQ(static_cast<size_t>(INT32_MAX) / (chunk.size() + 3), count);
+  EXPECT_EQ(static_cast<size_t>(INT32_MAX) + 1, size.size());
+  EXPECT_FALSE(size.Field(uint8_t{0}));
+  EXPECT_EQ(static_cast<size_t>(INT32_MAX) + 1, size.size());
 }
 
 }  // namespace

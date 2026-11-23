@@ -69,6 +69,11 @@ CodecError WriteRequest(const RequestMetadata& metadata, const Request& request,
 template <typename Response>
 FrameStatus WriteResponse(const Response& response, int16_t version, int32_t correlation_id,
                           std::string* output) {
+  if constexpr (std::is_same_v<Response, FetchResponse>) {
+    return EncodeResponseFrame(response, version, correlation_id, output) == CodecError::kOk
+               ? FrameStatus::kComplete
+               : FrameStatus::kInvalidFrame;
+  }
   std::string body;
   if (Encode(response, version, &body) != CodecError::kOk)
     return FrameStatus::kInvalidFrame;
