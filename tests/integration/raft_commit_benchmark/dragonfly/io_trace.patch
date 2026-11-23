@@ -8,7 +8,21 @@
 
  #include "server/cluster/raft/log/log_files.h"
  #include "server/cluster/raft/log/record_batch.h"
-@@ -323,14 +324,19 @@
+@@ -271,9 +272,13 @@
+     return absl::FailedPreconditionError("Drain quorum append before flushing buffered data");
+   if (!buffered_durable_end_)
+     return absl::OkStatus();
++  raft_io_trace::Record("segment_begin", log_fd_, End().epoch, End().end_offset);
+   if (fsync(log_fd_) != 0)
+     return io_failure_ = DiskError("Syncing buffered quorum log");
++  raft_io_trace::Record("segment_end", log_fd_, End().epoch, End().end_offset);
++  raft_io_trace::Record("marker_begin", log_fd_, End().epoch, End().end_offset);
+   io_failure_ = PublishEnd(active_bytes_, End().end_offset, true);
++  raft_io_trace::Record("marker_end", log_fd_, End().epoch, End().end_offset);
+   if (io_failure_.ok()) {
+     buffered_durable_end_.reset();
+     buffered_bytes_ = 0;
+@@ -390,6 +395,7 @@
      batch.file_end += active_bytes_;
    }
    pos = pending.back().file_end;
@@ -16,19 +30,21 @@
    io_failure_ = WriteAt(log_fd_, active_bytes_, bytes.substr(0, length));
    if (!io_failure_.ok())
      return io_failure_;
-   if (written)
-     (*written)(pending.front().file_end - pending.front().file_start);
-+  raft_io_trace::Record("segment_begin", log_fd_, epoch, end.end_offset);
-   if (fsync(log_fd_) != 0)
-     return io_failure_ = DiskError("Syncing quorum log append");
-+  raft_io_trace::Record("segment_end", log_fd_, epoch, end.end_offset);
-+  raft_io_trace::Record("marker_begin", log_fd_, epoch, end.end_offset);
-   io_failure_ = PublishEnd(pos, end.end_offset, true);
-+  raft_io_trace::Record("marker_end", log_fd_, epoch, end.end_offset);
+@@ -398,9 +404,13 @@
+   if (memory) {
+     RecordBuffered(length);
+   } else {
++    raft_io_trace::Record("segment_begin", log_fd_, epoch, end.end_offset);
+     if (fsync(log_fd_) != 0)
+       return io_failure_ = DiskError("Syncing quorum log append");
++    raft_io_trace::Record("segment_end", log_fd_, epoch, end.end_offset);
++    raft_io_trace::Record("marker_begin", log_fd_, epoch, end.end_offset);
+     io_failure_ = PublishEnd(pos, end.end_offset, true);
++    raft_io_trace::Record("marker_end", log_fd_, epoch, end.end_offset);
+   }
    if (io_failure_.ok()) {
      batches_.insert(batches_.end(), pending.begin(), pending.end());
-     active_bytes_ = pos;
-@@ -383,6 +389,7 @@
+@@ -457,6 +467,7 @@
    pending->submit = std::move(submit);
    pending->written = std::move(written);
    pending->done = std::move(done);
