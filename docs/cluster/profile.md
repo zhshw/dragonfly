@@ -1,10 +1,12 @@
 # raft.memory / 原 cluster profile 与优化项
 
+**当前保留 v9；最新 v10 接收确认快路径实验无收益，代码已回退。**
+
 | 版本 | 确认吞吐 MiB/s | 对比 |
 | --- | ---: | ---: |
 | 原始 `raft.memory`（profile 优化前） | 169.56 | — |
-| 最新 `raft.memory`（v9，含以下全部优化） | **389.95** | **+130.0%** |
-| 原 cluster（最新同轮对照） | 580.94 | 仍为最新 Raft 的 1.49 倍 |
+| 保留的 `raft.memory`（v9 原实验，含以下优化） | **389.95** | **+130.0%** |
+| 原 cluster（v9 同轮对照） | 580.94 | 为该轮 Raft 的 1.49 倍 |
 
 最新版本包含的优化项：
 
@@ -17,20 +19,20 @@
 均为 1 连接、pipeline 64、未插桩三轮中位数，计时包含 SET + 原写连接 WAIT 1。
 **+130.0% 是原始基线到最新版本的跨轮累计对比**，包含上述全部优化及 WAIT 等待变化；各阶段增量不能相加。
 
-**最新一轮 v9：SET 输入所有权转交**（2026-11-23）。以下使用同轮 v8 复测作为增量基线。
+**最新一轮 v10：follower 接收确认快路径（无收益，已回退）**。以下使用 v9 同轮复测作增量基线。
 
-| 指标 | v8 本轮复测 | v9 | 变化 |
+| 指标 | v9 本轮复测 | v10 候选（已回退） | 变化 |
 | --- | ---: | ---: | ---: |
-| 确认吞吐（三轮中位数） | 322.41 MiB/s | **389.95 MiB/s** | **+20.9%** |
-| 批次 P95（三轮中位数） | 74.94 ms | **65.32 ms** | **−12.8%** |
-| leader CPU（单次诊断） | 612 ms | 506 ms | −17.3% |
-| 两节点 CPU 合计（单次诊断） | 852 ms | 744 ms | −12.7% |
-| 入队 key/value 复制 CPU（采样估计） | 54 ms | 0 ms | 目标副本消除 |
-| leader 峰值 RSS（单次诊断） | 459.72 MiB | 445.07 MiB | −3.2% |
+| 确认吞吐（三轮中位数） | **400.62 MiB/s** | 385.40 MiB/s | **−3.8%** |
+| 批次 P95（三轮中位数） | **58.66 ms** | 70.09 ms | **+19.5%** |
+| 接收完成至 Fetch 发送累计等待（单次诊断） | 88.62 ms | 12.01 ms | −86.4% |
+| 两节点 CPU 合计（单次诊断） | 822 ms | 742 ms | −9.7% |
+| leader 峰值 RSS（单次诊断） | 430.79 MiB | 438.50 MiB | +1.8% |
 
-三组确认吞吐配对均提升约 20%–21%，范围不重叠；两版末尾 WAIT 均约 0.15 ms。
-第三组 P95 上升 5.7%；RSS 测量前占用和角色节点不同，不能将全部差值归因于优化。
-逐轮数据与结论见[实验索引](#experiments)；最新火焰图与 trace 见 [v9 实验](profile/v9-input-ownership.md)，完整口径见 [benchmark](replication-benchmark.md)。
+三组确认吞吐配对 **−4.0% / −7.7% / +9.5%**，没有稳定收益；本轮原 cluster 为 **618.30 MiB/s**。
+局部确认等待确实缩短，但 Fetch 次数 **200 → 256**，leader worker 排队区间并集 **217.73 → 295.80 ms**。
+因此回退本轮代码，保留全部实验记录，不扩展连接数。400.62 是 v9 复测，不是新优化收益；上表 v9 原实验 389.95 保留原含义。
+三版本完整指标、火焰图和 trace 见 [v10 实验](profile/v10-follower-receipt.md)；历史优化见[实验索引](#experiments)，口径见 [benchmark](replication-benchmark.md)。
 
 ## 1. 路径差异：哪些工作可以减少
 
@@ -63,32 +65,20 @@ Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责；借鉴原
 
 <a id="follower-receipt-progress"></a>
 
-### P0-1b：follower 接收确认快路径（待验证候选，未实现）
+### P0-1b：follower 接收确认快路径（提前 Fetch 试验无收益，已回退）
 
-**问题：** `ReceiveFetchResponse` 已完成接收追加，但下一次报告接收位置的 Fetch 仍经过
-`RunPeer → RunOnWorker → Next → Tick → Synchronize → apply_`。
-`RunOnWorker` 的统一 pending 检查还会等待 memory 后台 fsync。
-于是已经满足本模式确认条件的位置，要等待状态机应用或后台同步才有机会报告给 leader。
+**问题仍存在：** `ReceiveFetchResponse` 追加后，报告接收位置的下一次 Fetch 仍经过
+`RunPeer → RunOnWorker → Next → Tick → Synchronize → apply_`；统一 pending 检查也会等待 memory 后台 fsync。
 
-**目标：** 让 follower 及时发起携带已发布 `End()` 的下一次 Fetch；已提交数据的应用与网络等待重叠。
-先限定 follower 普通数据路径，保持组内日志/任期/HW 状态串行更新；leader 的 SET 仍等本地应用完成才回复。
-接收位置、持久位置、已应用位置分别使用，WAIT 继续根据 applied tag 确认副本应用。
+**v10 已验证并回退：** 普通响应后准备下一笔 Fetch，先发送已发布位置，再由原 worker 串行应用；
+每 peer 仍只有一笔 RPC，结构记录和角色变化保留屏障，WAIT 使用 applied tag。
+接收至发送等待 **88.62 → 12.01 ms**，但正式确认吞吐 **400.62 → 385.40 MiB/s（−3.8%）**，
+P95 **+19.5%**；未证明整体收益，不保留该实现。数据和补丁见 [v10 实验](profile/v10-follower-receipt.md)。
 
-- 准备 Fetch 时读取已发布的位置；已接收位置的报告不依赖后续 apply 或 memory 后台 fsync。
-  不能直接给所有 `RunOnWorker` 设置 `allow_pending=true`，也不能提前报告尚未完成的追加。
-- 将应用组织为有界、按日志顺序的任务；组 worker 不同步等待整个 owner/shard 应用批次。
-  完成后由组 worker 推进连续 applied 前缀。换主、控制记录、截断、快照、迁移和存储失败保留屏障。
-- 这与 P1-6“允许追加和 fsync 并行”不同：先优化已经接收的位置报告，不改变持久标记切点。
-  P1-4 已独立验证接收缓冲复用，减少了读回、清零及重复解码；后续评估须使用最新实现作基线，不能重复计算收益。
-
-**依据与收益边界：** 最新接收间隔及其与 leader 工作的重叠，见[v9 确认路径复核](profile/v9-input-ownership.md#v9-confirmation-review)。
-此前复核保留在[v5 实验](profile/v5-batched-apply.md#confirmation-path)。先补齐 Fetch 实际发送、leader 接纳位置与 HW 推进的关联事件，
-再决定是否完整异步化；不能把累计等待直接算成可兑现收益。
-
-**验收：** 先补齐接收完成、Fetch 实际发出、leader 接纳 offset/HW 的关联事件，核对确认等待是否消失；
-再做 1 连接 / pipeline 64 三轮未插桩对照及原 cluster 对照，保持 SET + 原连接 WAIT 1 口径。
-验证 applied 不超过 HW、同 key 顺序、慢应用反压、换主/截断/快照和关闭；flush 模式仍按持久位置确认。
-按唯一缓冲 capacity 核对内存，完成离线副本恢复、WAIT 2 和全部值读回。
+**尚未实施：** 有界、按日志顺序的独立异步应用队列，以及完成后回到 worker 推进连续 applied 前缀。
+不能从本次局部等待下降推断完整异步化收益；重新评估需覆盖组 worker 排队、RPC 次数和端到端确认。
+换主、控制记录、截断、快照、迁移、存储失败仍需屏障；不得普遍放开 `allow_pending` 或提前报告未完成追加。
+与 P1-6 的追加/后台同步分离、已完成的 P1-4 接收缓存分别评估，不重复计算收益。
 
 ### P0-2：批量应用，继续评估 shard 内批量执行
 
@@ -196,4 +186,5 @@ WAL 副本、Fetch 响应、应用参数、确认 fiber 和 allocator 容量仍�
 - <a id="v6-drain-experiment"></a>[v6：直接聚合编码与 effect/WAL 共享](profile/v6-drain-sharing.md)
 - <a id="v7-follower-experiment"></a>[v7：follower 复用接收批次](profile/v7-follower-cache.md)
 - <a id="v8-frame-experiment"></a>[v8：Fetch 直接封帧](profile/v8-fetch-frame.md)
-- <a id="v9-input-experiment"></a>[v9：SET 输入所有权转交](profile/v9-input-ownership.md)（最新）
+- <a id="v9-input-experiment"></a>[v9：SET 输入所有权转交](profile/v9-input-ownership.md)（当前保留实现）
+- <a id="v10-receipt-experiment"></a>[v10：follower 接收确认快路径](profile/v10-follower-receipt.md)（最新实验，无收益，已回退）
