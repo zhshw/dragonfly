@@ -5,6 +5,7 @@
 减少这些工作既可能降低内存流量和临时内存，也可能缩短排队。
 已实现 WAL 缓冲共享、单条 SET 的直接编码、有界批量应用及同步借用 SET 参数；effect 缓存共享等仍待实施。
 各项收益以分阶段对照为准，不能把计划中的优化算作已经完成。
+v5 逐栈复核还定位到 Fetch 消息/封帧复制和确认回查的 I/O 等待；当前执行顺序见第 7 节。
 
 **相对原始基线的累计提升：169.56 → 224.69 MiB/s（+32.5%）。**
 两者均为 1 连接、pipeline 64、未插桩三轮 `raft.memory` 确认吞吐中位数，SET + WAIT 1 口径相同，但来自不同轮次。
@@ -57,7 +58,7 @@
 
 Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责；借鉴原 cluster 的数据处理方式，保持两种集群设计独立。
 
-## 3. 六个优化项
+## 3. 优化项与当前状态
 
 ### P0-1：一次编码，传递同一个不可变 WAL 缓冲
 
@@ -77,6 +78,8 @@ Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责；借鉴原
   去掉三个中间大字符串。保留旧通用编码器作为逐字节对照，日志格式和 CRC 不变。
 - **待实施：** effect 缓存持有缓冲所有权及 key/value 范围，减少另一份大 value；不能保存临时 `string_view`。
   drain 聚合的追加复制也仍保留，本轮尚未做到全链路只持有一份数据。
+- **v5 收尾目标：** `SetEffect` 构造和 drain 追加/扩容仍占 leader 69 个 memcpy 样本，约 138 ms。
+  先精确预留聚合空间，减少扩容搬运；再让 effect 缓存引用不可变 WAL，分别验证收益和缓冲存活期。
 
 **验收：** 每 MiB 用户数据的复制字节、分配字节及编码 CPU 下降；编码后的字节、CRC、段截取、短写重试均保持正确。
 
@@ -106,6 +109,8 @@ owner 每完成一笔检查 1 ms 预算，超时返回已完成前缀；单笔�
 **代码依据：** `TrySet` 为每笔创建确认 fiber；`WaitApplied → VisitUntil → RunOnWorker` 查询应用进度。
 初始 v3 的 1024 笔 SET 对应 leader **5106 次** worker 访问、**2650 次**等待 I/O 排空。
 这些次数也包含复制等操作，不能全部归因于 SET。当前已经是事件等待，不是忙轮询。
+v5 的 `WaitApplied` 仍经默认 `allow_pending=false` 的 `RunOnWorker`；即使只是查询已应用前缀，
+也要先等当前追加或后台同步结束。批量应用减少的是 owner 投递，并未移除此处等待。
 
 - 按 `(epoch, end_offset)` 登记待完成票据，由应用进度一次完成连续前缀，减少每笔唤醒后重新排队查询。
 - 角色/任期变化、存储失败、超时和关闭必须完成或取消相应票据；连接回复仍按原顺序。
@@ -119,6 +124,8 @@ owner 每完成一笔检查 1 ms 预算，超时返回已完成前缀；单笔�
 **代码依据：** `CommittedEffects::ApplyTo` 在未命中 effect 缓存时用 `log.Read(..., 1, ...)` 逐 batch 读回，
 随后 `DecodeRecordBatch → DecodeSetEffect`；后者重新复制 key/value。
 `PartitionLog::Read` 先创建清零字符串再 pread；leader Fetch 也走此入口。
+leader 已有 parked Fetch 和在途 `WrittenRecords` 快路径；v5 中这两条路径的复制与 follower 读回更值得优先处理，
+不能把 leader 的全部 Fetch 都算成磁盘重读。
 
 - leader 已有 `RememberAppended` 缓存，先补命中率，不能把新增同样的缓存当作收益。
 - 让 follower 在写入确认至应用期间复用收到的不可变 batch；近期 Fetch 也可复用有界 WAL 缓冲。
@@ -155,6 +162,21 @@ WAL 副本、Fetch 响应、应用参数、确认 fiber 和 allocator 容量仍�
 
 **验收：** 同步期间的追加排队下降；同时验证标记切点、短写、同步失败和故障恢复。不能只凭正常退出后的读回宣布安全。
 
+### P1-7：Fetch 直接构造完整响应帧，减少发送前复制（v5 新增）
+
+**代码依据：** [flexible_message.h](../../src/server/cluster/raft/protocol/flexible_message.h)
+的 `Writer::Field(RecordBytes)` 将日志复制进消息 body；尾部 `Tags → Varint → push_back` 还可能触发 body 扩容。
+[rpc_frame.cc](../../src/server/cluster/raft/protocol/rpc_frame.cc) 的 `WriteResponse → WriteFrame`
+随后把完整 body 再复制进最终 frame。v5 合计 56 个 memcpy 样本，约 112 ms，占 leader CPU 样本的 12.6%。
+
+- 先精确计算或可靠预留完整帧容量，保留长度前缀和 header 空间，让 body 直接写进最终帧，再回填长度。
+  独立测量“避免扩容”和“去掉 body → frame 副本”，保留原接口在编码失败时的输出语义。
+- 与 P1-4 配合，让 parked Fetch 引用在途 WAL 的不可变范围，避免发布和填充 response 时再各复制一次。
+  进一步采用分散缓冲发送时，再处理 buffer 所有权、部分发送和背压；先完成单缓冲版本。
+
+**验收：** Fetch 各协议版本逐字节一致，frame 长度、tag、空/null records、截断输入和错误返回正确；
+发送前复制字节、分配和 leader CPU 下降，原连接 WAIT 与恢复检查通过。
+
 ## 4. 验证顺序与收益记录
 
 1. 先增加按阶段的复制/分配计数及 apply 子阶段：WAL 读取、CRC/解码、owner 排队、实际 KV 应用。
@@ -168,7 +190,8 @@ WAL 副本、Fetch 响应、应用参数、确认 fiber 和 allocator 容量仍�
 5. 记录：确认吞吐、批次 P95、CPU ms/MiB、复制/分配字节比、临时内存峰值、worker 排队及每千笔同步次数。
    只有实测后填写提升百分比；不以栈变短或单个热点消失代替整体收益。
 
-暂不优先扩大 ring、继续增加连接数或仅替换 CRC：本轮 Folly 队列并集只有 **2.57 ms**，
+暂不优先扩大 ring、继续增加连接数或仅替换 CRC：初始 v3 的 Folly 队列并集为 **2.57 ms**，
+最新 v5 leader / follower 为 **3.90 / 0.46 ms**，
 数据 follower 未出现 Fetch 后 25 ms 退避，两边最终 WAIT 都约 101 ms。
 CRC 指令优化仍可作为后续独立对照，但无法消除当前的多份缓冲和逐笔 worker 往返。
 
@@ -237,7 +260,8 @@ CRC 指令优化仍可作为后续独立对照，但无法消除当前的多份�
   32 笔 / 1 MiB 约束的是投递批次，读取时可额外持有一笔前探记录，不能当成全部临时内存的硬上限。
 - **保留的瓶颈更清楚了。** 新 follower 仍有 1024 次 WAL 读回，读取、batch 校验/解码、effect 解码分别约
   64.71 / 41.47 / 57.14 ms。leader 编码约 243.28 ms，worker 访问从 5035 次变为 5400 次；
-  批量 owner 投递没有消除确认票据的 worker 回查。下一步优先评估 P1-4 的近期不可变批次复用与 P1-3 的批量完成票据。
+  批量 owner 投递没有消除确认票据的 worker 回查。P1-4 的近期不可变批次复用与 P1-3 的批量完成票据仍待实施，
+  与剩余编码/发送复制一起排序，见第 7 节。
 - 新 leader / follower 的 `journal.apply` 为 89.39 / 121.06 ms，旧版为 73.45 / 67.75 ms；
   这个内部阶段未缩短，不能把外层应用的全部改善归为 KV 执行加速。它包含等待，后续还需区分 shard 调度与实际执行。
 - CPU 只是一轮 500 Hz 采样；原 cluster follower 仅 63 个样本，细分热点不稳定。新版本增加了 apply 子阶段插桩，
@@ -256,3 +280,61 @@ CRC 指令优化仍可作为后续独立对照，但无法消除当前的多份�
 完整事件分别为 22403 / 27938 / 2931 条，无丢失。生产候选二进制为 `f039be66100f…`，
 旧/新诊断二进制为 `9371d68cbce0…` / `225520a1cba5…`；报告统计使用全部事件，Langfuse 每阶段保留最长 50 条。
 原始数据、源码差异、二进制和复现脚本在测试机 `docs/cluster/benchmarks/profile-apply-20261123/`，数据已同步本地并由 Git 忽略。
+
+## 7. v5 逐栈复核：剩余复制与等待
+
+本节在提交 `40139414`（实现）、`ce5a8753`（观测与已有结论）后分析，未修改生产代码或重跑 benchmark。
+使用第 6 节的同一轮原始采样，并对保留的 `225520a1cba5…` 二进制做 `addr2line -i` 内联展开。
+模板和 `std::char_traits` 栈由此对应到实际调用点；下表按 memcpy **叶子样本互斥归类**，不会重复累计父子函数。
+
+| 本轮 leader memcpy 来源 | 样本 / 估计 CPU | 对应优化 |
+| --- | ---: | --- |
+| 构造 `SetEffect` 的 key/value；drain 追加及扩容 | 35 + 34 / 138 ms | P0-1 收尾 |
+| Fetch records → body、尾部扩容；body → frame | 32 + 24 / 112 ms | 新增 P1-7 |
+| 异步请求取得输入所有权 | 29 / 58 ms | P1-5，需保持参数生命周期 |
+| 单条 record 写入最终 batch | 23 / 46 ms | P0-1 已减少中间副本；此处仍需编码 |
+| 发布 parked Fetch；parked 内容填入 response | 13 + 9 / 44 ms | P1-4 共享已有 WAL |
+| 最终写入 KV 的 `LargeString::SetString` | 21 / 42 ms | 保留 SET 存储语义 |
+| 合计 | **220 / 440 ms** | leader 全部 443 个 CPU 样本中的 49.7% |
+
+- drain 的 34 个样本中，24 个来自扩容搬运旧内容，10 个来自追加新内容。单条 batch 已精确预留，
+  聚合 `records.append` 仍会扩容；不能把“单条直接编码完成”写成“聚合复制已消除”。
+- Fetch body 的 32 个样本中，22 个来自 records 追加，10 个来自尾部 `Tags` 写长度时触发的扩容。
+  后者是搬运已经编码的大 body，并非 tag 本身有很大 payload；这里只改 CRC 或 ring 大小无法消除它。
+- 原 cluster leader 的 109 个 memcpy 样本中，72 个属于 journal 编码/流式复制、35 个属于 KV 存储、
+  2 个属于 RESP。两条路径都使用 Boost.Context，Raft 多出来的输入、effect、WAL、Fetch body/frame 中间形态
+  才是此次可定位的额外工作；模板栈层数本身不能当作耗时。
+
+**follower 读回/解码仍是明确目标。** 剩余 25 个 memset 样本全部来自 `PartitionLog::Read` 的清零字符串；
+27 个 memcpy 样本来自 `DecodeSetEffect` 再复制 value，25 个 CRC 样本来自应用时重新校验。
+另有 22 个 CRC 样本在接收追加时校验。读取、batch 解码、effect 解码三个 trace 阶段合并去重为
+**163.32 ms，占 follower 外层 apply 的 53.3%**，均位于该 apply 区间内。
+应复用接收时已验证的不可变批次及其元信息，保留网络输入和磁盘重读的校验；leader 追加时也仍有 25 个重复校验样本。
+follower 追加本轮还同步调用了 **134 次 pwrite，共 36.64 ms**；当前并非全部文件操作都走 Folly 异步路径。
+先处理读回和复制，再单独评估异步追加；`memory` 仍包含 page cache 写入和后台同步。
+
+**确认路径仍有等待，但不能把排队全归为 fiber 调度。**
+
+- leader 5400 次 worker 入口包含 2580 次 pending-I/O 等待后重试，并非 5400 个独立业务操作。
+  `await_commit` 从 873 增至 1262 次；现有 trace 没有操作类型和票据 ID，不能将所有访问都归到 `WaitApplied`。
+- worker 排队区间并集 301.37 ms 中，**255.77 ms（84.9%）与编码或应用区间重合**。
+  组 worker 在应用期间同步等待 owner/shard，仍占着该组任务顺序；缩短组内数据处理和应用往返仍然重要。
+  区间重合说明排队时系统正在做什么，不能直接推出删去某阶段后的吞吐提升。
+- leader 的 I/O 等待与后台 fsync 重合 **118.27 ms**，follower 为 **93.91 ms**。
+  P2-6 的统一 pending 状态确有影响；它与 worker 排队是不同等待区间，不能把所有等待都算成 fsync。
+  P1-3 应让已应用前缀直接完成票据，P2-6 则另行处理追加与持久标记切点，避免把两种改动混在一起。
+
+| 对照原计划 | v5 结论与接下来顺序 |
+| --- | --- |
+| P0-1 | 保留为第一优先级收尾：先聚合容量，再 effect/WAL 共享，逐项对照 |
+| P1-7（新增） | 随后单独试验 Fetch 完整帧预留及直接编码，避免 body 重复搬运 |
+| P1-4 | 接着复用 follower 已验证批次和 parked Fetch 缓冲；leader 普通 pread 不是此次首要热点 |
+| P1-3 | 保留批量完成票据；先补操作类型、票据关联、唤醒计数，量出回查和 I/O 闸门各自成本 |
+| P0-2 | 第一阶段有效；内部 SET 快入口后移，当前 journal.apply 未缩短，尚无独立收益证据 |
+| P1-5 | 贯穿以上改动记录唯一 capacity、分配字节与峰值；当前 RSS 仍未改善 |
+| P2-6 | 保留为后续独立实验，覆盖 fsync 切点、控制记录、换段、截断和故障恢复 |
+
+以上 CPU 数字来自单轮 500 Hz 采样，不能作为可节省的准确时长或承诺收益。
+复核脚本和区间交集结果保存在 ignored 的 `benchmarks/profile-apply-20261123/v5-review/`；
+内联调用点记录在 `benchmarks/profile-apply-20261123/memory-apply-c1-p64-v5/*callers*.txt`，
+原始基线仍为 **169.56 MiB/s**。
