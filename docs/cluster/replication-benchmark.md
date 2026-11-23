@@ -152,7 +152,7 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
 
 复现使用上面的 `--ack-mode memory` 命令，基线指定 `profile-buffer-20261123/encoded-bin`。
 本轮二进制、源码差异和原始结果在 `docs/cluster/benchmarks/profile-apply-20261123/`，不提交 Git。
-火焰图和 trace 结论见 [profile](profile.md)。
+火焰图和 trace 结论见 [v5 实验](profile/v5-batched-apply.md)。
 
 ## memory 实验：直接聚合编码与 effect/WAL 共享
 
@@ -171,7 +171,7 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
 - **直接聚合单独结果不稳定**：先行对照 231.32 → 235.41 MiB/s（+1.8%），上表复测则为 −1.2%。两组样本全部保留，不扩展到 2 / 8 连接。
 - **实现**：按编码长度、字节预算及段边界取连续前缀，一次预留并直接编码；effect 用带所有权的不可变 WAL 视图，缓存按唯一 capacity 控制预算。原日志字节、CRC、确认和应用顺序保持不变。
 - **正确性**：Debug / Release 各 63 项、ASAN/UBSAN 62 项单测，以及 11 项集群回归通过。两组正式对照共 21 轮，均通过副本确认、恢复和完整读回。
-- **单次诊断**：leader 编码区间 −63.6%、CPU 样本估计 −16.4%，但峰值 RSS **429.00 → 461.16 MiB（+7.5%）**；局部 CPU 优化有效，尚未证明综合改善。详情与 v6 火焰图见 [profile](profile.md#v6-drain-experiment)。
+- **单次诊断**：leader 编码区间 −63.6%、CPU 样本估计 −16.4%，但峰值 RSS **429.00 → 461.16 MiB（+7.5%）**；局部 CPU 优化有效，尚未证明综合改善。详情与 v6 火焰图见 [v6 实验](profile/v6-drain-sharing.md)。
 
 232.92 是已优化版本的本轮复测，不能改称原始基线；原始 **169.56 MiB/s** 继续保留。
 本轮二进制、源码差异、四版本脚本 `compare_steps.py` 和原始数据在本地及测试机
@@ -198,7 +198,7 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
   9 轮正式对照和 3 次诊断均通过原连接 WAIT 1、离线副本恢复、WAIT 2、1088 个值读回。本轮未扩连接数。
 
 增量只使用本轮复测 252.11，原始基线 **169.56 MiB/s** 不变。完整分析及 v7 火焰图/trace 见
-[profile 第 10 节](profile.md#v7-follower-experiment)。脚本、二进制与原始结果位于本地及测试机
+[v7 实验](profile/v7-follower-cache.md)。脚本、二进制与原始结果位于本地及测试机
 `docs/cluster/benchmarks/profile-follower-20261123/`，由 Git 忽略。
 
 ## memory 优化：Fetch 直接封帧
@@ -222,5 +222,5 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
   3 次诊断均完成原连接 WAIT 1、离线副本恢复、WAIT 2、1088 个值读回。
 
 原始基线 **169.56 MiB/s** 不变，累计 **+91.9%** 是跨轮对比，不能累加各阶段增量。
-完整分析与 v8 火焰图/trace 见 [profile 第 11 节](profile.md#v8-frame-experiment)。
+完整分析与 v8 火焰图/trace 见 [v8 实验](profile/v8-fetch-frame.md)。
 脚本、二进制与原始数据在测试机 `docs/cluster/benchmarks/profile-frame-20261123/`；报告和原始结果已复制本地，均由 Git 忽略。
