@@ -206,7 +206,7 @@ FetchReplication::ParkedFetch::Tail FetchReplication::CurrentFetchTail() const {
   return {{leader_epoch_, log_.End().end_offset}, log_.StartOffset(), HighWatermark().value_or(-1)};
 }
 
-absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoch,
+absl::Status FetchReplication::Append(string batches, int32_t expected_epoch,
                                       bool* may_have_appended) {
   if (may_have_appended)
     *may_have_appended = false;
@@ -217,10 +217,11 @@ absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoc
       leader_epoch_ != expected_epoch)
     return absl::FailedPreconditionError(
         "Append requires an initialized leader of the specified epoch");
+  shared_ptr<const string> payload;
   if (async_io_) {
-    auto payload = make_shared<string>(batches);
+    payload = make_shared<const string>(std::move(batches));
     auto pending = log_.TryAppendAsync(
-        *payload, expected_epoch, async_io_,
+        payload, expected_epoch, async_io_,
         [this, payload](size_t first) { PublishWritten(*payload, first); },
         [this, payload, expected_epoch](absl::Status status) {
           if (!status.ok()) {
@@ -239,16 +240,17 @@ absl::Status FetchReplication::Append(string_view batches, int32_t expected_epoc
       return absl::OkStatus();
     }
   }
+  const string_view bytes = payload ? string_view(*payload) : string_view(batches);
   auto written = [&](size_t first_batch_size) {
     if (may_have_appended)
       *may_have_appended = true;
-    PublishWritten(batches, first_batch_size);
+    PublishWritten(bytes, first_batch_size);
   };
-  if (auto s = log_.Append(batches, expected_epoch, written); !s.ok())
+  if (auto s = log_.Append(bytes, expected_epoch, written); !s.ok())
     return log_.io_failure().ok() ? s : DurableFailure(s);
   if (may_have_appended)
     *may_have_appended = true;
-  return Appended(batches);
+  return Appended(bytes);
 }
 
 void FetchReplication::PublishWritten(string_view batches, size_t first_batch_size) {

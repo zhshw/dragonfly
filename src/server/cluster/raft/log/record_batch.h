@@ -47,6 +47,11 @@ absl::StatusOr<BatchInfo> DecodeRecordBatch(std::string_view batch,
 
 absl::StatusOr<std::string> MakeDataBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
                                           std::span<const std::string> values);
+
+// Encode one record directly from value fragments into its final owned batch buffer.
+absl::StatusOr<std::string> MakeSingleRecordBatch(int64_t offset, int32_t epoch,
+                                                  int64_t timestamp_ms,
+                                                  std::span<const std::string_view> value_parts);
 absl::StatusOr<std::string> MakeControlBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
                                              std::span<const ControlRecordValue> controls);
 absl::StatusOr<std::string> MakeLeaderChangeBatch(

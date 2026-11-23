@@ -294,9 +294,19 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
     auto apply = [this, replica = local.get()](const PartitionLog& log, int64_t hw) {
       if (auto s = replica->snapshots.Restore(log, hw, &replica->effects); !s.ok())
         return s;
-      auto apply_set = [&](const SetEffect& effect) {
-        // Re-enter the service on a proactor. Client writes wait outside shard transactions.
-        return owner_->Await([&] { return ExecuteSetEffect(replica->apply_executor, effect); });
+      auto apply_sets = [&](span<const SetEffect* const> effects, size_t* applied) {
+        // Re-enter once per bounded batch, preserving log order and the completed prefix.
+        return owner_->Await([&] {
+          const auto deadline = steady_clock::now() + milliseconds(1);
+          for (const auto* effect : effects) {
+            if (auto s = ExecuteSetEffect(replica->apply_executor, *effect); !s.ok())
+              return s;
+            ++*applied;
+            if (steady_clock::now() >= deadline)
+              break;
+          }
+          return absl::OkStatus();
+        });
       };
       auto apply_slot = [&](SlotId slot, optional<string_view> bytes, string_view digest) {
         return owner_->Await([&] {
@@ -307,7 +317,7 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
           return absl::OkStatus();
         });
       };
-      return replica->effects.ApplyTo(log, hw, apply_set, apply_slot);
+      return replica->effects.ApplyToBatched(log, hw, apply_sets, apply_slot);
     };
     auto opened = opener_.Await([&] {
       return RaftGroup::Open(dir_, identity_, RaftGroup::Kind::kData, id, voters, false, apply,
@@ -840,7 +850,7 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
   if (records.empty())
     return absl::OkStatus();
   bool may_have_appended = false;
-  auto status = state.replication.Append(records, epoch, &may_have_appended);
+  auto status = state.replication.Append(std::move(records), epoch, &may_have_appended);
   if (!status.ok()) {
     if (may_have_appended)
       return absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown");

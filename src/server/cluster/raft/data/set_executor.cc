@@ -16,11 +16,8 @@ absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffect& effect
     return absl::DataLossError("Committed SET key hashes to a different slot");
   if (effect.action == SetEffect::Action::kNoop)
     return absl::OkStatus();
-  std::array<std::string_view, 3> parts{"SET", effect.key, effect.value};
-  journal::ParsedEntry::CmdData cmd;
-  cmd.Assign(parts.begin(), parts.end(), parts.size());
   facade::CapturingReplyBuilder capture{facade::ReplyMode::FULL};
-  auto result = executor.Execute(effect.db, cmd, capture);
+  auto result = executor.ExecuteSet(effect.db, effect.key, effect.value, capture);
   auto payload = capture.Take();
   if (result == facade::DispatchResult::OOM)
     return absl::ResourceExhaustedError("OOM applying committed SET");

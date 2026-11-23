@@ -32,9 +32,10 @@ class PartitionSnapshotTest : public testing::Test {
       fs::remove_all(dir_);
   }
 
-  void Reopen(size_t segment_bytes = 1U << 30) {
+  void Reopen(size_t segment_bytes = 1U << 30,
+              PartitionLog::AckMode mode = PartitionLog::AckMode::kFlush) {
     log_.reset();
-    auto log = PartitionLog::Open(dir_, segment_bytes);
+    auto log = PartitionLog::Open(dir_, segment_bytes, mode);
     ASSERT_TRUE(log.ok()) << log.status();
     log_ = *std::move(log);
   }
@@ -63,6 +64,22 @@ class PartitionSnapshotTest : public testing::Test {
   fs::path dir_;
   unique_ptr<PartitionLog> log_;
 };
+
+TEST_F(PartitionSnapshotTest, MemorySnapshotAndRetentionPublishOnlyDurablePrefixes) {
+  Reopen(1U << 30, PartitionLog::AckMode::kMemory);
+  ASSERT_TRUE(log_->Append(Data(0, 3), 3).ok());
+  EXPECT_EQ(log_->DurableEnd().end_offset, 0);
+  ASSERT_TRUE(Install({3, 2}, 2).ok());
+  EXPECT_EQ(log_->DurableEnd().end_offset, 2);
+  ASSERT_TRUE(log_->Append(Data(2, 3), 3).ok());
+  EXPECT_EQ(log_->DurableEnd().end_offset, 2);
+  ASSERT_TRUE(log_->DeleteBeforeSnapshot({3, 2}, 4).ok());
+  EXPECT_EQ(log_->DurableEnd().end_offset, 4);
+  Reopen();
+  EXPECT_EQ(log_->StartOffset(), 2);
+  EXPECT_EQ(log_->End(), (LogPosition{3, 4}));
+  EXPECT_EQ(log_->Read(2, 4, SIZE_MAX).value(), Data(2, 3));
+}
 
 TEST_F(PartitionSnapshotTest, ReceiveFreezeReadAndResumeAfterRestart) {
   LogPosition id{2, 122};

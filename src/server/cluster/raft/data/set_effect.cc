@@ -64,10 +64,8 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
   if (effect.key.size() > kMaxBatchSize - kHeader ||
       effect.value.size() > kMaxBatchSize - kHeader - effect.key.size())
     return absl::ResourceExhaustedError("Dragonfly SET effect exceeds Kafka batch size");
-  array<string, 1> records;
-  string& payload = records.front();
-  payload.assign(kHeader, '\0');
-  payload.replace(0, kMagic.size(), kMagic);
+  array<char, kHeader> payload{};
+  copy(kMagic.begin(), kMagic.end(), payload.begin());
   payload[4] = kVersion;
   payload[5] = static_cast<char>(effect.action);
   be::Store32(payload.data() + 6, effect.group_id);
@@ -75,9 +73,9 @@ absl::StatusOr<string> MakeSetEffectBatch(int64_t offset, int32_t epoch, int64_t
   be::Store16(payload.data() + 12, effect.slot);
   be::Store64(payload.data() + 14, effect.generation);
   be::Store32(payload.data() + 22, effect.key.size());
-  payload += effect.key;
-  payload += effect.value;
-  return MakeDataBatch(offset, epoch, timestamp_ms, records);
+  const array<string_view, 3> parts{string_view(payload.data(), payload.size()), effect.key,
+                                    effect.value};
+  return MakeSingleRecordBatch(offset, epoch, timestamp_ms, parts);
 }
 
 CommittedEffects::CommittedEffects(int32_t group_id, int64_t applied_offset)
@@ -132,37 +130,26 @@ absl::StatusOr<CommittedEffects> CommittedEffects::FromSnapshot(
   return restored;
 }
 
-absl::Status CommittedEffects::ApplyRecord(string_view payload, LogPosition end, ApplySet apply,
-                                           ApplySlotImage apply_image) {
-  if (payload.starts_with(kSlotTransferMagic)) {
-    protocol::SlotTransferRecord record;
-    if (protocol::Decode(payload.substr(kSlotTransferMagic.size()), 0, &record) !=
-        protocol::CodecError::kOk)
-      return absl::DataLossError("Invalid Dragonfly slot transfer payload");
-    return transfers_.Replay(group_id_, record, end,
-                             [&](SlotId slot, optional<string_view> image, string_view digest) {
-                               auto status = apply_image(slot, image, digest);
-                               if (status.ok())
-                                 slot_generations_[slot] = image ? record.generation + 1 : -1;
-                               return status;
-                             });
-  }
-  auto effect = DecodeSetEffect(payload);
-  if (!effect.ok())
-    return effect.status();
-  return ApplyEffect(*effect, apply);
+absl::Status CommittedEffects::ApplyTransferRecord(string_view payload, LogPosition end,
+                                                   ApplySlotImage apply_image) {
+  protocol::SlotTransferRecord record;
+  if (protocol::Decode(payload.substr(kSlotTransferMagic.size()), 0, &record) !=
+      protocol::CodecError::kOk)
+    return absl::DataLossError("Invalid Dragonfly slot transfer payload");
+  return transfers_.Replay(group_id_, record, end,
+                           [&](SlotId slot, optional<string_view> image, string_view digest) {
+                             auto status = apply_image(slot, image, digest);
+                             if (status.ok())
+                               slot_generations_[slot] = image ? record.generation + 1 : -1;
+                             return status;
+                           });
 }
 
-absl::Status CommittedEffects::ApplyEffect(const SetEffect& effect, ApplySet apply) {
+absl::Status CommittedEffects::ValidateEffect(const SetEffect& effect) const {
   if (effect.group_id != group_id_)
     return absl::FailedPreconditionError("SET effect belongs to another replication group");
   if (transfers_.BlocksAccess(effect.slot, effect.generation))
     return absl::FailedPreconditionError("SET effect addresses a fenced slot generation");
-  if (effect.action == SetEffect::Action::kReplace) {
-    if (auto s = apply(effect); !s.ok())
-      return s;
-    slot_generations_[effect.slot] = effect.generation;
-  }
   return absl::OkStatus();
 }
 
@@ -182,6 +169,21 @@ void CommittedEffects::RememberAppended(LogPosition end, size_t encoded_bytes, S
 
 absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, ApplySet apply,
                                        ApplySlotImage apply_image) {
+  return ApplyToBatched(
+      log, hw,
+      [&](span<const SetEffect* const> effects, size_t* applied) {
+        for (const auto* effect : effects) {
+          if (auto s = apply(*effect); !s.ok())
+            return s;
+          ++*applied;
+        }
+        return absl::OkStatus();
+      },
+      apply_image);
+}
+
+absl::Status CommittedEffects::ApplyToBatched(const PartitionLog& log, int64_t hw,
+                                              ApplySetBatch apply, ApplySlotImage apply_image) {
   if (!log.io_failure().ok())
     return log.io_failure();
   if (applied_offset() < log.StartOffset() || applied_offset() > log.End().end_offset)
@@ -200,41 +202,105 @@ absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, Appl
     pending_.clear();
     pending_bytes_ = 0;
   }
-  while (applied_offset() < hw) {
-    if (!pending_.empty() && pending_.front().end.end_offset == applied_offset() + 1) {
-      const auto& next = pending_.front();
-      if (auto s = ApplyEffect(next.effect, apply); !s.ok())
+  constexpr size_t kMaxEntries = 32;
+  constexpr size_t kMaxBytes = 1 << 20;
+  vector<PendingEffect> ready;
+  ready.reserve(kMaxEntries);
+  size_t ready_bytes = 0;
+  auto flush = [&]() -> absl::Status {
+    array<const SetEffect*, kMaxEntries> effects;
+    for (size_t i = 0; i < ready.size(); ++i)
+      effects[i] = &ready[i].effect;
+    size_t done = 0;
+    while (done < ready.size()) {
+      size_t completed = 0;
+      auto status = apply(span(effects.data() + done, ready.size() - done), &completed);
+      if (completed > ready.size() - done || (status.ok() && completed == 0))
+        return absl::InternalError("Invalid completed SET prefix");
+      for (size_t i = done; i < done + completed; ++i) {
+        const auto& item = ready[i];
+        slot_generations_[item.effect.slot] = item.effect.generation;
+        applied_ = item.end;
+        applied_bytes_ += item.encoded_bytes;
+      }
+      if (!status.ok())
+        return status;
+      done += completed;
+    }
+    ready.clear();
+    ready_bytes = 0;
+    return absl::OkStatus();
+  };
+
+  // Reading ahead must not discard a valid prefix when a later record is corrupt or fenced.
+  auto fail = [&](absl::Status status) {
+    auto applied = flush();
+    return applied.ok() ? status : applied;
+  };
+  int64_t next_offset = applied_offset();
+  while (next_offset < hw) {
+    PendingEffect next;
+    while (!pending_.empty() && pending_.front().end.end_offset <= next_offset) {
+      pending_bytes_ -= pending_.front().encoded_bytes;
+      pending_.pop_front();
+    }
+    if (!pending_.empty() && pending_.front().end.end_offset == next_offset + 1) {
+      pending_bytes_ -= pending_.front().encoded_bytes;
+      next = std::move(pending_.front());
+      pending_.pop_front();
+    } else {
+      // A one-byte budget returns one complete batch, even across a segment boundary.
+      int64_t base;
+      auto bytes = log.Read(next_offset, hw, 1, &base);
+      if (!bytes.ok())
+        return fail(bytes.status());
+      if (bytes->empty())
+        break;
+      if (base != next_offset)
+        return fail(absl::DataLossError("KV image applied offset splits a group log batch"));
+      vector<RecordView> records;
+      auto batch = DecodeRecordBatch(*bytes, &records);
+      if (!batch.ok())
+        return fail(batch.status());
+      if (!batch->control && (records.size() != 1 || records.front().key || !records.front().value))
+        return fail(absl::DataLossError("Expected one Dragonfly KV effect in a data batch"));
+      if (batch->control || records.front().value->starts_with(kSlotTransferMagic)) {
+        if (auto s = flush(); !s.ok())
+          return s;
+        if (!batch->control) {
+          if (auto s = ApplyTransferRecord(*records.front().value, batch->end, apply_image);
+              !s.ok())
+            return s;
+        }
+        applied_ = batch->end;
+        applied_bytes_ += bytes->size();
+        next_offset = applied_offset();
+        continue;
+      }
+      auto effect = DecodeSetEffect(*records.front().value);
+      if (!effect.ok())
+        return fail(effect.status());
+      next = {batch->end, bytes->size(), *std::move(effect)};
+    }
+    if (auto s = ValidateEffect(next.effect); !s.ok())
+      return fail(s);
+    next_offset = next.end.end_offset;
+    if (next.effect.action == SetEffect::Action::kNoop) {
+      if (auto s = flush(); !s.ok())
         return s;
       applied_ = next.end;
       applied_bytes_ += next.encoded_bytes;
-      pending_bytes_ -= next.encoded_bytes;
-      pending_.pop_front();
       continue;
     }
-
-    // A one-byte budget returns just the first complete batch, even across a segment boundary.
-    int64_t base;
-    auto bytes = log.Read(applied_offset(), hw, 1, &base);
-    if (!bytes.ok())
-      return bytes.status();
-    if (bytes->empty())
-      break;
-    if (base != applied_offset())
-      return absl::DataLossError("KV image applied offset splits a group log batch");
-    vector<RecordView> records;
-    auto batch = DecodeRecordBatch(*bytes, &records);
-    if (!batch.ok())
-      return batch.status();
-    if (!batch->control) {
-      if (records.size() != 1 || records.front().key || !records.front().value)
-        return absl::DataLossError("Expected one Dragonfly KV effect in a data batch");
-      if (auto s = ApplyRecord(*records.front().value, batch->end, apply, apply_image); !s.ok())
+    if (!ready.empty() && (ready.size() == kMaxEntries ||
+                           next.encoded_bytes > kMaxBytes - min(ready_bytes, kMaxBytes))) {
+      if (auto s = flush(); !s.ok())
         return s;
     }
-    applied_ = batch->end;
-    applied_bytes_ += bytes->size();
+    ready_bytes += next.encoded_bytes;
+    ready.push_back(std::move(next));
   }
-  return absl::OkStatus();
+  return flush();
 }
 
 }  // namespace dfly::cluster::raft

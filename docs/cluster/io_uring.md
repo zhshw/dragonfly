@@ -7,22 +7,42 @@
 `raft_async_io`、`raft_drain_writes` 默认均为 `true`；可分别显式设为 `false`。
 Linux 数据组使用异步文件 I/O，Folly / Helio 仍由编译宏选择；非 Linux 保留同步文件追加。
 
+`--raft_data_ack_mode=flush|memory` 选择普通数据写的确认条件，默认 `flush`：
+
+- **flush**：保持现有多数落盘及 leader 应用后回复的行为。
+- **memory**：leader、follower 写完 WAL 到 page cache 后即可参与多数确认，leader 应用后回复；
+  不是纯内存日志。后台按 100 ms 或 64 MiB 未同步数据触发合批刷盘，实际完成受调度和 I/O 影响。
+  `End()` 是接收位置，`DurableEnd()` 是真正完成两次同步的位置；恢复标记只在日志段同步后发布。
+  控制记录、任期/投票状态持久化、换段、快照、截断和正常退出会先排空未同步数据。
+
+元数据组继续使用 `flush`。所有数据副本须使用同一模式，并在停止后统一切换；不支持混用模式。
+`memory` 的 OK / WAIT 不保证磁盘持久化，未发布恢复标记的尾部在进程重启时也可能被丢弃。
+该模式先用于实验，不能沿用 `flush` 的故障恢复保证。
+
+确认模式验证：Folly 的 Debug、Release、ASAN+UBSAN 各通过 47 项日志、快照和 Fetch 单测。
+真实集群覆盖两种模式的 pipeline、WAIT、关闭排空，以及 `memory` 的空闲后台刷盘和快照恢复。
+`flush` 保留 OK 后立即崩溃的恢复断言；`memory` 的崩溃恢复断言先等标记发布，
+未发布尾部丢失另有回归覆盖。单连接 pipeline 64 的三轮未插桩对照中，
+`raft.memory` 相对 `raft.flush` 确认吞吐仅提高 4.4%，原 cluster 仍快 3.71 倍。
+独立火焰图和 trace 显示 worker 内编码、数据复制、应用及排队仍有明显成本，后台刷盘也仍会阻塞。
+见 [benchmark 文档](replication-benchmark.md) 和 [性能分析结论](replication-observability.md)。
+
 | 开关 | 行为 |
 | --- | --- |
-| `--raft_async_io` | 同段、DFE4 标记窗口内的普通数据追加使用 io_uring，编译时选择 Helio 或 Folly 实现。WRITE、段 FSYNC、标记 FSYNC 分别检查完成结果，短写补写，两个 FSYNC 均使用 `flags=0`。网络仍可使用 epoll。 |
+| `--raft_async_io` | 同段普通数据追加使用 io_uring，编译时选择 Helio 或 Folly 实现。`flush` 在 DFE4 窗口内依次执行 WRITE、段 FSYNC、标记 FSYNC；`memory` 写完即可确认，后台同步共用该 I/O 后端。分别检查完成结果，短写补写，两个 FSYNC 均使用 `flags=0`。网络仍可使用 epoll。 |
 | `--raft_drain_writes` | worker 可接受下一轮追加时，从同组同任期就绪 SET 队列取最多 32 笔。按键值积压选择 1/4 MiB 编码字节预算，只追加能装入当前段的连续前缀，不主动等满。条件 SET 单独执行；RESP V2 的普通 SET 可按序提前提交，见下节。队列最多 256 笔、8 MiB 键值，满时让提交 fiber 等待；单笔超过预算的合法请求仅在空队列进入，并单独追加。 |
 
-每组只有一轮追加在途。批次字节和文件描述符保留至完成；`End()` 始终返回已经完成两次同步的 LEO。已写全的尾部可响应新到达的合法 Fetch；follower 提前报告未在本地发布的位置时，该 RPC 等本地发布后重新校验。其他 worker 操作先等在途追加排空，因此换主、截断、快照安装和关闭不能复用正在写的文件。完成回调也核对 leader 角色和任期，失败则封锁存储确认。
+每组只有一轮追加或后台刷盘在途。批次字节和文件描述符保留至完成；`flush` 的 `End()` 返回已经完成两次同步的 LEO，`memory` 则返回写全位置。已写全的尾部可响应新到达的合法 Fetch；follower 提前报告未在本地确认的位置时，该 RPC 等本地确认后重新校验。其他 worker 操作先等在途 I/O 排空，因此换主、截断、快照安装和关闭不能复用正在写的文件。完成回调也核对 leader 角色和任期，失败则封锁存储确认。
 
 drain 按实际 Kafka 编码长度和段相对 offset 上限截取前缀，余下请求放回队首，继续占用排队预算。
 若首笔也放不下，单独走同步换段路径，下一轮再继续合批。数据段大小由
 `--raft_data_segment_bytes` 控制，默认 1 GiB；回归使用小段覆盖连续换段与恢复。
-超出 DFE4 窗口、控制批及 follower 追加继续走同步路径。队列预算不含已经交给 I/O 的一轮及连接自身的请求缓冲。
+超出 DFE4 窗口的标记发布、控制批及 follower 追加继续走同步调用路径；`memory` 的普通 follower 追加只写全，不逐轮刷盘。队列预算不含已经交给 I/O 的一轮及连接自身的请求缓冲。
 本次未试验 SQE 链接、`fdatasync`、直接 I/O 或预分配。
 
 请求入队前读取非等待的 leader 任期快照，等待容量期间及追加前重新核对；旧任期排队请求
-返回错误，不改挂到新任期。不同任期请求不合成一批。追加完成后的多数持久化、leader 应用
-及按序回复要求不变。本文下方的历史性能表均来自这次段前缀、任期绑定及默认值调整之前，不能作为新版本的性能验收。
+返回错误，不改挂到新任期。不同任期请求不合成一批。追加完成后按所选模式等待多数确认、leader 应用
+及按序回复。本文下方的历史性能表均使用 `flush` 语义，来自这次段前缀、任期绑定及默认值调整之前，不能作为新版本的性能验收。
 
 本次在 `172.31.23.2` 的 Folly 构建上验证：Debug、Release、ASAN+UBSAN 的日志、Fetch、
 SET 应用、命令分发及 Folly I/O 五组单测通过，sanitizer 开启泄漏检查。段边界回归在三种
@@ -37,7 +57,7 @@ Release 的两副本、条件写、WAIT、断连、关闭排空、换主及快�
 `raft_drain_writes=true` 时，RESP V2 的普通 `SET key value` 使用非等待入队接口，
 后续 SET 无须等前一笔确认。入队顺序决定日志顺序，同 key 也可连续提交。
 每个请求持有自己的 key/value 和完成状态；连接断开只释放回复，不取消已入队写入。
-完成 fiber 继续等待多数持久化及 leader 应用，连接只按原命令顺序发送回复，
+完成 fiber 继续等待所选模式的多数确认及 leader 应用，连接只按原命令顺序发送回复，
 并在回复时更新本连接的 `raft_last_write`。GET、WAIT、NX/XX、SELECT、RESET、鉴权等
 命令只能在队首执行，保留读己之写和条件求值顺序。
 
@@ -279,7 +299,7 @@ runner 交替运行三组单笔追加探针、三组单连接客户端，以及�
 
 每组由一个 worker 串行修改日志、选举状态和 HW。异步普通数据批写全后，已经挂起及新到达的合法 Fetch 均可提前取到数据和原 HW，无需等待 leader 完成段和标记同步。[组内 Fetch 调度](../../src/server/cluster/raft/runtime/group.cc) · [提前响应及 voter 进度](../../src/server/cluster/raft/quorum/fetch_replication.cc)
 
-下面是已实现的普通异步追加路径。假设稳定的三票配置，第三台离线，普通数据批的排他末端为 N。图中两条落盘路径可以重叠。
+下面说明 `flush` 模式的普通异步追加路径。假设稳定的三票配置，第三台离线，普通数据批的排他末端为 N。图中两条落盘路径可以重叠。
 
 ```mermaid
 sequenceDiagram

@@ -34,14 +34,19 @@ class JournalExecutor {
   facade::DispatchResult Execute(DbIndex dbid, journal::ParsedEntry::CmdData& cmd,
                                  facade::SinkReplyBuilder& reply);
 
+  // Replay a resolved replacement without copying its key/value into command storage.
+  // The views must remain valid until this synchronous call returns, including fiber yields.
+  facade::DispatchResult ExecuteSet(DbIndex dbid, std::string_view key, std::string_view value,
+                                    facade::SinkReplyBuilder& reply);
+
   void FlushAll();  // Execute FLUSHALL.
   void FlushSlots(const cluster::SlotRange& slot_range);
 
  private:
-  facade::DispatchResult Execute(CommandContext* cmd_cntx);
+  facade::DispatchResult Execute(facade::ParsedArgs args, CommandContext* cmd_cntx);
 
   // Select database. Ensure it exists if accessed for first time.
-  void SelectDb(DbIndex dbid);
+  bool SelectDb(DbIndex dbid);
 
   Service* service_;
   std::unique_ptr<facade::CapturingReplyBuilder> reply_builder_;

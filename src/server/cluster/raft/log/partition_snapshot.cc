@@ -84,6 +84,8 @@ absl::Status PartitionLog::InstallSnapshot(SnapshotWriter* writer, int64_t hw,
       (!resets_log && (id.end_offset > hw || !IsLocalBoundary(id))))
     return absl::InvalidArgumentError(
         "Kafka snapshot conflicts with retained log or committed prefix");
+  if (auto s = FlushBuffered(); !s.ok())
+    return s;
   auto status = writer->Freeze(validate);
   if (!status.ok()) {
     if (writer->published_)
@@ -154,6 +156,8 @@ absl::Status PartitionLog::DeleteBeforeSnapshot(LogPosition id, int64_t hw) {
     return absl::InvalidArgumentError("Log retention requires a committed snapshot boundary");
   if (id == start_)
     return absl::OkStatus();
+  if (auto s = FlushBuffered(); !s.ok())
+    return s;
   if (id == End())
     return io_failure_ = ResetToSnapshot(id);
 

@@ -249,7 +249,7 @@ absl::Status VoterChanges::Apply(int64_t now_ms, int64_t wall_ms) {
   auto batch = MakeControlBatch(offset, pending_->epoch, wall_ms, controls);
   if (!batch.ok())
     return batch.status();
-  if (auto s = fetch_.Append(*batch, pending_->epoch); !s.ok())
+  if (auto s = fetch_.Append(*std::move(batch), pending_->epoch); !s.ok())
     return s;
   pending_->offset = offset;
   if (pending_->op == Operation::kUpdate)

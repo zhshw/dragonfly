@@ -32,6 +32,8 @@
 
 ABSL_FLAG(bool, raft_async_io, true, "Use asynchronous io_uring for data quorum appends");
 ABSL_FLAG(uint32_t, raft_data_segment_bytes, 1U << 30, "Data quorum log segment size in bytes");
+ABSL_FLAG(std::string, raft_data_ack_mode, "flush",
+          "Data quorum acknowledgement: flush (durable) or memory (page cache)");
 
 namespace dfly::cluster::raft {
 namespace {
@@ -82,6 +84,8 @@ class RaftGroup::Impl {
         bootstrap_(voters),
         campaign_(std::move(target), std::move(voters),
                   [this](const ElectionState& state) {
+                    if (auto s = log_->FlushBuffered(); !s.ok())
+                      return make_error_code(errc::io_error);
                     return store_.WriteElectionState(state,
                                                      replication_.membership().KraftVersion());
                   }),
@@ -129,6 +133,8 @@ class RaftGroup::Impl {
   }
 
   void Start(fb2::ProactorBase* owner) {
+    if (kind_ == Kind::kData)
+      LOG(INFO) << "Raft data acknowledgement mode: " << absl::GetFlag(FLAGS_raft_data_ack_mode);
 #ifdef __linux__
     if (kind_ == Kind::kData && absl::GetFlag(FLAGS_raft_async_io)) {
 #if DFLY_RAFT_USE_FOLLY
@@ -140,10 +146,11 @@ class RaftGroup::Impl {
       LOG(INFO) << "Raft file I/O: io_uring (Helio)";
 #endif
       RunOnWorker([&] {
-        replication_.SetAsyncIO(
-            [this](int fd, int64_t offset, string_view bytes, PartitionLog::IoCallback done) {
-              SubmitIO(fd, offset, bytes, std::move(done));
-            });
+        async_io_ = [this](int fd, int64_t offset, string_view bytes,
+                           PartitionLog::IoCallback done) {
+          SubmitIO(fd, offset, bytes, std::move(done));
+        };
+        replication_.SetAsyncIO(async_io_);
       });
     }
 #endif
@@ -162,7 +169,7 @@ class RaftGroup::Impl {
       supervisor_.Join();
 
     // Completion callbacks retain the log and its descriptors until both barriers drain.
-    RunOnWorker([] {});
+    RunOnWorker([&] { CheckBufferedFlush(log_->FlushBuffered()); });
   }
 
   RpcHandlers Handlers();
@@ -211,6 +218,7 @@ class RaftGroup::Impl {
         const auto commit = CommitState();
         const auto end = log_->End();
         result.Apply(operation);
+        MaybeFlushBuffered();
         NotifyProgress(commit, end);
         return true;
       });
@@ -234,6 +242,25 @@ class RaftGroup::Impl {
     }
   }
 
+  void CheckBufferedFlush(absl::Status status) {
+    if (!status.ok()) {
+      failed_ = true;
+      campaign_.FenceStorage();
+      LOG(ERROR) << "Stopped quorum " << campaign_.target().topic << ": " << status;
+    }
+  }
+
+  void MaybeFlushBuffered() {
+    if (failed_ || stopping_ || log_->AppendPending() || !log_->BufferedFlushDue())
+      return;
+    auto started = log_->TryFlushBufferedAsync(
+        async_io_, [this](absl::Status status) { CheckBufferedFlush(status); });
+    if (!started.ok())
+      CheckBufferedFlush(started.status());
+    else if (!*started)
+      CheckBufferedFlush(log_->FlushBuffered());
+  }
+
 #ifdef __linux__
   void SubmitIO(int fd, int64_t offset, string_view bytes, PartitionLog::IoCallback done) {
 #if DFLY_RAFT_USE_FOLLY
@@ -247,6 +274,7 @@ class RaftGroup::Impl {
         (*completion)(result);
         if (!log_->AppendPending()) {
           Tick();
+          MaybeFlushBuffered();
           io_changed_.notifyAll();
         }
         NotifyProgress(commit, end);
@@ -265,6 +293,7 @@ class RaftGroup::Impl {
             (*completion)(result);
             if (!log_->AppendPending()) {
               Tick();
+              MaybeFlushBuffered();
               io_changed_.notifyAll();
             }
             NotifyProgress(commit, end);
@@ -612,6 +641,7 @@ class RaftGroup::Impl {
   fb2::EventCount fetch_changed_;
   fb2::EventCount commit_changed_;
   fb2::EventCount io_changed_;
+  PartitionLog::AsyncIO async_io_;
   unique_ptr<fb2::Pool> disk_pool_;
 #if DFLY_RAFT_USE_FOLLY
   unique_ptr<FollyIo> folly_io_;
@@ -774,7 +804,7 @@ error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
   if (parked && !stopping_) {
     if (auto records = parked->Records(request.max_bytes)) {
       // The response retains the previously validated epoch and HW. Only a later Fetch can
-      // report a higher durable offset, and that request runs on the serialized group worker.
+      // report a higher acknowledged offset under the group's configured durability mode.
       response->responses.front().partitions.front().records.data->assign(*records);
       return {};
     }
@@ -802,9 +832,14 @@ absl::StatusOr<unique_ptr<RaftGroup>> RaftGroup::Open(const filesystem::path& di
     members.push_back({ReplicaKey{id}, ep});
   }
   const string topic = kind == Kind::kMetadata ? kMetadataTopic : kDataTopic;
+  const auto mode = absl::GetFlag(FLAGS_raft_data_ack_mode);
+  if (mode != "flush" && mode != "memory")
+    return absl::InvalidArgumentError("raft_data_ack_mode must be flush or memory");
   auto group_dir = dir / (topic + "-" + to_string(partition));
   auto log = PartitionLog::Open(
-      group_dir, kind == Kind::kData ? absl::GetFlag(FLAGS_raft_data_segment_bytes) : 1U << 30);
+      group_dir, kind == Kind::kData ? absl::GetFlag(FLAGS_raft_data_segment_bytes) : 1U << 30,
+      kind == Kind::kData && mode == "memory" ? PartitionLog::AckMode::kMemory
+                                              : PartitionLog::AckMode::kFlush);
   if (!log.ok())
     return log.status();
   VoteTarget target{

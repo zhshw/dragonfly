@@ -55,41 +55,49 @@ facade::DispatchResult JournalExecutor::Execute(DbIndex dbid, journal::ParsedEnt
 
 facade::DispatchResult JournalExecutor::Execute(DbIndex dbid, journal::ParsedEntry::CmdData& cmd,
                                                 facade::SinkReplyBuilder& reply) {
-  if (dbid >= absl::GetFlag(FLAGS_dbnum)) {
-    LOG(ERROR) << "Database index out of range in journal: " << dbid;
+  if (!SelectDb(dbid))
     return facade::DispatchResult::ERROR;
-  }
-
-  SelectDb(dbid);
   CommandContext cntx_cmd;
   cntx_cmd.Init(&reply, &conn_context_);
 
   // TODO: we should improve interfaces in callers (replica and rdb_load) so that we pass
   // CommandContext directly and avoid this swap.
   cntx_cmd.SwapArgs(cmd);
-  return Execute(&cntx_cmd);
+  return Execute(facade::ParsedArgs{cntx_cmd}, &cntx_cmd);
+}
+
+facade::DispatchResult JournalExecutor::ExecuteSet(DbIndex dbid, string_view key, string_view value,
+                                                   facade::SinkReplyBuilder& reply) {
+  if (!SelectDb(dbid))
+    return facade::DispatchResult::ERROR;
+  array<string_view, 3> parts{"SET", key, value};
+  CommandContext cmd(&reply, &conn_context_);
+  return Execute(facade::ArgSlice{parts}, &cmd);
 }
 
 void JournalExecutor::FlushAll() {
   CommandContext cmd;
   cmd.Init(reply_builder_.get(), &conn_context_);
   BuildFromParts(&cmd, "FLUSHALL");
-  std::ignore = Execute(&cmd);
+  std::ignore = Execute(facade::ParsedArgs{cmd}, &cmd);
 }
 
 void JournalExecutor::FlushSlots(const cluster::SlotRange& slot_range) {
   CommandContext cmd;
   cmd.Init(reply_builder_.get(), &conn_context_);
   BuildFromParts(&cmd, "DFLYCLUSTER", "FLUSHSLOTS", slot_range.start, slot_range.end);
-  std::ignore = Execute(&cmd);
+  std::ignore = Execute(facade::ParsedArgs{cmd}, &cmd);
 }
 
-facade::DispatchResult JournalExecutor::Execute(CommandContext* cmd_cntx) {
-  return service_->DispatchCommand(facade::ParsedArgs{*cmd_cntx}, cmd_cntx,
-                                   facade::AsyncPreference::ONLY_SYNC, nullptr);
+facade::DispatchResult JournalExecutor::Execute(facade::ParsedArgs args, CommandContext* cmd_cntx) {
+  return service_->DispatchCommand(args, cmd_cntx, facade::AsyncPreference::ONLY_SYNC, nullptr);
 }
 
-void JournalExecutor::SelectDb(DbIndex dbid) {
+bool JournalExecutor::SelectDb(DbIndex dbid) {
+  if (dbid >= absl::GetFlag(FLAGS_dbnum)) {
+    LOG(ERROR) << "Database index out of range in journal: " << dbid;
+    return false;
+  }
   if (ensured_dbs_.size() <= dbid)
     ensured_dbs_.resize(dbid + 1);
 
@@ -101,6 +109,7 @@ void JournalExecutor::SelectDb(DbIndex dbid) {
     ensured_dbs_[dbid] = true;
   }
   conn_context_.conn_state.db_index = dbid;
+  return true;
 }
 
 }  // namespace dfly

@@ -23,8 +23,8 @@ const vector<CampaignVoter> kVoters{{kA, {"a", 7100}}, {kB, {"b", 7200}}, {kC, {
 
 struct Node {
   Node(fs::path dir, ReplicaKey local, vector<CampaignVoter> voters, int32_t partition,
-       optional<int64_t> hw)
-      : log(PartitionLog::Open(dir).value()),
+       optional<int64_t> hw, PartitionLog::AckMode mode = PartitionLog::AckMode::kFlush)
+      : log(PartitionLog::Open(dir, 1U << 30, mode).value()),
         campaign({"cluster", "data", partition, local}, std::move(voters),
                  [](const ElectionState&) { return error_code{}; }),
         epochs(campaign, "RAFT", 1000, 1000),
@@ -122,8 +122,12 @@ TEST_F(FetchReplicationTest, NewlyArrivingFetchReadsWrittenTailBeforeLocalPublic
   }
   test::ControlledIO io;
   a.fetch.SetAsyncIO(io.Submitter());
-  const auto bytes = Batch(1, 5) + Batch(2, 5);
-  ASSERT_TRUE(a.fetch.Append(bytes, 5).ok());
+  auto bytes = Batch(1, 5) + Batch(2, 5);
+  const auto expected = bytes;
+  const char* data = bytes.data();
+  ASSERT_TRUE(a.fetch.Append(std::move(bytes), 5).ok());
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().bytes.data(), data);
   auto request = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
   EXPECT_TRUE(Handle(&a, request).responses[0].partitions[0].records.data->empty());
   io.Complete();
@@ -131,7 +135,7 @@ TEST_F(FetchReplicationTest, NewlyArrivingFetchReadsWrittenTailBeforeLocalPublic
   // This Fetch arrives after WRITE completion and while the segment sync is still pending.
   request = b.fetch.PrepareFetch(1, 18, 0, 1024).value();
   auto response = Handle(&a, request);
-  EXPECT_EQ(response.responses[0].partitions[0].records.data, bytes);
+  EXPECT_EQ(response.responses[0].partitions[0].records.data, expected);
   ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, request.sequence, response).ok());
   EXPECT_EQ(b.log->End(), (LogPosition{5, 3}));
   EXPECT_EQ(a.log->End(), (LogPosition{5, 1}));
@@ -211,6 +215,47 @@ TEST_F(FetchReplicationTest, LeaderAppendsOnceAndCommitsOnlyReportedDurableVoter
   Handle(&a, caught_up, &waiting);
   EXPECT_TRUE(waiting);
   EXPECT_EQ(c.log->End().end_offset, 0);
+}
+
+TEST_F(FetchReplicationTest, MemoryMajorityCommitsBeforeEitherDataLogFlushes) {
+  Node a(Path(kA.id, 10), kA, kVoters, 10, nullopt, PartitionLog::AckMode::kMemory);
+  Node b(Path(kB.id, 10), kB, kVoters, 10, nullopt, PartitionLog::AckMode::kMemory);
+  Elect(&a, &b);
+  for (int i = 0; i < 2; ++i) {
+    auto fetch = b.fetch.PrepareFetch(kA.id, 18, 0, 1 << 20).value();
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, fetch.sequence, Handle(&a, fetch)).ok());
+  }
+  ASSERT_EQ(a.fetch.HighWatermark(), 1);
+  ASSERT_EQ(b.fetch.HighWatermark(), 1);
+
+  // Leader-change records remain durable even when ordinary data uses memory acknowledgement.
+  ASSERT_EQ(a.log->DurableEnd().end_offset, 1);
+  ASSERT_EQ(b.log->DurableEnd().end_offset, 1);
+  test::ControlledIO io;
+  a.fetch.SetAsyncIO(io.Submitter());
+  ASSERT_TRUE(a.fetch.Append(Batch(1, 5), 5).ok());
+  ASSERT_EQ(io.requests.size(), 1u);
+  io.Complete();
+  EXPECT_TRUE(io.requests.empty());
+  EXPECT_EQ(a.log->End().end_offset, 2);
+  EXPECT_EQ(a.log->DurableEnd().end_offset, 1);
+  EXPECT_EQ(a.fetch.HighWatermark(), 1);
+
+  auto copy = b.fetch.PrepareFetch(kA.id, 18, 0, 1 << 20).value();
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, copy.sequence, Handle(&a, copy)).ok());
+  EXPECT_EQ(b.log->End().end_offset, 2);
+  EXPECT_EQ(b.log->DurableEnd().end_offset, 1);
+  EXPECT_EQ(a.fetch.HighWatermark(), 1);
+  auto report = b.fetch.PrepareFetch(kA.id, 18, 0, 1 << 20).value();
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, report.sequence, Handle(&a, report)).ok());
+  EXPECT_EQ(a.fetch.HighWatermark(), 2);
+  EXPECT_EQ(b.fetch.HighWatermark(), 2);
+  EXPECT_EQ(a.log->DurableEnd().end_offset, 1);
+  EXPECT_EQ(b.log->DurableEnd().end_offset, 1);
+  EXPECT_TRUE(a.log->FlushBuffered().ok());
+  EXPECT_TRUE(b.log->FlushBuffered().ok());
+  EXPECT_EQ(a.log->DurableEnd(), a.log->End());
+  EXPECT_EQ(b.log->DurableEnd(), b.log->End());
 }
 
 TEST_F(FetchReplicationTest, IndependentTwoVoterPartitionsLoseMajorityIndependently) {

@@ -66,6 +66,16 @@ void PutSigned(int32_t n, string* bytes) {
   bytes->push_back(static_cast<char>(raw));
 }
 
+size_t SignedSize(int32_t n) {
+  uint32_t raw = (static_cast<uint32_t>(n) << 1) ^ static_cast<uint32_t>(-(n < 0));
+  size_t size = 1;
+  while (raw >= 128) {
+    ++size;
+    raw >>= 7;
+  }
+  return size;
+}
+
 bool ReadBytes(string_view* body, optional<string_view>* result) {
   int32_t n;
   if (!ReadSigned(body, &n) || n < -1)
@@ -127,16 +137,15 @@ void PutRecord(int32_t index, optional<string_view> key, string_view value, stri
   records->append(body);
 }
 
-absl::StatusOr<string> BuildBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
-                                  int32_t count, bool control, string records) {
+absl::StatusOr<string> FinishBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                   int32_t count, bool control, string batch) {
   if (offset < 0 || count <= 0 || offset > INT64_MAX - count || epoch < 0 || timestamp_ms < 0)
     return absl::InvalidArgumentError("Invalid KRaft batch offset, epoch, count or timestamp");
-  if (records.size() > kMaxBatchSize - kBatchHeaderSize)
+  if (batch.size() > kMaxBatchSize)
     return absl::ResourceExhaustedError("KRaft batch exceeds maximum size");
 
-  string batch(kBatchHeaderSize, '\0');
   be::Store64(batch.data(), offset);
-  be::Store32(batch.data() + 8, kBatchHeaderSize + records.size() - 12);
+  be::Store32(batch.data() + 8, batch.size() - 12);
   be::Store32(batch.data() + 12, epoch);
   batch[16] = 2;
   be::Store16(batch.data() + 21, control ? kControl : 0);
@@ -147,10 +156,18 @@ absl::StatusOr<string> BuildBatch(int64_t offset, int32_t epoch, int64_t timesta
   be::Store16(batch.data() + 51, UINT16_MAX);
   be::Store32(batch.data() + 53, UINT32_MAX);
   be::Store32(batch.data() + 57, count);
-  batch += records;
   be::Store32(batch.data() + 17,
               static_cast<uint32_t>(absl::ComputeCrc32c(string_view(batch).substr(21))));
   return batch;
+}
+
+absl::StatusOr<string> BuildBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                  int32_t count, bool control, string records) {
+  if (records.size() > kMaxBatchSize - kBatchHeaderSize)
+    return absl::ResourceExhaustedError("KRaft batch exceeds maximum size");
+  string batch(kBatchHeaderSize, '\0');
+  batch += records;
+  return FinishBatch(offset, epoch, timestamp_ms, count, control, std::move(batch));
 }
 }  // namespace
 
@@ -213,6 +230,33 @@ absl::StatusOr<std::string> MakeDataBatch(int64_t offset, int32_t epoch, int64_t
       return absl::ResourceExhaustedError("KRaft data batch exceeds maximum size");
   }
   return BuildBatch(offset, epoch, timestamp_ms, values.size(), false, std::move(records));
+}
+
+absl::StatusOr<string> MakeSingleRecordBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,
+                                             span<const string_view> value_parts) {
+  size_t value_size = 0;
+  for (string_view part : value_parts) {
+    if (part.size() > kMaxBatchSize - value_size)
+      return absl::ResourceExhaustedError("KRaft data batch exceeds maximum size");
+    value_size += part.size();
+  }
+
+  // Attributes, timestamp/offset deltas, null key and empty headers each occupy one byte.
+  const size_t body_size = 5 + SignedSize(value_size) + value_size;
+  const size_t batch_size = kBatchHeaderSize + SignedSize(body_size) + body_size;
+  if (batch_size > kMaxBatchSize)
+    return absl::ResourceExhaustedError("KRaft data batch exceeds maximum size");
+  string batch;
+  batch.reserve(batch_size);
+  batch.append(kBatchHeaderSize, '\0');
+  PutSigned(body_size, &batch);
+  batch.append(3, '\0');
+  PutSigned(-1, &batch);
+  PutSigned(value_size, &batch);
+  for (string_view part : value_parts)
+    batch.append(part);
+  batch.push_back(0);
+  return FinishBatch(offset, epoch, timestamp_ms, 1, false, std::move(batch));
 }
 
 absl::StatusOr<std::string> MakeControlBatch(int64_t offset, int32_t epoch, int64_t timestamp_ms,

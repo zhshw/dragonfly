@@ -2,6 +2,9 @@
 
 `--cluster_mode=yes` 的主节点按引擎线程推送 journal，副本用 LSN 报告执行进度。`--cluster_mode=raft` 的每个数据复制组拥有独立的分区日志，voter 在组内选主，按多数持久化位置确认写入。下文沿用同一组 A、A-r1 节点对照两套复制协议。Raft 示例另将 A-r2 加入组 10，使多数从 2/2 变为 2/3。slot 42 和 43 共用组 10 的日志。[集群拓扑与 slot 映射](raft-cluster-design.md) · [主从复制原图](../replication.md) · [复制测试报告](replication-benchmark.md)
 
+本文描述默认 `--raft_data_ack_mode=flush`。实验选项 `memory` 改为多数页缓存确认，
+控制记录和元数据仍需落盘；确认条件及恢复限制见 [io_uring 文档](io_uring.md)。
+
 ## 1. 复制状态机
 
 原图跟踪主节点上的复制会话。Raft 图跟踪组 10 的一个 follower。组内换主时，follower 根据新 leader 的 epoch 和本地日志末端查找共同前缀。本地仍有共同日志前缀时继续增量 Fetch；落后位置早于 leader 的日志起点时，follower 安装整组 KV 快照后续拉。

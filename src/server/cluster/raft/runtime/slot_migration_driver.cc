@@ -109,7 +109,7 @@ absl::Status SlotMigrationDriver::Append(RaftGroup::State state, const SlotTrans
   auto batch = MakeSlotTransferBatch(offset, epoch, wall, record);
   if (!batch.ok())
     return batch.status();
-  auto status = state.replication.Append(*batch, epoch);
+  auto status = state.replication.Append(*std::move(batch), epoch);
   if (status.ok())
     pending_ = {epoch, offset + 1};
   return status;

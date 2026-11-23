@@ -7,6 +7,7 @@
 #include <absl/functional/function_ref.h>
 #include <absl/status/statusor.h>
 
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -28,11 +29,15 @@ struct FetchPosition {
 };
 
 // One writer per partition. Mutations and I/O completions run on the serialized group worker.
-// End() reports only durable data; an asynchronous append keeps its unpublished tail separate.
+// End() reports the acknowledgement boundary: durable by default, written in memory mode.
+// DurableEnd() always reports the prefix covered by completed durability barriers.
 class PartitionLog {
  public:
+  enum class AckMode { kFlush, kMemory };
+
   static absl::StatusOr<std::unique_ptr<PartitionLog>> Open(const std::filesystem::path& dir,
-                                                            size_t segment_bytes = 1U << 30);
+                                                            size_t segment_bytes = 1U << 30,
+                                                            AckMode ack_mode = AckMode::kFlush);
   ~PartitionLog();
   PartitionLog(const PartitionLog&) = delete;
   PartitionLog& operator=(const PartitionLog&) = delete;
@@ -50,7 +55,14 @@ class PartitionLog {
   // Kafka RaftLog's Fetch validation returns the common prefix or a snapshot to download.
   FetchPosition ValidateOffsetAndEpoch(int64_t offset, int32_t epoch) const;
   LogPosition End() const;
+  LogPosition DurableEnd() const {
+    return buffered_durable_end_.value_or(End());
+  }
   LogPosition EndForEpoch(int32_t requested_epoch) const;
+
+  // Memory mode batches ordinary data barriers. Structural changes must flush first.
+  bool BufferedFlushDue() const;
+  absl::Status FlushBuffered();
 
   // Check an encoded append against the active segment's byte and relative-offset limits.
   // Call on the group worker after the previous append has completed.
@@ -59,7 +71,7 @@ class PartitionLog {
   // Leader appends contain whole batches of this epoch; follower appends may include
   // earlier epochs and a partial trailing batch from Fetch.
   // For an all-data append, notify after the complete write and before its durability barrier.
-  // The callback receives the first complete batch's byte size. End() is still the durable LEO.
+  // The callback receives the first complete batch's byte size before End() advances.
   using DataWritten = absl::FunctionRef<void(size_t)>;
   absl::Status Append(std::string_view batches, int32_t leader_epoch,
                       std::optional<DataWritten> written = std::nullopt);
@@ -68,8 +80,12 @@ class PartitionLog {
   using IoCallback = std::function<void(int)>;
   using AsyncIO = std::function<void(int, int64_t, std::string_view, IoCallback)>;
   using AppendDone = std::function<void(absl::Status)>;
-  absl::StatusOr<bool> TryAppendAsync(std::string_view bytes, int32_t epoch, AsyncIO submit,
-                                      std::function<void(size_t)> written, AppendDone done);
+
+  // Retain the immutable bytes through short writes and the final completion callback.
+  absl::StatusOr<bool> TryAppendAsync(std::shared_ptr<const std::string> bytes, int32_t epoch,
+                                      AsyncIO submit, std::function<void(size_t)> written,
+                                      AppendDone done);
+  absl::StatusOr<bool> TryFlushBufferedAsync(AsyncIO submit, AppendDone done);
   bool AppendPending() const {
     return pending_ != nullptr;
   }
@@ -108,7 +124,7 @@ class PartitionLog {
   };
 
   struct PendingAppend {
-    std::string bytes;
+    std::shared_ptr<const std::string> bytes;
     std::vector<Batch> batches;
     log_files::RecoveryMarker::AppendPublication publication;
     AsyncIO submit;
@@ -116,12 +132,16 @@ class PartitionLog {
     AppendDone done;
     size_t progress = 0;
     bool readable = false;
+    bool memory = false;
+    bool flush_only = false;
   };
   void WritePending();
+  void SyncPending();
   void FinishPending(absl::Status status);
+  void RecordBuffered(size_t bytes);
 
-  PartitionLog(std::filesystem::path dir, size_t segment_bytes)
-      : dir_(std::move(dir)), segment_bytes_(segment_bytes) {
+  PartitionLog(std::filesystem::path dir, size_t segment_bytes, AckMode ack_mode)
+      : dir_(std::move(dir)), segment_bytes_(segment_bytes), ack_mode_(ack_mode) {
   }
   absl::Status Recover();
   absl::Status RecoverSegment(const log_files::DurableEnd* marker, LogPosition* physical_end);
@@ -139,6 +159,10 @@ class PartitionLog {
   int log_fd_ = -1;
   log_files::RecoveryMarker marker_;
   size_t segment_bytes_;
+  const AckMode ack_mode_;
+  std::optional<LogPosition> buffered_durable_end_;
+  size_t buffered_bytes_ = 0;
+  std::chrono::steady_clock::time_point buffered_since_;
   int64_t active_base_ = 0;
   int64_t active_bytes_ = 0;
   LogPosition start_{0, 0};

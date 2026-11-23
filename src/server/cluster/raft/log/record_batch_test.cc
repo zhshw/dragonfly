@@ -46,6 +46,38 @@ TEST(RecordBatchTest, MatchesKafkaLeaderChangeAndBasicRecords) {
   EXPECT_TRUE(DecodeRecordBatch(*leader)->control);
 }
 
+TEST(RecordBatchTest, SplitDataValueMatchesContiguousEncoding) {
+  for (size_t size : {0u, 1u, 55u, 56u, 63u, 64u, 8191u, 8192u, 262144u,
+                      unsigned(kMaxBatchSize - kBatchHeaderSize - 13)}) {
+    SCOPED_TRACE(size);
+    array<string, 1> values{string(size, '\0')};
+    for (size_t i = 0; i < size; ++i)
+      values.front()[i] = static_cast<char>(i % 251);
+    const string_view value = values.front();
+    const array<string_view, 4> parts{value.substr(0, size / 3),
+                                      {},
+                                      value.substr(size / 3, size / 3),
+                                      value.substr(2 * (size / 3))};
+    auto batch = MakeSingleRecordBatch(7, 2, 123, parts);
+    ASSERT_TRUE(batch.ok()) << batch.status();
+    ASSERT_EQ(batch, MakeDataBatch(7, 2, 123, values));
+    vector<RecordView> records;
+    auto info = DecodeRecordBatch(*batch, &records);
+    ASSERT_TRUE(info.ok()) << info.status();
+    EXPECT_EQ(info->end, (LogPosition{2, 8}));
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_FALSE(records.front().key);
+    EXPECT_EQ(records.front().value, value);
+    if (size == kMaxBatchSize - kBatchHeaderSize - 13) {
+      EXPECT_EQ(batch->size(), kMaxBatchSize);
+    }
+  }
+  const string large(kMaxBatchSize - kBatchHeaderSize - 12, 'v');
+  const array<string_view, 1> oversized{large};
+  EXPECT_FALSE(MakeSingleRecordBatch(0, 2, 123, oversized).ok());
+  EXPECT_FALSE(MakeSingleRecordBatch(-1, 2, 123, {}).ok());
+}
+
 TEST(RecordBatchTest, RejectsBadCrcAndMalformedRecordsEvenWithValidCrc) {
   string good;
   ASSERT_TRUE(absl::HexStringToBytes(kJavaData, &good));

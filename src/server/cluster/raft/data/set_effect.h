@@ -56,6 +56,11 @@ class CommittedEffects {
   }
   using ApplySet = absl::FunctionRef<absl::Status(const SetEffect&)>;
 
+  // Execute in order and report the completed prefix, including on failure. Success may
+  // consume a nonempty prefix to yield after a time budget. Views live until the call returns.
+  using ApplySetBatch =
+      absl::FunctionRef<absl::Status(std::span<const SetEffect* const>, size_t* applied)>;
+
   const SlotTransferState& transfers() const {
     return transfers_;
   }
@@ -78,11 +83,16 @@ class CommittedEffects {
   absl::Status ApplyTo(const PartitionLog& log, int64_t high_watermark, ApplySet apply,
                        ApplySlotImage apply_image);
 
- private:
-  absl::Status ApplyRecord(std::string_view payload, LogPosition end, ApplySet apply,
-                           ApplySlotImage apply_image);
+  // Coalesce ready replacements up to 32 entries / 1 MiB (one larger entry is allowed).
+  // Control, no-op and migration records end a batch. State changes stay on the group worker.
+  absl::Status ApplyToBatched(const PartitionLog& log, int64_t high_watermark, ApplySetBatch apply,
+                              ApplySlotImage apply_image);
 
-  absl::Status ApplyEffect(const SetEffect& effect, ApplySet apply);
+ private:
+  absl::Status ApplyTransferRecord(std::string_view payload, LogPosition end,
+                                   ApplySlotImage apply_image);
+
+  absl::Status ValidateEffect(const SetEffect& effect) const;
 
   struct PendingEffect {
     LogPosition end;

@@ -44,7 +44,8 @@ class FetchReplication {
   // may_have_appended lets the client distinguish an uncertain outcome from a rejection.
   // With AsyncIO enabled success may mean accepted: callers must still wait for HW/application.
   // The owner drains the pending append before changing term, truncating or installing snapshots.
-  [[nodiscard]] absl::Status Append(std::string_view batches, int32_t expected_epoch,
+  // Move the encoded batches in to share their storage with asynchronous I/O callbacks.
+  [[nodiscard]] absl::Status Append(std::string batches, int32_t expected_epoch,
                                     bool* may_have_appended = nullptr);
   void SetAsyncIO(PartitionLog::AsyncIO submit) {
     async_io_ = std::move(submit);

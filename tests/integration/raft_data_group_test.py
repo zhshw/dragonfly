@@ -224,6 +224,20 @@ class RaftDataGroupFixture(unittest.TestCase):
             return None
         return sorted(replies[0])
 
+    def data_log_published(self, node, group, offset):
+        marker = self.root / str(node) / f"__dragonfly_data-{group}" / "dragonfly-log-end"
+        with marker.open("rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            header = source.read(44)
+            if os.fstat(source.fileno()).st_size != size:
+                return False
+        if len(header) != 44 or header[:4] != b"DFE4":
+            return False
+        delta, check = divmod(size - (1 << 16), 16)
+        if not 0 <= delta <= 4095 or check != ((delta ^ (delta >> 4) ^ (delta >> 8)) & 15):
+            return False
+        return int.from_bytes(header[32:40], "big") + delta >= offset
+
     def retained_checkpoint(self, node, group, min_offset):
         directory = self.root / str(node) / f"__dragonfly_data-{group}"
         marker = directory / "dragonfly-log-end"
@@ -410,6 +424,7 @@ class RaftDataGroupTest(RaftDataGroupFixture):
 
 class RaftPipelineTest(RaftDataGroupFixture):
     data_threads = 4
+    crash_recovery = True
     segment_bytes = (1 << 20) + (128 << 10)
     data_flags = (f"--raft_data_segment_bytes={segment_bytes}",)
 
@@ -587,9 +602,9 @@ class RaftPipelineTest(RaftDataGroupFixture):
                 self.assertEqual(previous.stat().st_size, 12 + int.from_bytes(header[8:12], "big"))
             self.assertGreater(previous.stat().st_size + next_batch_bytes, self.segment_bytes)
 
-        # Confirmed replies remain recoverable after both data voters are killed.
+        # Flush mode survives a crash; memory mode flushes on orderly shutdown before restart.
         for node in GROUPS[10]:
-            self.stop(node, crash=True)
+            self.stop(node, crash=self.crash_recovery)
         for node in GROUPS[10]:
             self.start(node)
         slots = self.wait_for(self.slots)
@@ -598,6 +613,26 @@ class RaftPipelineTest(RaftDataGroupFixture):
                 self.assertEqual(recovered.get(name), value)
             self.assertTrue(recovered.select(1))
             self.assertEqual(recovered.get(key), b"db-one")
+
+
+class RaftMemoryAckTest(RaftPipelineTest):
+    data_flags = RaftPipelineTest.data_flags + ("--raft_data_ack_mode=memory",)
+    crash_recovery = False
+
+    def test_idle_memory_writes_publish_recovery_boundary(self):
+        client, key, leader, _ = self.writer()
+        self.assertTrue(client.set(key, b"background flush"))
+        self.assertEqual(client.wait(1, 2500), 1)
+        offset = describe(self.raft[leader], b"__dragonfly_data", 10).hw
+
+        self.wait_for(lambda: all(self.data_log_published(node, 10, offset) for node in GROUPS[10]))
+        for node in GROUPS[10]:
+            self.stop(node, crash=True)
+        for node in GROUPS[10]:
+            self.start(node)
+        slots = self.wait_for(self.slots)
+        with redis.Redis(host=HOST, port=slots[0][2][1]) as recovered:
+            self.assertEqual(recovered.get(key), b"background flush")
 
 
 class ControllerAdminTest(RaftDataGroupFixture):
@@ -971,6 +1006,7 @@ class DynamicDataGroupTest(DynamicDataGroupFixture):
 class DataSnapshotRecoveryTest(DynamicDataGroupFixture):
     data_threads = 2
     snapshot_bytes = {11: 1280 * 1024, 12: 1280 * 1024, 13: 64 << 20}
+    wait_for_tail_publication = False
 
     def test_lagging_voter_installs_snapshot_and_replays_tail(self):
         slots = self.wait_for(self.slots)
@@ -1016,6 +1052,11 @@ class DataSnapshotRecoveryTest(DynamicDataGroupFixture):
                 self.assertEqual(client.get(key), value)
             self.assertTrue(client.set(tail_key, b"after promotion"))
 
+        # Memory mode promises recovery only after background publication, not just SET OK.
+        if self.wait_for_tail_publication:
+            offset = describe(self.raft[self.learner], b"__dragonfly_data", 10).hw
+            self.wait_for(lambda: self.data_log_published(self.learner, 10, offset))
+
         # The new leader's log still starts at the downloaded cut; recover its suffix on restart.
         self.stop(self.learner, crash=True)
         self.start(self.learner)
@@ -1025,6 +1066,11 @@ class DataSnapshotRecoveryTest(DynamicDataGroupFixture):
                 self.assertEqual(client.get(key), value)
         with redis.Redis(host=HOST, port=self.resp[self.learner], db=1) as other_db:
             self.assertEqual(other_db.get(tail_key), b"db1 incremental value")
+
+
+class MemorySnapshotRecoveryTest(DataSnapshotRecoveryTest):
+    data_flags = ("--raft_data_ack_mode=memory",)
+    wait_for_tail_publication = True
 
 
 if __name__ == "__main__":

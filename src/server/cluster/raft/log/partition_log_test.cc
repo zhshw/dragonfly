@@ -40,8 +40,9 @@ class PartitionLogTest : public testing::Test {
     Open();
   }
 
-  void Open(size_t segment_bytes = 1U << 30) {
-    auto result = PartitionLog::Open(dir_, segment_bytes);
+  void Open(size_t segment_bytes = 1U << 30,
+            PartitionLog::AckMode mode = PartitionLog::AckMode::kFlush) {
+    auto result = PartitionLog::Open(dir_, segment_bytes, mode);
     ASSERT_TRUE(result.ok()) << result.status();
     log_ = *std::move(result);
   }
@@ -68,15 +69,19 @@ TEST_F(PartitionLogTest, AsyncAppendPublishesOnlyAfterBothBarriersAndHandlesShor
   test::ControlledIO io;
   bool written = false, completed = false;
   EXPECT_FALSE(log_->TryAppendAsync(
-                       bytes, 4, io.Submitter(), [](size_t) {}, [](absl::Status) { ADD_FAILURE(); })
+                       make_shared<const string>(bytes), 4, io.Submitter(), [](size_t) {},
+                       [](absl::Status) { ADD_FAILURE(); })
                    .ok());
   EXPECT_FALSE(log_->TryAppendAsync(
-                       string_view(bytes).substr(0, bytes.size() - 1), 3, io.Submitter(),
-                       [](size_t) {}, [](absl::Status) { ADD_FAILURE(); })
+                       make_shared<const string>(bytes.substr(0, bytes.size() - 1)), 3,
+                       io.Submitter(), [](size_t) {}, [](absl::Status) { ADD_FAILURE(); })
                    .ok());
   EXPECT_TRUE(io.requests.empty());
+  auto payload = make_shared<const string>(bytes);
+  weak_ptr<const string> retained = payload;
+  const char* data = payload->data();
   auto started = log_->TryAppendAsync(
-      bytes, 3, io.Submitter(),
+      std::move(payload), 3, io.Submitter(),
       [&](size_t first_size) {
         written = true;
         EXPECT_EQ(first_size, bytes.size());
@@ -84,8 +89,11 @@ TEST_F(PartitionLogTest, AsyncAppendPublishesOnlyAfterBothBarriersAndHandlesShor
       [&](absl::Status status) {
         completed = true;
         EXPECT_TRUE(status.ok());
+        EXPECT_FALSE(retained.expired());
       });
   ASSERT_TRUE(started.ok() && *started);
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().bytes.data(), data);
   EXPECT_FALSE(log_->TruncateTo(0, 0).ok());
   EXPECT_FALSE(log_->Append(bytes, 3).ok());
   EXPECT_FALSE(log_->WrittenRecords(2, 1));
@@ -94,6 +102,7 @@ TEST_F(PartitionLogTest, AsyncAppendPublishesOnlyAfterBothBarriersAndHandlesShor
   EXPECT_FALSE(written);
   ASSERT_EQ(io.requests.size(), 1u);
   EXPECT_EQ(io.requests.front().offset, int64_t(first.size() + 7));
+  EXPECT_EQ(io.requests.front().bytes.data(), data + 7);
   io.Complete();
   EXPECT_TRUE(written);
   EXPECT_EQ(log_->WrittenRecords(2, 1), bytes);
@@ -106,12 +115,130 @@ TEST_F(PartitionLogTest, AsyncAppendPublishesOnlyAfterBothBarriersAndHandlesShor
   EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
   io.Complete();
   EXPECT_TRUE(completed);
+  EXPECT_TRUE(retained.expired());
   EXPECT_FALSE(log_->AppendPending());
   EXPECT_EQ(log_->End(), (LogPosition{3, 4}));
   log_.reset();
   Open();
   EXPECT_EQ(log_->End(), (LogPosition{3, 4}));
   EXPECT_EQ(log_->Read(0, 4, SIZE_MAX).value(), first + bytes);
+}
+
+TEST_F(PartitionLogTest, MemoryAppendAcknowledgesWritesBeforeSharedDurabilityBarriers) {
+  log_.reset();
+  Open(1U << 30, PartitionLog::AckMode::kMemory);
+  const auto marker_size = fs::file_size(dir_ / "dragonfly-log-end");
+  const auto first = MakeDataBatch(0, 3, 1, values_).value();
+  const auto second = MakeDataBatch(2, 3, 1, values_).value();
+  test::ControlledIO io;
+  bool completed = false;
+  auto payload = make_shared<const string>(first);
+  weak_ptr<const string> retained = payload;
+  ASSERT_TRUE(log_->TryAppendAsync(
+                      std::move(payload), 3, io.Submitter(), [](size_t) {},
+                      [&](absl::Status s) {
+                        completed = s.ok();
+                        EXPECT_FALSE(retained.expired());
+                      })
+                  .value());
+  io.Complete(7);
+  EXPECT_FALSE(completed);
+  EXPECT_EQ(log_->End().end_offset, 0);
+  io.Complete();
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(retained.expired());
+  EXPECT_TRUE(io.requests.empty());
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  EXPECT_EQ(log_->DurableEnd(), (LogPosition{0, 0}));
+  ASSERT_TRUE(log_->AppendAsFollower(second, 3).ok());
+  EXPECT_EQ(log_->End(), (LogPosition{3, 4}));
+  EXPECT_EQ(log_->DurableEnd(), (LogPosition{0, 0}));
+  EXPECT_EQ(fs::file_size(dir_ / "dragonfly-log-end"), marker_size);
+  EXPECT_EQ(log_->Read(0, 4, SIZE_MAX).value(), first + second);
+
+  // Receiving both writes does not publish a recovery marker or issue an implicit fsync.
+  completed = false;
+  ASSERT_TRUE(
+      log_->TryFlushBufferedAsync(io.Submitter(), [&](absl::Status s) { completed = s.ok(); })
+          .value());
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().offset, -1);
+  EXPECT_FALSE(log_->Append(second, 3).ok());
+  io.Complete();
+  EXPECT_FALSE(completed);
+  EXPECT_EQ(log_->DurableEnd().end_offset, 0);
+  ASSERT_EQ(io.requests.size(), 1u);
+  EXPECT_EQ(io.requests.front().offset, -1);
+  io.Complete();
+  EXPECT_TRUE(completed);
+  EXPECT_EQ(log_->DurableEnd(), log_->End());
+  EXPECT_FALSE(log_->BufferedFlushDue());
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->Read(0, 4, SIZE_MAX).value(), first + second);
+}
+
+TEST_F(PartitionLogTest, MemoryTailWithoutPublicationIsDiscardedOnRecovery) {
+  const auto first = MakeDataBatch(0, 3, 1, values_).value();
+  const auto second = MakeDataBatch(2, 3, 1, values_).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  log_.reset();
+  auto pid = fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    auto log = PartitionLog::Open(dir_, 1U << 30, PartitionLog::AckMode::kMemory).value();
+    if (!log->AppendAsFollower(second, 3).ok() || log->End().end_offset != 4 ||
+        log->DurableEnd().end_offset != 2)
+      _exit(1);
+    _exit(0);
+  }
+  int status;
+  ASSERT_EQ(waitpid(pid, &status, 0), pid);
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(WEXITSTATUS(status), 0);
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+  EXPECT_EQ(log_->Read(0, 2, SIZE_MAX).value(), first);
+  EXPECT_EQ(fs::file_size(Segment()), first.size());
+}
+
+TEST_F(PartitionLogTest, MemoryControlAndRolloverFlushEarlierData) {
+  const auto first = MakeDataBatch(0, 3, 1, values_).value();
+  log_.reset();
+  Open(first.size(), PartitionLog::AckMode::kMemory);
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  EXPECT_EQ(log_->DurableEnd().end_offset, 0);
+  ASSERT_TRUE(log_->Append(MakeDataBatch(2, 3, 1, values_).value(), 3).ok());
+  EXPECT_EQ(log_->End().end_offset, 4);
+  EXPECT_EQ(log_->DurableEnd().end_offset, 2);
+  const array<int32_t, 1> voters{1};
+  ASSERT_TRUE(log_->AppendLeaderChange(4, 1, 1, voters, voters).ok());
+  EXPECT_EQ(log_->DurableEnd(), log_->End());
+  log_.reset();
+  Open();
+  EXPECT_EQ(log_->End(), (LogPosition{4, 5}));
+}
+
+TEST_F(PartitionLogTest, FailedMemoryFlushFencesFurtherWrites) {
+  for (int step = 0; step < 2; ++step) {
+    SCOPED_TRACE(step);
+    log_.reset();
+    fs::remove_all(dir_);
+    Open(1U << 30, PartitionLog::AckMode::kMemory);
+    ASSERT_TRUE(log_->Append(MakeDataBatch(0, 3, 1, values_).value(), 3).ok());
+    test::ControlledIO io;
+    absl::Status completed;
+    ASSERT_TRUE(log_->TryFlushBufferedAsync(io.Submitter(), [&](absl::Status s) { completed = s; })
+                    .value());
+    if (step)
+      io.Complete();
+    io.Complete(-EIO);
+    EXPECT_FALSE(completed.ok());
+    EXPECT_FALSE(log_->io_failure().ok());
+    EXPECT_EQ(log_->DurableEnd().end_offset, 0);
+    EXPECT_FALSE(log_->Append(MakeDataBatch(2, 3, 1, values_).value(), 3).ok());
+    EXPECT_FALSE(log_->FlushBuffered().ok());
+  }
 }
 
 TEST_F(PartitionLogTest, AsyncFailuresFenceAppendAndPreserveAcknowledgedPrefix) {
@@ -125,14 +252,20 @@ TEST_F(PartitionLogTest, AsyncFailuresFenceAppendAndPreserveAcknowledgedPrefix) 
     const auto bytes = MakeDataBatch(2, 3, 1, values_).value();
     test::ControlledIO io;
     bool failed = false;
+    auto payload = make_shared<const string>(bytes);
+    weak_ptr<const string> retained = payload;
     ASSERT_TRUE(log_->TryAppendAsync(
-                        bytes, 3, io.Submitter(), [](size_t) {},
-                        [&](absl::Status status) { failed = !status.ok(); })
+                        std::move(payload), 3, io.Submitter(), [](size_t) {},
+                        [&](absl::Status status) {
+                          failed = !status.ok();
+                          EXPECT_FALSE(retained.expired());
+                        })
                     .value());
     for (int i = 0; i < (step == 3 ? 0 : step); ++i)
       io.Complete();
     io.Complete(step == 3 ? 0 : -EIO);
     EXPECT_TRUE(failed);
+    EXPECT_TRUE(retained.expired());
     EXPECT_FALSE(log_->AppendPending());
     EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
     EXPECT_FALSE(log_->Append(bytes, 3).ok());
@@ -159,7 +292,8 @@ TEST_F(PartitionLogTest, CrashAtAsyncPublicationBoundariesRecoversCompletePrefix
       auto log = PartitionLog::Open(dir_).value();
       test::ControlledIO io;
       if (!log->TryAppendAsync(
-                  bytes, 3, io.Submitter(), [](size_t) {}, [](absl::Status) {})
+                  make_shared<const string>(bytes), 3, io.Submitter(), [](size_t) {},
+                  [](absl::Status) {})
                .value())
         _exit(1);
       io.Complete();
@@ -193,7 +327,8 @@ TEST_F(PartitionLogTest, AsyncSlowPathsKeepSynchronousOrdering) {
   auto bytes = MakeLeaderChangeBatch(0, 3, 1, 1, voters, voters).value();
   auto start = [&] {
     return log_->TryAppendAsync(
-        bytes, 3, io.Submitter(), [](size_t) {}, [](absl::Status) { ADD_FAILURE(); });
+        make_shared<const string>(bytes), 3, io.Submitter(), [](size_t) {},
+        [](absl::Status) { ADD_FAILURE(); });
   };
   EXPECT_FALSE(start().value());
   ASSERT_TRUE(log_->Append(bytes, 3).ok());
@@ -219,7 +354,7 @@ TEST_F(PartitionLogTest, SegmentPrefixSharesBarriersAndPublishesOnlyItsTail) {
   test::ControlledIO io;
   bool completed = false;
   ASSERT_TRUE(log_->TryAppendAsync(
-                      second + third, 3, io.Submitter(), [](size_t) {},
+                      make_shared<const string>(second + third), 3, io.Submitter(), [](size_t) {},
                       [&](absl::Status status) {
                         EXPECT_TRUE(status.ok());
                         completed = true;
@@ -247,10 +382,10 @@ TEST_F(PartitionLogTest, SegmentPrefixSharesBarriersAndPublishesOnlyItsTail) {
 
   // A full segment cannot admit even the first batch; the next round must roll and progress.
   EXPECT_FALSE(log_->FitsActiveSegment(fourth.size(), 8));
-  EXPECT_FALSE(
-      log_->TryAppendAsync(
-              fourth, 3, io.Submitter(), [](size_t) {}, [](absl::Status) { ADD_FAILURE(); })
-          .value());
+  EXPECT_FALSE(log_->TryAppendAsync(
+                       make_shared<const string>(fourth), 3, io.Submitter(), [](size_t) {},
+                       [](absl::Status) { ADD_FAILURE(); })
+                   .value());
   ASSERT_TRUE(log_->Append(fourth, 3).ok());
   EXPECT_EQ(fs::file_size(dir_ / "00000000000000000006.log"), fourth.size());
   log_.reset();

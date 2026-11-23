@@ -84,7 +84,7 @@ absl::Status Append(RaftGroup::State state, span<const MetadataRecord> records) 
   }
   if (auto s = flush(); !s.ok())
     return s;
-  return state.replication.Append(output, epoch);
+  return state.replication.Append(std::move(output), epoch);
 }
 
 struct ProbeTarget {

@@ -95,6 +95,145 @@ TEST_F(SetEffectTest, OnlyCommittedEffectsAreAppliedOnceInLogOrder) {
   EXPECT_EQ(seen, vector<SetEffect>{second});
 }
 
+TEST_F(SetEffectTest, BatchesRespectHighWatermarkEntryBudgetAndRecordBarriers) {
+  CommittedEffects cached(10);
+  uint64_t committed_bytes = 0;
+  for (int i = 0; i < 45; ++i) {
+    if (i == 42) {
+      auto control = MakeSnapshotFooterBatch(i, 3, 10).value();
+      ASSERT_TRUE(log_->Append(control, 3).ok());
+      committed_bytes += control.size();
+      continue;
+    }
+    auto effect = first_;
+    effect.value = to_string(i);
+    if (i == 40) {
+      effect.action = SetEffect::Action::kNoop;
+      effect.value.clear();
+    }
+    auto batch = MakeSetEffectBatch(i, 3, 10, effect).value();
+    ASSERT_TRUE(log_->Append(batch, 3).ok());
+    cached.RememberAppended({3, i + 1}, batch.size(), effect);
+    if (i < 44)
+      committed_bytes += batch.size();
+  }
+  CommittedEffects replayed(10);
+  for (auto* state : {&cached, &replayed}) {
+    vector<size_t> sizes;
+    vector<string> seen;
+    auto apply = [&](span<const SetEffect* const> effects, size_t* applied) {
+      sizes.push_back(effects.size());
+      EXPECT_FALSE(state->SnapshotMigrations(state->applied_position()).ok());
+      for (const auto* effect : effects) {
+        seen.push_back(effect->value);
+        ++*applied;
+      }
+      return absl::OkStatus();
+    };
+    auto image = [](SlotId, optional<string_view>, string_view) {
+      ADD_FAILURE() << "No migration record was written";
+      return absl::OkStatus();
+    };
+    ASSERT_TRUE(state->ApplyToBatched(*log_, 0, apply, image).ok());
+    EXPECT_TRUE(sizes.empty());
+    ASSERT_TRUE(state->ApplyToBatched(*log_, 44, apply, image).ok());
+    EXPECT_EQ(sizes, (vector<size_t>{32, 8, 1, 1}));
+    ASSERT_EQ(seen.size(), 42u);
+    for (int i = 0; i < 40; ++i)
+      EXPECT_EQ(seen[i], to_string(i));
+    EXPECT_EQ(seen[40], "41");
+    EXPECT_EQ(seen[41], "43");
+    EXPECT_EQ(state->applied_offset(), 44);
+    EXPECT_EQ(state->applied_bytes(), committed_bytes);
+  }
+}
+
+TEST_F(SetEffectTest, BatchesLimitBytesAndAllowOneOversizedEffect) {
+  CommittedEffects cached(10);
+  for (int i = 0; i < 12; ++i) {
+    auto effect = first_;
+    effect.value.assign(i == 10 ? 2 << 20 : 200 << 10, 'a' + i);
+    auto batch = MakeSetEffectBatch(i, 3, 10, effect).value();
+    ASSERT_TRUE(log_->Append(batch, 3).ok());
+
+    // Exercise a cache gap followed by another cached effect in the same apply batch.
+    if (i != 7)
+      cached.RememberAppended({3, i + 1}, batch.size(), std::move(effect));
+  }
+  CommittedEffects replayed(10);
+  for (auto* state : {&cached, &replayed}) {
+    vector<size_t> sizes;
+    size_t seen = 0;
+    auto apply = [&](span<const SetEffect* const> effects, size_t* applied) {
+      sizes.push_back(effects.size());
+      size_t bytes = 0;
+      for (const auto* effect : effects) {
+        EXPECT_EQ(effect->value.front(), 'a' + seen++);
+        bytes += effect->key.size() + effect->value.size();
+        ++*applied;
+      }
+      EXPECT_TRUE(bytes <= 1 << 20 || effects.size() == 1);
+      return absl::OkStatus();
+    };
+    auto image = [](SlotId, optional<string_view>, string_view) { return absl::OkStatus(); };
+    ASSERT_TRUE(state->ApplyToBatched(*log_, 12, apply, image).ok());
+    EXPECT_EQ(sizes, (vector<size_t>{5, 5, 1, 1}));
+    EXPECT_EQ(seen, 12u);
+  }
+}
+
+TEST_F(SetEffectTest, BatchedFailureAndTimeBudgetAdvanceOnlyTheCompletedPrefix) {
+  CommittedEffects state(10);
+  vector<size_t> bytes;
+  for (int i = 0; i < 4; ++i) {
+    auto effect = first_;
+    effect.value = to_string(i);
+    effect.generation += i;
+    auto batch = MakeSetEffectBatch(i, 3, 10, effect).value();
+    ASSERT_TRUE(log_->Append(batch, 3).ok());
+    bytes.push_back(batch.size());
+    state.RememberAppended({3, i + 1}, batch.size(), effect);
+  }
+  vector<string> seen;
+  auto image = [](SlotId, optional<string_view>, string_view) { return absl::OkStatus(); };
+  auto status = state.ApplyToBatched(
+      *log_, 4,
+      [&](span<const SetEffect* const> effects, size_t* applied) {
+        EXPECT_EQ(effects.size(), 4u);
+        seen.push_back(effects[0]->value);
+        seen.push_back(effects[1]->value);
+        *applied = 2;
+        return absl::ResourceExhaustedError("third SET failed");
+      },
+      image);
+  EXPECT_TRUE(absl::IsResourceExhausted(status));
+  EXPECT_EQ(state.applied_offset(), 2);
+  EXPECT_EQ(state.applied_bytes(), bytes[0] + bytes[1]);
+  EXPECT_EQ(state.SnapshotSlots(), (vector<SnapshotSlotRange>{{42, 42, 8}}));
+
+  // A time-limited callback can finish just one entry without dropping or repeating the rest.
+  auto apply_one = [&](span<const SetEffect* const> effects, size_t* applied) {
+    seen.push_back(effects.front()->value);
+    *applied = 1;
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(state.ApplyToBatched(*log_, 4, apply_one, image).ok());
+  EXPECT_EQ(seen, (vector<string>{"0", "1", "2", "3"}));
+  EXPECT_EQ(state.applied_offset(), 4);
+  EXPECT_EQ(state.applied_bytes(), bytes[0] + bytes[1] + bytes[2] + bytes[3]);
+  EXPECT_EQ(state.SnapshotSlots(), (vector<SnapshotSlotRange>{{42, 42, 10}}));
+
+  // Reject a broken callback instead of spinning or publishing entries it did not apply.
+  CommittedEffects invalid(10);
+  EXPECT_FALSE(invalid
+                   .ApplyToBatched(
+                       *log_, 4,
+                       [](span<const SetEffect* const>, size_t*) { return absl::OkStatus(); },
+                       image)
+                   .ok());
+  EXPECT_EQ(invalid.applied_offset(), 0);
+}
+
 TEST_F(SetEffectTest, LeaderDeliversCachedEffectsOnlyAfterCommitAndDiscardsReplacedSuffix) {
   CommittedEffects state(10);
   auto first = MakeSetEffectBatch(0, 3, 10, first_).value();
