@@ -279,7 +279,8 @@ function App() {
           </nav>
           {page.view === 'overview' && <Overview summary={active.summary} />}
           {page.view === 'runs' && <RunsView key={experiment.id} id={experiment.id} />}
-          {(page.view === 'flamegraphs' || page.view === 'trace') && <DiagnosticsView key={experiment.id} id={experiment.id} view={page.view} />}
+          {(page.view === 'flamegraphs' || page.view === 'trace') && <DiagnosticsView key={experiment.id} id={experiment.id} view={page.view}
+            referenceID={!active.summary.comparisons.previous ? active.summary.comparisons.reference?.target.id : undefined} />}
           </>}
         </>}
       </div>

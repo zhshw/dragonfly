@@ -30,7 +30,9 @@
 - `memory` 仍写 page cache、后台同步；每笔 SET 仍需多数接收并完成本地应用。原 cluster 的 SET 先回复本地执行结果，
   再由末尾 WAIT 确认副本应用。总计时包含副本确认，但两者逐笔确认和持久性语义仍有区别。
 
-证据入口：[Raft 火焰图](http://172.31.23.2:3137/memory-c1-p64-v3/index.html)、
+平台已关联两组历史采集：[火焰图对照](http://127.0.0.1:8787/#/v3/flamegraphs) · [Trace 对照](http://127.0.0.1:8787/#/v3/trace)。v3 没有上一轮，使用已选的 `v3:cluster` 作为诊断对照；原 cluster 的 2920 条事件、221 条 Langfuse 展示样本和双节点火焰图均来自当时的采集。
+
+原始证据入口：[Raft 火焰图](http://172.31.23.2:3137/memory-c1-p64-v3/index.html)、
 [原 cluster 火焰图](http://172.31.23.2:3137/cluster-c1-p64-v3/index.html)、
 [trace 结论及链接](../replication-observability.md)、[未插桩 benchmark](../replication-benchmark.md)。
 原始 `*.folded`、`stages.csv` 和 `summary.json` 位于 `docs/cluster/benchmarks/observability-20261123/`，由 Git 忽略。

@@ -3,24 +3,37 @@ import { ArrowDownToLine, ArrowUpRight, Flame, Search, Workflow } from 'lucide-r
 import { api, artifactURL, endpoint, number, targetTitle } from './model';
 import type { DiagnosticCapture, DiagnosticComparison, DiagnosticSummary, ReferenceDiagnostics, Role, Stage } from './model';
 
-type Panel = { key: 'current' | 'previous'; title: string; id?: string; capture?: DiagnosticCapture };
+type Panel = { key: 'current' | 'previous' | 'reference'; title: string; id?: string; capture?: DiagnosticCapture; raft?: boolean };
 
-export function DiagnosticsView({ id, view }: { id: string; view: 'flamegraphs' | 'trace' }) {
+export function DiagnosticsView({ id, view, referenceID }: { id: string; view: 'flamegraphs' | 'trace'; referenceID?: string }) {
   const [comparison, setComparison] = useState<DiagnosticComparison>();
+  const [reference, setReference] = useState<ReferenceDiagnostics>();
   const [role, setRole] = useState<Role>('leader');
   const [request, setRequest] = useState(0);
   const [error, setError] = useState('');
   useEffect(() => {
     const abort = new AbortController();
-    api<DiagnosticComparison>(`${endpoint(id)}/diagnostic-comparison`, { signal: abort.signal })
-      .then(setComparison).catch((e) => { if (!abort.signal.aborted) setError(e.message); });
+    setComparison(undefined);
+    setReference(undefined);
+    setError('');
+    Promise.all([
+      api<DiagnosticComparison>(`${endpoint(id)}/diagnostic-comparison`, { signal: abort.signal }),
+      referenceID ? api<ReferenceDiagnostics>(`/api/v1/comparison-targets/${encodeURIComponent(referenceID)}/diagnostics`, { signal: abort.signal }) : Promise.resolve(undefined),
+    ]).then(([comparison, reference]) => {
+      if (abort.signal.aborted) return;
+      setComparison(comparison);
+      setReference(reference);
+    }).catch((e) => { if (!abort.signal.aborted) setError(e.message); });
     return () => abort.abort();
-  }, [id, request]);
+  }, [id, referenceID, request]);
 
   const isCPU = view === 'flamegraphs';
   const panels: Panel[] = [
     { key: 'current', title: '本轮', id, capture: comparison?.current },
-    { key: 'previous', title: '上一轮', id: comparison?.previous_id, capture: comparison?.previous },
+    reference ? {
+      key: 'reference', title: reference.target.mode === 'yes' ? '原 Cluster' : '对比参照',
+      id: reference.target.experiment_id, capture: reference.capture, raft: reference.target.mode === 'raft',
+    } : { key: 'previous', title: '上一轮', id: comparison?.previous_id, capture: comparison?.previous },
   ];
 
   return <div className="view-content">
@@ -60,7 +73,7 @@ export function ReferenceView({ id }: { id: string }) {
   const { target, capture } = reference;
   const isCluster = target.mode === 'yes';
   const panel: Panel = { key: 'current', title: 'CPU 火焰图', capture };
-  const tracePanel = { ...panel, title: 'Trace' };
+  const tracePanel = { ...panel, title: 'Trace', raft: !isCluster };
   return <>
     <div className="hero">
       <div className="experiment-meta"><span className="id-label">对比参照</span></div>
@@ -71,10 +84,8 @@ export function ReferenceView({ id }: { id: string }) {
     {capture ? <div className="view-content">
       <div className="section-toolbar"><h2>诊断采集</h2><NodeRolePicker role={role} setRole={setRole} /></div>
       <FlamegraphPanel panel={panel} role={role} />
-      {!isCluster && <>
-        <TracePanel panel={tracePanel} />
-        <TraceComparison panels={[tracePanel]} />
-      </>}
+      <TracePanel panel={tracePanel} />
+      <TraceComparison panels={[tracePanel]} />
     </div> : <div className="panel inline-empty">这条基准暂无诊断记录</div>}
   </>;
 }
@@ -136,6 +147,7 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
   const [query, setQuery] = useState('');
   const [role, setRole] = useState('all');
   const [showAll, setShowAll] = useState(false);
+  const raftPanels = panels.filter((panel) => panel.raft !== false);
   const grouped = new Map<string, { stage: string; role: string; values: (Stage | undefined)[] }>();
   const search = query.trim().toLowerCase();
   panels.forEach(({ capture }, index) => {
@@ -150,13 +162,13 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
   const longest = (row: { values: (Stage | undefined)[] }) => Math.max(...row.values.map((phase) => phase?.union_ms ?? 0));
   const phases = [...grouped.values()].sort((a, b) => longest(b) - longest(a));
   return <>
-    <section className="panel data-panel">
+    {raftPanels.length > 0 && <section className="panel data-panel">
       <div className="panel-heading"><h2>Raft 等待指标</h2></div>
       <div className="table-scroll"><table className="data-table diagnostic-table">
-        <thead><tr><th>指标</th>{panels.map((panel) => <th key={panel.key}>{panelTitle(panel)}</th>)}</tr></thead>
-        <tbody>{waitMetrics.map(({ label, value }) => <tr key={label}><td>{label}</td>{panels.map(({ key, capture }) => <td className="mono" key={key}>{capture ? value(capture.profile) : '—'}</td>)}</tr>)}</tbody>
+        <thead><tr><th>指标</th>{raftPanels.map((panel) => <th key={panel.key}>{panelTitle(panel)}</th>)}</tr></thead>
+        <tbody>{waitMetrics.map(({ label, value }) => <tr key={label}><td>{label}</td>{raftPanels.map(({ key, capture }) => <td className="mono" key={key}>{capture ? value(capture.profile) : '—'}</td>)}</tr>)}</tbody>
       </table></div>
-    </section>
+    </section>}
     <section className="panel data-panel">
       <div className="panel-heading phase-heading">
         <div><h2>阶段耗时</h2><p>{panels.length === 2 && panels.every(({ capture }) => capture) ? '按两次采集中较长的区间并集排序。' : '按区间并集排序。'}</p></div>
