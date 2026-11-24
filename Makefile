@@ -47,7 +47,7 @@ HELIO_FLAGS = -DHELIO_RELEASE_FLAGS="-g" \
               -DLEGACY_GLOG=$(LEGACY_GLOG) \
 			  -DDF_ENABLE_MEMORY_TRACKING=$(TRACK_MEMORY_ALLOCS)
 
-.PHONY: default
+.PHONY: default profile
 
 configure:
 	cmake -L -B $(RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release -GNinja $(HELIO_FLAGS)
@@ -77,3 +77,6 @@ package:
 release: configure build
 
 default: release
+
+profile:
+	$(MAKE) -C tools/profile up

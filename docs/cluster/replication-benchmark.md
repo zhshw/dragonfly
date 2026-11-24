@@ -1,23 +1,14 @@
 # Raft 复制优化与 benchmark
 
-**最新 v10（P1-6）保留：memory 后台同步期间继续普通追加。** 单连接同轮确认吞吐
-**377.21 → 437.97 MiB/s（+16.1%）**，三组均提高；批次 P95 中位数 **−11.8%**。
+当前 v10（P1-6）支持 memory 后台同步期间继续普通追加。本轮、基线和原 cluster 参照以平台归档为准。 [Profile 总览](profile.md#当前结果)
 
-**原始 `raft.memory` 基线 → v10：169.56 → 437.97 MiB/s，累计 +158.3%。**
-包含 P0-1 共享 WAL / 直接编码 / drain 聚合、P0-2 批量应用、P1-4 follower 接收缓存、
-P1-7 Fetch 封帧、P1-5 输入所有权转交，以及本轮 P1-6 追加与后台同步分离。
-v10 同轮原 cluster 为 **605.47 MiB/s**，快约 **1.38 倍**；已回退的提前 Fetch 试验 不包含在内。
-沿用 v9，仅汇总 **1 连接 / pipeline 64** 这一组负载，三版本各三轮，计时包含 SET + 原写连接 WAIT 1。
-累计值是跨轮比较，包含 WAIT 等待变化；额外连接数数据只归档。
-完整指标见 [v10 实验](profile/v10-memory-flush-overlap.md)，历史 v9 的 389.95 MiB/s 保留原含义。
-历史优化对比使用 `flush` 语义；memory 优化与确认模式对比单独列出。吞吐取三轮中位数，
-各项使用不同阶段的基线，提升比例不能相加。
+下文记录历次改动的对照结果。`flush`、`memory` 和确认模式对比分节列出，各项吞吐取当时的三轮中位数，并使用当时的基线。
 
 <a id="本轮同连接-set-已能提前提交"></a>
 
 ## 做了哪些优化、提升多少
 
-- **后台同步与普通追加并行（v10）**：确认吞吐 **377.21 → 437.97 MiB/s（+16.1%）**，P95 **60.19 → 53.06 ms（−11.8%）**。同步期间新 leader 编码 / follower 追加 **0 / 0 → 27 / 17 次**；同步条件和恢复切点保证不变，详见 [v10 实验](profile/v10-memory-flush-overlap.md)。
+- **后台同步与普通追加并行（v10）**。首次同轮 A/B 确认吞吐 **+16.1%**，批次 P95 **−11.8%**。 [v10 实验](profile/v10-memory-flush-overlap.md#首次同轮验证)
 - **follower 接收确认快路径（无收益，已回退）**：确认吞吐 **400.62 → 385.40 MiB/s（−3.8%）**，批次 P95 **58.66 → 70.09 ms（+19.5%）**；三组方向不一致。局部发送等待下降未兑现整体收益，完整指标和归档见 [提前 Fetch 失败试验](profile/p0-1b-follower-receipt.md)。
 - **SET 输入所有权转交（v9）**：确认吞吐 **322.41 → 389.95 MiB/s（+20.9%）**，批次 P95 中位数 **−12.8%**；三组配对均提升，但第三组 P95 略升。接管已解析参数并在 drain 后释放，保持原有票据反压；两版 WAIT 均约 0.15 ms。完整数据、火焰图与内存结论见 [v9 实验](profile/v9-input-ownership.md)。
 - **Fetch 直接封帧**：确认吞吐 **299.55 → 325.31 MiB/s（+8.6%）**，SET 阶段同为 **+8.6%**；批次 P95 **−3.5%**。一次预留完整响应，去掉 body → frame 和尾部扩容复制；三轮范围重叠，不能把中位数当作稳定提升。
@@ -76,7 +67,7 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
 ```
 
 原始数据仅保存在本地 `docs/cluster/benchmarks/` 及测试机，已由 `.gitignore` 排除；
-本轮使用单组负载，结果见 [v10 实验](profile/v10-memory-flush-overlap.md)。
+首次同轮对照使用单组负载。 [v10 实验](profile/v10-memory-flush-overlap.md#首次同轮验证)
 历史 64 连接样本和同步 Raft 性能数据已删除；段边界优化的旧日志位于测试机隔离仓库
 `/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-segment-drain-pipeline-20261123-c{1,2,8}/`。
 

@@ -16,6 +16,9 @@ def publish(runs, destination):
             raise FileNotFoundError(f"Run report.py first: {run}")
         target = destination / run.name
         shutil.copytree(source, target, dirs_exist_ok=True)
+
+        # Go prepares reports in a private temporary directory. Nginx serves the published copy.
+        target.chmod(0o755)
     page = [
         "<!doctype html><meta charset='utf-8'><title>Dragonfly 复制性能分析</title>",
         "<style>body{font:17px system-ui;max-width:1000px;margin:50px auto;padding:0 20px;line-height:1.8}"

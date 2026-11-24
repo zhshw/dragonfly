@@ -8,6 +8,8 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+profile_dir=$(cd -- "$script_dir/../profile" && pwd)
+compose=$profile_dir/compose.yaml
 task_user=zhangshenwang
 task_uid=$(id -u "$task_user")
 task_gid=$(id -g "$task_user")
@@ -71,9 +73,9 @@ if [[ ! -e $env_file ]]; then
   runuser -u "$task_user" -- python3 "$script_dir/init_env.py" \
     --env-file "$env_file" --storage-root "$storage/state"
 fi
-docker compose --env-file "$env_file" -f "$script_dir/compose.yaml" config -q
+docker compose --env-file "$env_file" -f "$compose" config -q
 python3 "$script_dir/persist_host.py" --device "$device" --storage "$storage" \
-  --disk-image "$disk_image" --compose "$script_dir/compose.yaml" --env-file "$env_file"
+  --disk-image "$disk_image" --compose "$compose" --env-file "$env_file"
 systemctl daemon-reload
 systemctl enable dragonfly-observability.service
 systemctl start dragonfly-observability.service

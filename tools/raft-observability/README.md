@@ -11,23 +11,23 @@
   Docker 容器使用 `on-failure:3`，由 systemd 负责开机启动，避免盘未挂载就先启动数据库。
   镜像和 Docker 限额日志仍使用 Docker 自身目录。
 
-## 部署与重启
+## 部署与启动
 
-在 `172.31.23.2` 的隔离仓库运行：
+在 `172.31.23.2` 首次准备数据盘时运行。
 
 ```sh
 sudo bash tools/raft-observability/setup_host.sh
-sudo systemctl restart dragonfly-observability.service
 ```
 
 Compose 固定 Langfuse `4.83.0`，数据库不发布宿主机端口。禁用公开注册和遥测。
 `LANGFUSE_PUBLIC_URL` 是浏览器回调地址，默认为 `http://172.31.23.2:3007`；
-`OBSERVABILITY_BIND` 默认为 `0.0.0.0`。更新 Compose 后用下列命令应用：
+`OBSERVABILITY_BIND` 默认为 `0.0.0.0`。 [Compose 配置](../profile/compose.yaml)
 
 ```sh
-sudo docker compose --env-file /data/dragonfly-observability/config/langfuse.env \
-  -f tools/raft-observability/compose.yaml up -d --wait
+make -C tools/profile langfuse
 ```
+
+同时启动实验 Web 用 `make profile`。 [profile 使用说明](../profile/README.md#启动)
 
 ## 采集
 
