@@ -26,27 +26,26 @@ type Hotspot struct {
 	Percent float64 `json:"percent"`
 }
 
+type CallPath struct {
+	Frames  []string `json:"frames"`
+	Samples int64    `json:"samples"`
+	Percent float64  `json:"percent"`
+}
+
+type CallPathReport struct {
+	Symbol  string     `json:"symbol"`
+	Matched int64      `json:"matched_samples"`
+	Paths   []CallPath `json:"paths"`
+}
+
 // CPUHotspots ranks either leaf frames or all frames from a folded CPU profile.
 func CPUHotspots(folded string, cumulative bool, limit int) ([]Hotspot, int64, error) {
 	if limit < 0 {
 		return nil, 0, errors.New("CPU hotspot limit must be nonnegative")
 	}
 	counts := map[string]int64{}
-	var total int64
-	scanner := bufio.NewScanner(strings.NewReader(folded))
-	scanner.Buffer(make([]byte, 4096), 8<<20)
-	for scanner.Scan() {
-		line := scanner.Text()
-		idx := strings.LastIndexByte(line, ' ')
-		if idx < 1 {
-			return nil, 0, errors.New("malformed folded stack")
-		}
-		count, err := strconv.ParseInt(line[idx+1:], 10, 64)
-		if err != nil || count <= 0 {
-			return nil, 0, errors.New("invalid CPU sample count")
-		}
-		total += count
-		frames := strings.Split(line[:idx], ";")
+	total, err := scanFoldedStacks(folded, func(stack string, count int64) {
+		frames := strings.Split(stack, ";")
 		if !cumulative {
 			frames = frames[len(frames)-1:]
 		}
@@ -57,12 +56,9 @@ func CPUHotspots(folded string, cumulative bool, limit int) ([]Hotspot, int64, e
 				seen[frame] = true
 			}
 		}
-	}
-	if err := scanner.Err(); err != nil {
+	})
+	if err != nil {
 		return nil, 0, err
-	}
-	if total == 0 {
-		return nil, 0, errors.New("no CPU samples")
 	}
 	var top []Hotspot
 	for name, count := range counts {
@@ -75,6 +71,71 @@ func CPUHotspots(folded string, cumulative bool, limit int) ([]Hotspot, int64, e
 		return top[i].Name < top[j].Name
 	})
 	return top[:min(len(top), limit)], total, nil
+}
+
+// CPUCallPaths groups samples by the callers of a matching frame. In inclusive
+// mode the match closest to the leaf represents each sample, including recursive calls.
+func CPUCallPaths(folded, symbol string, inclusive bool, callerDepth, limit int) (CallPathReport, int64, error) {
+	if symbol == "" || callerDepth < 0 || limit < 0 {
+		return CallPathReport{}, 0, errors.New("call paths require a symbol and nonnegative caller depth and limit")
+	}
+	result := CallPathReport{Symbol: symbol, Paths: []CallPath{}}
+	counts := map[string]int64{}
+	total, err := scanFoldedStacks(folded, func(stack string, count int64) {
+		frames := strings.Split(stack, ";")
+		first := len(frames) - 1
+		if inclusive {
+			first = 0
+		}
+		for i := len(frames) - 1; i >= first; i-- {
+			if !strings.Contains(frames[i], symbol) {
+				continue
+			}
+			caller := 0
+			if callerDepth > 0 {
+				caller = max(0, i-callerDepth)
+			}
+			counts[strings.Join(frames[caller:i+1], ";")] += count
+			result.Matched += count
+			break
+		}
+	})
+	if err != nil {
+		return CallPathReport{}, 0, err
+	}
+	paths := sortedKeys(counts)
+	sort.SliceStable(paths, func(i, j int) bool { return counts[paths[i]] > counts[paths[j]] })
+	for _, path := range paths[:min(len(paths), limit)] {
+		count := counts[path]
+		result.Paths = append(result.Paths, CallPath{strings.Split(path, ";"), count, 100 * float64(count) / float64(total)})
+	}
+	return result, total, nil
+}
+
+func scanFoldedStacks(folded string, visit func(string, int64)) (int64, error) {
+	var total int64
+	scanner := bufio.NewScanner(strings.NewReader(folded))
+	scanner.Buffer(make([]byte, 4096), 8<<20)
+	for scanner.Scan() {
+		line := scanner.Text()
+		idx := strings.LastIndexByte(line, ' ')
+		if idx < 1 {
+			return 0, errors.New("malformed folded stack")
+		}
+		count, err := strconv.ParseInt(line[idx+1:], 10, 64)
+		if err != nil || count <= 0 {
+			return 0, errors.New("invalid CPU sample count")
+		}
+		total += count
+		visit(line[:idx], count)
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	if total == 0 {
+		return 0, errors.New("no CPU samples")
+	}
+	return total, nil
 }
 
 var (

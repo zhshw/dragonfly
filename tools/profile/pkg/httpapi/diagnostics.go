@@ -28,6 +28,7 @@ func diagnosticRoutes(api *http.ServeMux, store models.Repository) {
 		query := models.TraceQuery{
 			Run: params.Get("run"), Role: params.Get("role"), Stage: params.Get("stage"),
 			Sort: params.Get("sort"), Order: params.Get("order"), Limit: limit, Offset: offset,
+			Analysis: params.Get("analysis"),
 		}
 		if raw := params.Get("min_union_ms"); raw != "" {
 			query.MinUnionMS, err = strconv.ParseFloat(raw, 64)
@@ -50,8 +51,14 @@ func diagnosticRoutes(api *http.ServeMux, store models.Repository) {
 			respondError(w, err)
 			return
 		}
+		depth, err := diagnosticInt(params, "caller_depth", 0)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
 		report, err := store.Flamegraph(r.PathValue("id"), models.FlamegraphQuery{
 			Run: params.Get("run"), Role: params.Get("role"), View: params.Get("view"), Limit: limit,
+			Symbol: params.Get("symbol"), CallerDepth: depth,
 		})
 		if err != nil {
 			respondError(w, err)

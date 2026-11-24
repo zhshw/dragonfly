@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"dragonflydb.io/profile/models"
 	"dragonflydb.io/profile/pkg/langfuse"
@@ -27,9 +28,9 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 	run := f.String("run", "", "archived diagnostic run ID (default current diagnostic)")
 	limit := f.Int("limit", models.DefaultTraceLimit, "maximum rows (0 shows only the summary)")
 	asJSON := f.Bool("json", false, "write only the selected results as JSON")
-	var role, stage, order, metric, view, verifyRun string
+	var role, stage, order, metric, view, verifyRun, analysis, symbol string
 	var minUnion float64
-	var offset int
+	var offset, callerDepth int
 	if command == "trace" {
 		f.StringVar(&role, "role", "", "filter by leader, follower or client")
 		f.StringVar(&stage, "stage", "", "literal stage prefix, e.g. raft.fetch")
@@ -38,9 +39,12 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 		f.IntVar(&offset, "offset", 0, "skip this many matching stages")
 		f.Float64Var(&minUnion, "min-union-ms", 0, "minimum union time in milliseconds")
 		f.StringVar(&verifyRun, "verify-run", "", "check a completed workflow's observations directly in Langfuse")
+		f.StringVar(&analysis, "analysis", "", "correlate leader events by offset (apply-to-confirm)")
 	} else {
 		f.StringVar(&role, "role", "leader", "profiled node (leader or follower)")
 		f.StringVar(&view, "view", "leaf", "CPU hotspot view (leaf or inclusive)")
+		f.StringVar(&symbol, "symbol", "", "match a substring and group samples by call path")
+		f.IntVar(&callerDepth, "caller-depth", 0, "number of callers to group by (0 uses the full path)")
 	}
 	if err := f.Parse(args); err != nil {
 		return err
@@ -49,7 +53,7 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 		return errors.New("expected flags only")
 	}
 	if verifyRun != "" {
-		if *id != "" || *run != "" {
+		if *id != "" || *run != "" || analysis != "" {
 			return errors.New("choose trace -id ID or trace -verify-run DIR")
 		}
 		return verifyTrace(ctx, verifyRun, *asJSON)
@@ -65,15 +69,27 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 	params := url.Values{"run": {*run}, "role": {role}, "limit": {strconv.Itoa(*limit)}}
 	if command == "flamegraph" {
 		params.Set("view", view)
+		params.Set("symbol", symbol)
+		params.Set("caller_depth", strconv.Itoa(callerDepth))
 		var report models.FlamegraphReport
 		if err := client.request(ctx, http.MethodGet, path+"/flamegraph?"+params.Encode(), nil, &report); err != nil {
 			return err
+		}
+		if symbol != "" && report.CallPaths == nil {
+			return errors.New("profile server does not support flamegraph call paths")
 		}
 		if *asJSON {
 			return json.NewEncoder(os.Stdout).Encode(report)
 		}
 		fmt.Printf("%s/%s  %s  CPU %.2f ms  %.2f ms/MiB\n", report.ExperimentID, report.Run, report.Role, report.CPUMS, report.CPUPerMiB)
 		fmt.Println(client.base + path + "/artifacts/" + url.PathEscape(report.Artifact))
+		if calls := report.CallPaths; calls != nil {
+			fmt.Printf("%d/%d samples match %q (%s)\n", calls.Matched, report.Samples, calls.Symbol, report.View)
+			for _, call := range calls.Paths {
+				fmt.Printf("%6.2f%%  %6d  %s\n", call.Percent, call.Samples, strings.Join(call.Frames, " → "))
+			}
+			return nil
+		}
 		if report.Samples > 0 {
 			fmt.Printf("%d samples, %s hotspots\n", report.Samples, report.View)
 		}
@@ -87,9 +103,13 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 	params.Set("order", order)
 	params.Set("offset", strconv.Itoa(offset))
 	params.Set("min_union_ms", strconv.FormatFloat(minUnion, 'g', -1, 64))
+	params.Set("analysis", analysis)
 	var page models.TracePage
 	if err := client.request(ctx, http.MethodGet, path+"/trace?"+params.Encode(), nil, &page); err != nil {
 		return err
+	}
+	if analysis != "" && page.ApplyToConfirm == nil {
+		return errors.New("profile server does not support trace analysis")
 	}
 	if *asJSON {
 		return json.NewEncoder(os.Stdout).Encode(page)
@@ -97,6 +117,18 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 	fmt.Printf("%s/%s  %d events  %d verified observations\n", page.ExperimentID, page.Run, page.SpanCount, page.Verified)
 	if page.TraceURL != "" {
 		fmt.Println(page.TraceURL)
+	}
+	if result := page.ApplyToConfirm; result != nil {
+		fmt.Printf("Matched %d/%d confirmations across %d apply batches (%d–%d writes per batch)\n",
+			result.Matched, result.Confirmations, result.ApplyBatches, result.MinBatchWrites, result.MaxBatchWrites)
+		delay := result.PostApply
+		fmt.Printf("After apply  p50 %.3f ms  p95 %.3f ms  max %.3f ms  union %.3f ms  %d over 1 ms\n",
+			delay.P50MS, delay.P95MS, delay.MaxMS, delay.UnionMS, delay.Over1MS)
+		fmt.Printf("Pipeline tails %d/%d  sum %.1f µs  max %.1f µs\n",
+			result.PipelineTails, result.PipelineWindows, result.PipelineTailSumUS, result.PipelineTailMaxUS)
+		fmt.Printf("Worker queue overlapping apply %.3f ms  tickets %d  peak in flight %d\n",
+			result.WorkerQueueInApply, result.Tickets, result.PeakInFlight)
+		return nil
 	}
 	fmt.Printf("%d/%d stages, offset %d, sort %s %s\n", len(page.Stages), page.Total, page.Offset, page.Sort, page.Order)
 	for _, stage := range page.Stages {

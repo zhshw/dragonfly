@@ -91,7 +91,16 @@ profile delete -id v11
 - `trace` 支持节点角色、阶段前缀和 `-min-union-ms`。`-sort` 可选 `union`、`sum`、`p50`、`p95`、`max`、`count`，`-order` 决定升降序，`-offset` 和 `-limit` 用于分页。`-json` 返回当前页和匹配的阶段总数。
 - `flamegraph` 从选定节点的 CPU 栈统计热点，`-view leaf` 按叶子函数统计，`-view inclusive` 包含调用链上的样本。`-limit 0` 可只读摘要和原图链接。
 
-从写入等待查到 CPU 复制热点的实测对照见 v9 到 v10 的例子。 [Trace 和火焰图分析示例](../../docs/cluster/profile.md#trace-和火焰图分析示例)
+```sh
+profile trace -id v10 -analysis apply-to-confirm
+profile flamegraph -id v10 -role leader -symbol 'CRC32::Extend' -caller-depth 8
+```
+
+`apply-to-confirm` 按日志 offset 关联 Leader 上的 apply 批次和写入确认，统计匹配数、应用后的延迟、worker 排队与 apply 的重叠，以及票据峰值。只有确认 offset 连续且完整覆盖客户端批次时，才按 `client.pipeline` 的写入序号计算批尾耗时。输出同时列出有效批尾数和批次数。
+
+`-symbol` 对函数名做区分大小写的子串匹配，按调用路径列出样本数及其占该节点总样本的比例。`-caller-depth` 为参与分组的上游帧数，默认使用完整路径。`-view inclusive` 使用靠近叶子的匹配帧，每个样本只计一次。两个查询都支持 `-json`。
+
+v10 归档的查询结果见文档示例。 [Trace 和火焰图分析示例](../../docs/cluster/profile.md#trace-和火焰图分析示例)
 
 在执行机上，`run -config FILE` 也可直接生成独立测量，`trace -verify-run DIR` 直接向 Langfuse 核对这轮观测。要更新既有实验的本轮数据，使用 `refresh -id ID -run DIR -data DIR -dsn-file FILE` 导入已完成的重测。重测需使用同一二进制和负载，并保留已归档的对照与其它负载结果。
 
@@ -121,8 +130,8 @@ profile summarize -compare "$compare_dir" \
 | POST | `/api/v1/experiments/{id}/execution` | 启动或继续执行，`{"restart":true}` 从头运行 |
 | GET | `/api/v1/experiments/{id}/execution/log` | 当前执行的进度日志 |
 | GET | `/api/v1/experiments/{id}/diagnostic-comparison` | 本轮与上一轮的阶段统计和产物 ID，每份诊断保留各自的实验 ID |
-| GET | `/api/v1/experiments/{id}/trace` | 指定诊断运行的阶段统计和分页，支持 `run`、`role`、`stage`、`sort`、`order`、`min_union_ms`、`limit`、`offset` |
-| GET | `/api/v1/experiments/{id}/flamegraph` | 指定诊断运行的 CPU 热点和原图 ID，支持 `run`、`role`、`view`、`limit` |
+| GET | `/api/v1/experiments/{id}/trace` | 指定诊断运行的阶段统计和分页，支持 `run`、`role`、`stage`、`sort`、`order`、`min_union_ms`、`limit`、`offset`。`analysis=apply-to-confirm` 增加逐 offset 的应用后确认分析 |
+| GET | `/api/v1/experiments/{id}/flamegraph` | 指定诊断运行的 CPU 热点和原图 ID，支持 `run`、`role`、`view`、`limit`。`symbol` 和可选的 `caller_depth` 按调用路径返回匹配样本 |
 | GET | `/api/v1/experiments/{id}/run-comparison` | baseline、上一轮与本轮的运行记录 |
 | GET | `/api/v1/experiments/{id}/run-logs?group=current` | 主负载三轮日志，`group` 可选 baseline、previous 或 current，省略时返回所有可用组 |
 | GET | `/api/v1/experiments/{id}/runs/{run}/measurement` | 一轮的完整测量字段 |

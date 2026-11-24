@@ -34,16 +34,21 @@ profile show -id v11
 
 ### Trace 和火焰图分析示例
 
-比较平台中 v9 与 v10 的本轮独立诊断。两轮使用相同负载，先筛选 leader 的写入等待，再按叶子函数查看 CPU 热点。`trace` 和 `flamegraph` 默认读取本轮诊断，可用 `-run` 指定诊断运行 ID。
+查看 v10 应用完成到写入确认返回的延迟。 [v10 Trace](http://127.0.0.1:8787/#/v10/trace)
 
 ```sh
-for version in v9 v10; do
-  profile trace -id "$version" -run diagnostic-current -role leader \
-    -stage raft.set.await -sort p95 -limit 5
-  profile flamegraph -id "$version" -run diagnostic-current -role leader \
-    -view leaf -limit 5
-done
+profile trace -id v10 -analysis apply-to-confirm
 ```
+
+先看 v10 Leader 的叶子热点，再用 `-symbol` 按上游调用路径拆分同一个热点。
+
+```sh
+profile flamegraph -id v10 -run diagnostic-current -role leader -view leaf -limit 5
+profile flamegraph -id v10 -run diagnostic-current -role leader \
+  -symbol 'CRC32::Extend' -caller-depth 8
+```
+
+`CRC32::Extend` 的 55 个样本中，**31 个**来自 `AppendSingleRecordBatch` 编码，**24 个**来自 `TryAppendAsync` 的 WAL 追加校验。换成 `-symbol '__memcpy_avx'` 可用同样的方法定位复制来源。 [v10 火焰图](http://127.0.0.1:8787/#/v10/flamegraphs)
 
 复核本地 A/B 归档时，用 `profile summarize` 一次汇总正式指标、关键等待和各节点 CPU 热点。 [CLI 汇总示例](../../tools/profile/README.md#汇总本地归档)
 

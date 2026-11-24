@@ -13,30 +13,33 @@ import (
 	"strings"
 
 	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/workflow"
 	"gorm.io/gorm"
 )
 
 const DefaultTraceLimit = 10
+const ApplyToConfirmAnalysis = "apply-to-confirm"
 
 type TraceQuery struct {
-	Run, Role, Stage, Sort, Order string
-	Limit, Offset                 int
-	MinUnionMS                    float64
+	Run, Role, Stage, Sort, Order, Analysis string
+	Limit, Offset                           int
+	MinUnionMS                              float64
 }
 
 type TracePage struct {
-	ExperimentID string           `json:"experiment_id"`
-	Run          string           `json:"run"`
-	Variant      string           `json:"variant"`
-	TraceURL     string           `json:"trace_url,omitempty"`
-	SpanCount    int              `json:"span_count"`
-	Verified     int              `json:"verified_observations"`
-	Sort         string           `json:"sort"`
-	Order        string           `json:"order"`
-	Total        int64            `json:"total"`
-	Limit        int              `json:"limit"`
-	Offset       int              `json:"offset"`
-	Stages       []langfuse.Stage `json:"stages"`
+	ExperimentID   string                      `json:"experiment_id"`
+	Run            string                      `json:"run"`
+	Variant        string                      `json:"variant"`
+	TraceURL       string                      `json:"trace_url,omitempty"`
+	SpanCount      int                         `json:"span_count"`
+	Verified       int                         `json:"verified_observations"`
+	Sort           string                      `json:"sort"`
+	Order          string                      `json:"order"`
+	Total          int64                       `json:"total"`
+	Limit          int                         `json:"limit"`
+	Offset         int                         `json:"offset"`
+	Stages         []langfuse.Stage            `json:"stages"`
+	ApplyToConfirm *workflow.ApplyConfirmation `json:"apply_to_confirm,omitempty"`
 }
 
 type diagnosticRun struct {
@@ -74,6 +77,9 @@ func (q *TraceQuery) validate() error {
 	if q.Role != "" && q.Role != "leader" && q.Role != "follower" && q.Role != "client" {
 		return fmt.Errorf("%w: role 请选择 leader、follower 或 client", ErrInvalid)
 	}
+	if q.Analysis != "" && (q.Analysis != ApplyToConfirmAnalysis || (q.Role != "" && q.Role != "leader")) {
+		return fmt.Errorf("%w: analysis 支持 leader 的 %s", ErrInvalid, ApplyToConfirmAnalysis)
+	}
 	if q.Limit < 0 || q.Offset < 0 || q.MinUnionMS < 0 || math.IsNaN(q.MinUnionMS) || math.IsInf(q.MinUnionMS, 0) {
 		return fmt.Errorf("%w: limit、offset 和 min_union_ms 需要为有限非负值", ErrInvalid)
 	}
@@ -86,6 +92,24 @@ func (q TraceQuery) page(run diagnosticRun) TracePage {
 		TraceURL: run.Profile.TraceURL, SpanCount: run.Profile.SpanCount, Verified: run.Profile.Verified,
 		Sort: q.Sort, Order: q.Order, Limit: q.Limit, Offset: q.Offset, Stages: []langfuse.Stage{},
 	}
+}
+
+func (p *TracePage) analyzeApplyConfirmation(run diagnosticRun, artifact func(string) (string, error)) error {
+	path, err := artifact(run.Observation.Timeline)
+	if err != nil {
+		return err
+	}
+	timeline, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer timeline.Close()
+	analysis, err := workflow.AnalyzeApplyConfirmation(timeline)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	p.ApplyToConfirm = &analysis
+	return nil
 }
 
 func selectDiagnosticRun(record Record, runID string) (diagnosticRun, error) {
@@ -134,6 +158,11 @@ func (s Store) Trace(id string, q TraceQuery) (TracePage, error) {
 		return TracePage{}, err
 	}
 	page := q.page(run)
+	if q.Analysis == ApplyToConfirmAnalysis {
+		if err := page.analyzeApplyConfirmation(run, func(key string) (string, error) { return s.Artifact(record, key) }); err != nil {
+			return TracePage{}, err
+		}
+	}
 	stages := make([]langfuse.Stage, 0, len(run.Observation.Stages))
 	for _, stage := range run.Observation.Stages {
 		if (q.Role == "" || stage.Role == q.Role) && strings.HasPrefix(stage.Name, q.Stage) && stage.Union >= q.MinUnionMS {
@@ -207,6 +236,11 @@ func (p *Postgres) Trace(id string, q TraceQuery) (TracePage, error) {
 			return err
 		}
 		page = q.page(run)
+		if q.Analysis == ApplyToConfirmAnalysis {
+			if err := page.analyzeApplyConfirmation(run, func(key string) (string, error) { return p.artifactFor(tx, id, key) }); err != nil {
+				return err
+			}
+		}
 		rows := tx.Model(&traceStageRow{}).Where("experiment_id = ? AND variant = ?", id, page.Variant)
 		if q.Role != "" {
 			rows = rows.Where("statistics->>'role' = ?", q.Role)
