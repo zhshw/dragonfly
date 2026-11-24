@@ -96,6 +96,16 @@ class PartitionLog {
   bool AppendPending() const {
     return pending_ != nullptr;
   }
+  bool FlushPending() const {
+    return flushing_ != nullptr;
+  }
+  bool IoPending() const {
+    return AppendPending() || FlushPending();
+  }
+
+  // Admission check only: same-term data in the active segment may overlap a buffered flush.
+  // Append still validates the complete batch, including its CRC and record boundaries.
+  bool CanAppendDuringFlush(std::string_view bytes) const;
   std::optional<std::string_view> WrittenRecords(int64_t offset, size_t max_bytes) const;
   bool PendingContains(int64_t offset, int32_t epoch) const;
 
@@ -150,11 +160,18 @@ class PartitionLog {
     size_t progress = 0;
     bool readable = false;
     bool memory = false;
-    bool flush_only = false;
+  };
+  struct PendingFlush {
+    log_files::RecoveryMarker::AppendPublication publication;
+    LogPosition end;
+    size_t bytes;
+    AsyncIO submit;
+    AppendDone done;
   };
   void WritePending();
   void SyncPending();
   void FinishPending(absl::Status status);
+  void FinishFlush(absl::Status status);
   void RecordBuffered(size_t bytes);
 
   PartitionLog(std::filesystem::path dir, size_t segment_bytes, AckMode ack_mode)
@@ -190,6 +207,7 @@ class PartitionLog {
   uint64_t content_generation_ = 0;
   absl::Status io_failure_;
   std::unique_ptr<PendingAppend> pending_;
+  std::unique_ptr<PendingFlush> flushing_;
 };
 
 }  // namespace dfly::cluster::raft

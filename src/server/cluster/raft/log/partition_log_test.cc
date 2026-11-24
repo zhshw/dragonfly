@@ -202,21 +202,216 @@ TEST_F(PartitionLogTest, MemoryTailWithoutPublicationIsDiscardedOnRecovery) {
   EXPECT_EQ(fs::file_size(Segment()), first.size());
 }
 
+TEST_F(PartitionLogTest, MemoryFlushPublishesCapturedCutWhileAppendContinues) {
+  for (int phase = 0; phase < 2; ++phase) {
+    for (bool flush_first : {false, true}) {
+      SCOPED_TRACE(testing::Message() << phase << ":" << flush_first);
+      log_.reset();
+      fs::remove_all(dir_);
+      Open(1U << 30, PartitionLog::AckMode::kMemory);
+      const auto first = MakeDataBatch(0, 3, 1, values_).value();
+      const auto second = MakeDataBatch(2, 3, 1, values_).value();
+      ASSERT_TRUE(log_->Append(first, 3).ok());
+      test::ControlledIO flush, append;
+      bool flushed = false, appended = false;
+      ASSERT_TRUE(log_->TryFlushBufferedAsync(flush.Submitter(),
+                                              [&](absl::Status s) {
+                                                EXPECT_TRUE(s.ok());
+                                                flushed = true;
+                                              })
+                      .value());
+      EXPECT_TRUE(log_->FlushPending());
+      EXPECT_FALSE(log_->AppendPending());
+      EXPECT_TRUE(log_->IoPending());
+      EXPECT_TRUE(log_->CanAppendDuringFlush(second));
+      EXPECT_FALSE(log_->CanAppendDuringFlush(second.substr(0, second.size() - 1)));
+      EXPECT_FALSE(log_->CanAppendDuringFlush(MakeDataBatch(2, 4, 1, values_).value()));
+      if (phase)
+        flush.Complete();
+      ASSERT_TRUE(log_->TryAppendAsync(
+                          make_shared<const string>(second), 3, append.Submitter(), [](size_t) {},
+                          [&](absl::Status s) {
+                            EXPECT_TRUE(s.ok());
+                            appended = true;
+                          })
+                      .value());
+      EXPECT_TRUE(log_->AppendPending());
+      EXPECT_FALSE(log_->FlushBuffered().ok());
+      EXPECT_FALSE(log_->TruncateTo(0, 0).ok());
+      append.Complete(7);
+      EXPECT_FALSE(appended);
+      if (!flush_first) {
+        append.Complete();
+        EXPECT_TRUE(appended);
+        EXPECT_EQ(log_->End().end_offset, 4);
+        EXPECT_EQ(log_->DurableEnd().end_offset, 0);
+      }
+      while (!flush.requests.empty())
+        flush.Complete();
+      EXPECT_TRUE(flushed);
+      EXPECT_EQ(log_->DurableEnd(), (LogPosition{3, 2}));
+      if (flush_first)
+        append.Complete();
+      EXPECT_TRUE(appended);
+      EXPECT_EQ(log_->End().end_offset, 4);
+      EXPECT_EQ(log_->DurableEnd().end_offset, 2);
+      EXPECT_FALSE(log_->IoPending());
+
+      // Recovery must discard the later complete write, even if the shared fsync covered it.
+      log_.reset();
+      Open(1U << 30, PartitionLog::AckMode::kMemory);
+      EXPECT_EQ(log_->End(), (LogPosition{3, 2}));
+      EXPECT_EQ(log_->Read(0, 2, SIZE_MAX).value(), first);
+    }
+  }
+}
+
+TEST_F(PartitionLogTest, MemoryFlushRetainsNewBytesAndTimer) {
+  log_.reset();
+  Open(1U << 30, PartitionLog::AckMode::kMemory);
+  ASSERT_TRUE(log_->Append(MakeDataBatch(0, 3, 1, values_).value(), 3).ok());
+  test::ControlledIO io;
+  ASSERT_TRUE(
+      log_->TryFlushBufferedAsync(io.Submitter(), [](absl::Status s) { EXPECT_TRUE(s.ok()); })
+          .value());
+  const array<string, 1> large{string(1U << 20, 'x')};
+  for (int i = 0; i < 64; ++i)
+    ASSERT_TRUE(log_->AppendAsFollower(MakeDataBatch(2 + i, 3, 1, large).value(), 3).ok());
+  io.Complete();
+  io.Complete();
+  EXPECT_EQ(log_->DurableEnd().end_offset, 2);
+  EXPECT_TRUE(log_->BufferedFlushDue());
+  ASSERT_TRUE(log_->FlushBuffered().ok());
+  EXPECT_EQ(log_->DurableEnd().end_offset, 66);
+  EXPECT_FALSE(log_->BufferedFlushDue());
+
+  // A sub-threshold tail still retains its age after the earlier cut is published.
+  ASSERT_TRUE(log_->Append(MakeDataBatch(66, 3, 1, values_).value(), 3).ok());
+  ASSERT_TRUE(
+      log_->TryFlushBufferedAsync(io.Submitter(), [](absl::Status s) { EXPECT_TRUE(s.ok()); })
+          .value());
+  ASSERT_TRUE(log_->Append(MakeDataBatch(68, 3, 1, values_).value(), 3).ok());
+  usleep(110000);
+  io.Complete();
+  io.Complete();
+  EXPECT_EQ(log_->DurableEnd().end_offset, 68);
+  EXPECT_TRUE(log_->BufferedFlushDue());
+  ASSERT_TRUE(log_->FlushBuffered().ok());
+  EXPECT_EQ(log_->DurableEnd().end_offset, 70);
+}
+
+TEST_F(PartitionLogTest, MemoryAppendAndFlushFailuresCannotClearEachOther) {
+  for (bool append_fails : {false, true}) {
+    for (int phase = 0; phase < 2; ++phase) {
+      SCOPED_TRACE(testing::Message() << append_fails << ":" << phase);
+      log_.reset();
+      fs::remove_all(dir_);
+      Open(1U << 30, PartitionLog::AckMode::kMemory);
+      const auto first = MakeDataBatch(0, 3, 1, values_).value();
+      const auto second = MakeDataBatch(2, 3, 1, values_).value();
+      ASSERT_TRUE(log_->Append(first, 3).ok());
+      test::ControlledIO flush, append;
+      optional<absl::Status> flushed, appended;
+      ASSERT_TRUE(
+          log_->TryFlushBufferedAsync(flush.Submitter(), [&](absl::Status s) { flushed = s; })
+              .value());
+      ASSERT_TRUE(log_->TryAppendAsync(
+                          make_shared<const string>(second), 3, append.Submitter(), [](size_t) {},
+                          [&](absl::Status s) { appended = s; })
+                      .value());
+      if (phase)
+        flush.Complete();
+      if (append_fails)
+        append.Complete(-EIO);
+      else
+        flush.Complete(-EIO);
+      const auto failure = log_->io_failure();
+      ASSERT_FALSE(failure.ok());
+      while (!append.requests.empty())
+        append.Complete();
+      while (!flush.requests.empty())
+        flush.Complete();
+      ASSERT_TRUE(appended && flushed);
+      EXPECT_EQ(*appended, failure);
+      EXPECT_EQ(*flushed, failure);
+      EXPECT_EQ(log_->io_failure(), failure);
+      EXPECT_FALSE(log_->IoPending());
+      EXPECT_EQ(log_->End().end_offset, 2);
+      EXPECT_FALSE(log_->Append(second, 3).ok());
+      EXPECT_FALSE(log_->FlushBuffered().ok());
+      log_.reset();
+      Open();
+      EXPECT_LE(log_->End().end_offset, 2);
+    }
+  }
+}
+
 TEST_F(PartitionLogTest, MemoryControlAndRolloverFlushEarlierData) {
   const auto first = MakeDataBatch(0, 3, 1, values_).value();
   log_.reset();
   Open(first.size(), PartitionLog::AckMode::kMemory);
   ASSERT_TRUE(log_->Append(first, 3).ok());
   EXPECT_EQ(log_->DurableEnd().end_offset, 0);
+  test::ControlledIO io;
+  ASSERT_TRUE(
+      log_->TryFlushBufferedAsync(io.Submitter(), [](absl::Status s) { EXPECT_TRUE(s.ok()); })
+          .value());
+  const array<int32_t, 1> voters{1};
+  EXPECT_FALSE(log_->CanAppendDuringFlush(MakeDataBatch(2, 3, 1, values_).value()));
+  EXPECT_FALSE(log_->Append(MakeDataBatch(2, 3, 1, values_).value(), 3).ok());
+  EXPECT_FALSE(log_->AppendLeaderChange(4, 1, 1, voters, voters).ok());
+  EXPECT_TRUE(log_->io_failure().ok());
+  io.Complete();
+  io.Complete();
   ASSERT_TRUE(log_->Append(MakeDataBatch(2, 3, 1, values_).value(), 3).ok());
   EXPECT_EQ(log_->End().end_offset, 4);
   EXPECT_EQ(log_->DurableEnd().end_offset, 2);
-  const array<int32_t, 1> voters{1};
   ASSERT_TRUE(log_->AppendLeaderChange(4, 1, 1, voters, voters).ok());
   EXPECT_EQ(log_->DurableEnd(), log_->End());
   log_.reset();
   Open();
   EXPECT_EQ(log_->End(), (LogPosition{4, 5}));
+}
+
+TEST_F(PartitionLogTest, CrashDuringOverlappingMemoryFlushRecoversOnlyCapturedCut) {
+  for (int phase = 0; phase < 3; ++phase) {
+    SCOPED_TRACE(phase);
+    log_.reset();
+    fs::remove_all(dir_);
+    Open();
+    const auto first = MakeDataBatch(0, 3, 1, values_).value();
+    const auto second = MakeDataBatch(2, 3, 1, values_).value();
+    const auto third = MakeDataBatch(4, 3, 1, values_).value();
+    ASSERT_TRUE(log_->Append(first, 3).ok());
+    log_.reset();
+    auto pid = fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      auto log = PartitionLog::Open(dir_, 1U << 30, PartitionLog::AckMode::kMemory).value();
+      test::ControlledIO io;
+      if (!log->Append(second, 3).ok() ||
+          !log->TryFlushBufferedAsync(io.Submitter(), [](absl::Status) {}).value() ||
+          !log->AppendAsFollower(third, 3).ok())
+        _exit(1);
+      if (phase == 0) {
+        if (fsync(io.requests.front().fd) != 0)
+          _exit(2);
+      } else {
+        io.Complete();
+        if (phase == 2)
+          io.Complete();
+      }
+      _exit(0);
+    }
+    int status;
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    Open();
+    EXPECT_EQ(log_->End().end_offset, phase == 0 ? 2 : 4);
+    EXPECT_EQ(log_->Read(0, log_->End().end_offset, SIZE_MAX).value(),
+              phase == 0 ? first : first + second);
+  }
 }
 
 TEST_F(PartitionLogTest, FailedMemoryFlushFencesFurtherWrites) {

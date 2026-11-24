@@ -9,6 +9,7 @@
 #include <fstream>
 
 #include "server/cluster/raft/log/partition_log.h"
+#include "server/cluster/raft/log/testdata/controlled_io.h"
 #include "server/cluster/raft/log/testdata/snapshot_fixture.h"
 
 namespace dfly::cluster::raft {
@@ -69,10 +70,25 @@ TEST_F(PartitionSnapshotTest, MemorySnapshotAndRetentionPublishOnlyDurablePrefix
   Reopen(1U << 30, PartitionLog::AckMode::kMemory);
   ASSERT_TRUE(log_->Append(Data(0, 3), 3).ok());
   EXPECT_EQ(log_->DurableEnd().end_offset, 0);
+  test::ControlledIO io;
+  ASSERT_TRUE(
+      log_->TryFlushBufferedAsync(io.Submitter(), [](absl::Status s) { EXPECT_TRUE(s.ok()); })
+          .value());
+  EXPECT_FALSE(Install({3, 2}, 2).ok());
+  EXPECT_TRUE(log_->io_failure().ok());
+  io.Complete();
+  io.Complete();
   ASSERT_TRUE(Install({3, 2}, 2).ok());
   EXPECT_EQ(log_->DurableEnd().end_offset, 2);
   ASSERT_TRUE(log_->Append(Data(2, 3), 3).ok());
   EXPECT_EQ(log_->DurableEnd().end_offset, 2);
+  ASSERT_TRUE(
+      log_->TryFlushBufferedAsync(io.Submitter(), [](absl::Status s) { EXPECT_TRUE(s.ok()); })
+          .value());
+  EXPECT_FALSE(log_->DeleteBeforeSnapshot({3, 2}, 4).ok());
+  EXPECT_TRUE(log_->io_failure().ok());
+  io.Complete();
+  io.Complete();
   ASSERT_TRUE(log_->DeleteBeforeSnapshot({3, 2}, 4).ok());
   EXPECT_EQ(log_->DurableEnd().end_offset, 4);
   Reopen();

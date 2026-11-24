@@ -4,6 +4,7 @@
 
 #include "server/cluster/raft/log/partition_log.h"
 
+#include <absl/base/internal/endian.h>
 #include <absl/cleanup/cleanup.h>
 #include <absl/strings/str_format.h>
 #include <fcntl.h>
@@ -251,15 +252,15 @@ LogPosition PartitionLog::End() const {
 }
 
 void PartitionLog::RecordBuffered(size_t bytes) {
-  if (!buffered_durable_end_) {
-    buffered_durable_end_ = End();
+  if (!buffered_durable_end_ || (flushing_ && buffered_bytes_ == flushing_->bytes))
     buffered_since_ = chrono::steady_clock::now();
-  }
+  if (!buffered_durable_end_)
+    buffered_durable_end_ = End();
   buffered_bytes_ += bytes;
 }
 
 bool PartitionLog::BufferedFlushDue() const {
-  return buffered_durable_end_ &&
+  return !flushing_ && buffered_durable_end_ &&
          (buffered_bytes_ >= (64U << 20) ||
           chrono::steady_clock::now() - buffered_since_ >= chrono::milliseconds(100));
 }
@@ -267,7 +268,7 @@ bool PartitionLog::BufferedFlushDue() const {
 absl::Status PartitionLog::FlushBuffered() {
   if (!io_failure_.ok())
     return io_failure_;
-  if (pending_)
+  if (IoPending())
     return absl::FailedPreconditionError("Drain quorum append before flushing buffered data");
   if (!buffered_durable_end_)
     return absl::OkStatus();
@@ -284,7 +285,7 @@ absl::Status PartitionLog::FlushBuffered() {
 absl::StatusOr<bool> PartitionLog::TryFlushBufferedAsync(AsyncIO submit, AppendDone done) {
   if (!io_failure_.ok())
     return io_failure_;
-  if (pending_)
+  if (IoPending())
     return absl::FailedPreconditionError("Quorum append already in flight");
   if (!submit || !buffered_durable_end_)
     return false;
@@ -293,13 +294,66 @@ absl::StatusOr<bool> PartitionLog::TryFlushBufferedAsync(AsyncIO submit, AppendD
     return io_failure_ = publication.status();
   if (!*publication)
     return false;
-  pending_ = make_unique<PendingAppend>();
-  pending_->publication = **publication;
-  pending_->submit = std::move(submit);
-  pending_->done = std::move(done);
-  pending_->flush_only = true;
-  SyncPending();
+  flushing_ = make_unique<PendingFlush>(
+      PendingFlush{**publication, End(), buffered_bytes_, std::move(submit), std::move(done)});
+  flushing_->submit(log_fd_, -1, {}, [this](int result) {
+    if (result != 0) {
+      FinishFlush(absl::ErrnoToStatus(result < 0 ? -result : EIO, "Syncing buffered quorum log"));
+      return;
+    }
+    if (!io_failure_.ok()) {
+      FinishFlush(io_failure_);
+      return;
+    }
+    auto status = marker_.SelectAppend(flushing_->publication);
+    if (!status.ok()) {
+      FinishFlush(status);
+      return;
+    }
+    flushing_->submit(flushing_->publication.fd, -1, {}, [this](int result) {
+      FinishFlush(result == 0 ? absl::OkStatus()
+                              : absl::ErrnoToStatus(result < 0 ? -result : EIO,
+                                                    "Syncing buffered quorum recovery marker"));
+    });
+  });
   return true;
+}
+
+void PartitionLog::FinishFlush(absl::Status status) {
+  auto flush = std::move(flushing_);
+  if (io_failure_.ok())
+    io_failure_ = status;
+  if (io_failure_.ok()) {
+    marker_.FinishAppend(flush->publication);
+    buffered_bytes_ -= flush->bytes;
+    if (buffered_bytes_ == 0)
+      buffered_durable_end_.reset();
+    else
+      buffered_durable_end_ = flush->end;
+  }
+  flush->done(io_failure_);
+}
+
+bool PartitionLog::CanAppendDuringFlush(string_view bytes) const {
+  if (ack_mode_ != AckMode::kMemory || pending_ || !io_failure_.ok())
+    return false;
+  auto end = End();
+  const size_t length = bytes.size();
+  while (!bytes.empty()) {
+    auto size = RecordBatchSize(bytes);
+    if (!size.ok() || *size > bytes.size())
+      return false;
+    const char* header = bytes.data();
+    const uint32_t count = absl::big_endian::Load32(header + 57);
+    if (header[16] != 2 || (absl::big_endian::Load16(header + 21) & 0x20) ||
+        absl::big_endian::Load32(header + 12) != uint32_t(end.epoch) ||
+        absl::big_endian::Load64(header) != uint64_t(end.end_offset) || count == 0 ||
+        count > INT32_MAX || end.end_offset > INT64_MAX - count)
+      return false;
+    end.end_offset += count;
+    bytes.remove_prefix(*size);
+  }
+  return FitsActiveSegment(length, end.end_offset);
 }
 
 LogPosition PartitionLog::EndForEpoch(int32_t epoch) const {
@@ -379,6 +433,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
     return absl::InvalidArgumentError("No complete batch to append");
   const size_t length = bytes.size() - remaining.size();
   const bool roll = active_bytes_ > 0 && !FitsActiveSegment(length, end.end_offset);
+  if (flushing_ && (!memory || roll || End().epoch != end.epoch))
+    return absl::FailedPreconditionError("Drain buffered flush before changing quorum log extent");
   if (!memory || roll) {
     if (auto s = FlushBuffered(); !s.ok())
       return s;
@@ -454,6 +510,8 @@ absl::StatusOr<bool> PartitionLog::TryAppendAsync(shared_ptr<const string> bytes
   if (!FitsActiveSegment(bytes->size(), end.end_offset))
     return false;
   pending->memory = ack_mode_ == AckMode::kMemory;
+  if (flushing_ && (!pending->memory || End().epoch != end.epoch))
+    return absl::FailedPreconditionError("Drain buffered flush before changing quorum log epoch");
   if (!pending->memory) {
     auto publication = marker_.PrepareAppend({start_, active_base_, pos, end.end_offset});
     if (!publication.ok())
@@ -476,6 +534,10 @@ void PartitionLog::WritePending() {
   p->submit(log_fd_, active_bytes_ + p->progress, string_view(*p->bytes).substr(p->progress),
             [this](int result) {
               auto* p = pending_.get();
+              if (!io_failure_.ok()) {
+                FinishPending(io_failure_);
+                return;
+              }
               if (result == -EINTR) {
                 WritePending();
                 return;
@@ -521,8 +583,9 @@ void PartitionLog::SyncPending() {
 
 void PartitionLog::FinishPending(absl::Status status) {
   auto pending = std::move(pending_);
-  io_failure_ = status;
-  if (status.ok()) {
+  if (io_failure_.ok())
+    io_failure_ = status;
+  if (io_failure_.ok()) {
     if (pending->memory) {
       RecordBuffered(pending->bytes->size());
     } else {
@@ -530,12 +593,10 @@ void PartitionLog::FinishPending(absl::Status status) {
       buffered_durable_end_.reset();
       buffered_bytes_ = 0;
     }
-    if (!pending->flush_only) {
-      active_bytes_ = pending->batches.back().file_end;
-      batches_.insert(batches_.end(), pending->batches.begin(), pending->batches.end());
-    }
+    active_bytes_ = pending->batches.back().file_end;
+    batches_.insert(batches_.end(), pending->batches.begin(), pending->batches.end());
   }
-  pending->done(status);
+  pending->done(io_failure_);
 }
 
 optional<string_view> PartitionLog::WrittenRecords(int64_t offset, size_t max_bytes) const {
@@ -605,7 +666,7 @@ absl::StatusOr<string> PartitionLog::Read(int64_t offset, int64_t max_offset, si
 }
 
 absl::Status PartitionLog::TruncateTo(int64_t offset, int64_t hw) {
-  if (pending_)
+  if (IoPending())
     return absl::FailedPreconditionError("Drain quorum append before truncation");
   if (!io_failure_.ok())
     return io_failure_;

@@ -1,13 +1,15 @@
 # Raft 复制优化与 benchmark
 
-**最新 v10 实验无收益，代码已回退；当前保留 v9。** v10 同轮确认吞吐 **400.62 → 385.40 MiB/s（−3.8%）**，P95 **+19.5%**，不扩大连接数。
+**最新 v10（P1-6）保留：memory 后台同步期间继续普通追加。** 单连接同轮确认吞吐
+**377.21 → 437.97 MiB/s（+16.1%）**，三组均提高；批次 P95 中位数 **−11.8%**。
 
-**原始 `raft.memory` 基线 → v9 原实验：169.56 → 389.95 MiB/s，累计 +130.0%。**
-对应已实现的 **P0-1：共享 WAL、直接编码与 drain 聚合**，**P0-2：批量应用与借用 SET 参数**，
-**P1-4：follower 复用接收批次**、**P1-7：Fetch 直接封帧**、**P1-5：SET 输入所有权转交**。
-v9 同轮原 cluster 为 580.94 MiB/s，快约 1.49 倍；v10 本轮复测为 618.30 MiB/s。
-均为 1 连接、pipeline 64、未插桩三轮中位数、SET + 原写连接 WAIT 1 口径；累计值是跨轮比较，也包含 WAIT 等待变化。
-v9 确认吞吐中位数 **+20.9%**，三组配对均约 +20%–21%，范围不重叠。各优化项的同轮增量和完整对照见下文。
+**原始 `raft.memory` 基线 → v10：169.56 → 437.97 MiB/s，累计 +158.3%。**
+包含 P0-1 共享 WAL / 直接编码 / drain 聚合、P0-2 批量应用、P1-4 follower 接收缓存、
+P1-7 Fetch 封帧、P1-5 输入所有权转交，以及本轮 P1-6 追加与后台同步分离。
+v10 同轮原 cluster 为 **605.47 MiB/s**，快约 **1.38 倍**；已回退的提前 Fetch 试验 不包含在内。
+沿用 v9，仅汇总 **1 连接 / pipeline 64** 这一组负载，三版本各三轮，计时包含 SET + 原写连接 WAIT 1。
+累计值是跨轮比较，包含 WAIT 等待变化；额外连接数数据只归档。
+完整指标见 [v10 实验](profile/v10-memory-flush-overlap.md)，历史 v9 的 389.95 MiB/s 保留原含义。
 历史优化对比使用 `flush` 语义；memory 优化与确认模式对比单独列出。吞吐取三轮中位数，
 各项使用不同阶段的基线，提升比例不能相加。
 
@@ -15,7 +17,8 @@ v9 确认吞吐中位数 **+20.9%**，三组配对均约 +20%–21%，范围不�
 
 ## 做了哪些优化、提升多少
 
-- **follower 接收确认快路径（v10，无收益，已回退）**：确认吞吐 **400.62 → 385.40 MiB/s（−3.8%）**，批次 P95 **58.66 → 70.09 ms（+19.5%）**；三组方向不一致。局部发送等待下降未兑现整体收益，完整指标和归档见 [v10 实验](profile/v10-follower-receipt.md)。
+- **后台同步与普通追加并行（v10）**：确认吞吐 **377.21 → 437.97 MiB/s（+16.1%）**，P95 **60.19 → 53.06 ms（−11.8%）**。同步期间新 leader 编码 / follower 追加 **0 / 0 → 27 / 17 次**；同步条件和恢复切点保证不变，详见 [v10 实验](profile/v10-memory-flush-overlap.md)。
+- **follower 接收确认快路径（无收益，已回退）**：确认吞吐 **400.62 → 385.40 MiB/s（−3.8%）**，批次 P95 **58.66 → 70.09 ms（+19.5%）**；三组方向不一致。局部发送等待下降未兑现整体收益，完整指标和归档见 [提前 Fetch 失败试验](profile/p0-1b-follower-receipt.md)。
 - **SET 输入所有权转交（v9）**：确认吞吐 **322.41 → 389.95 MiB/s（+20.9%）**，批次 P95 中位数 **−12.8%**；三组配对均提升，但第三组 P95 略升。接管已解析参数并在 drain 后释放，保持原有票据反压；两版 WAIT 均约 0.15 ms。完整数据、火焰图与内存结论见 [v9 实验](profile/v9-input-ownership.md)。
 - **Fetch 直接封帧**：确认吞吐 **299.55 → 325.31 MiB/s（+8.6%）**，SET 阶段同为 **+8.6%**；批次 P95 **−3.5%**。一次预留完整响应，去掉 body → frame 和尾部扩容复制；三轮范围重叠，不能把中位数当作稳定提升。
 - **follower 复用已验证的接收批次**：确认吞吐 **252.11 → 300.25 MiB/s（+19.1%）**，其中仅 SET 阶段 **+7.2%**；消除该负载的 WAL 读回及重复解码，末尾 WAIT 少等一次重查。单次 follower CPU **−35.9%**，峰值 RSS **+3.6%**。
@@ -60,22 +63,21 @@ v9 确认吞吐中位数 **+20.9%**，三组配对均约 +20%–21%，范围不�
 - **正确性通过**：27 轮均通过各写连接 WAIT 1、离线副本重启后的 WAIT 2 和全部 1088 个值读回。
 - **仍需定位等待**：票据容量、WAL 排空和 worker 等待应用尚未消除，下一步用 trace / 火焰图量化。最新测试未刻意跨越 1 GiB 段边界，也没有新刷盘计数，不能单独量化段截取收益。
 
-## 复现与原始数据
+## 当前优化复现与原始数据
 
 保留改动前的 `dragonfly`、`raft_storage`，在真实磁盘目录运行；[Folly 构建方法](io_uring.md#folly-编译变体)。
 
 ```sh
 ninja -C build-opt dragonfly raft_storage
-for clients in 1 2 8; do
-  python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
-    --build-dir build-opt --baseline-build /path/to/previous-pipeline-build \
-    --include-cluster --clients "$clients" --pipeline-depth 64 \
-    --output-dir "$PWD/docs/cluster/benchmarks/replication-pipeline-c$clients"
-done
+python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
+  --build-dir build-opt --baseline-build /path/to/v9-build \
+  --ack-mode memory --include-cluster --clients 1 --pipeline-depth 64 \
+  --output-dir "$PWD/docs/cluster/benchmarks/profile-flush-overlap-c1"
 ```
 
 原始数据仅保存在本地 `docs/cluster/benchmarks/` 及测试机，已由 `.gitignore` 排除；
-64 连接样本和同步 Raft 性能数据已删除。该阶段日志位于测试机隔离仓库
+本轮使用单组负载，结果见 [v10 实验](profile/v10-memory-flush-overlap.md)。
+历史 64 连接样本和同步 Raft 性能数据已删除；段边界优化的旧日志位于测试机隔离仓库
 `/home/zhangshenwang/workspace/db/dragonfly-io-uring-20261123/results-segment-drain-pipeline-20261123-c{1,2,8}/`。
 
 ## 确认模式：raft.flush / raft.memory / 原 cluster

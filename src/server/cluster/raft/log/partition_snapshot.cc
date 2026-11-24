@@ -66,7 +66,7 @@ absl::Status PartitionLog::InstallSnapshot(SnapshotWriter* writer, int64_t hw,
                                            const SnapshotValidator& validate) {
   if (!io_failure_.ok())
     return io_failure_;
-  if (AppendPending())
+  if (IoPending())
     return absl::FailedPreconditionError("Drain quorum append before installing snapshot");
   if (!writer || hw < 0 || hw > End().end_offset)
     return absl::InvalidArgumentError("Invalid Kafka snapshot installation or high watermark");
@@ -148,7 +148,7 @@ absl::Status PartitionLog::ResetToSnapshot(LogPosition id) {
 }
 
 absl::Status PartitionLog::DeleteBeforeSnapshot(LogPosition id, int64_t hw) {
-  if (AppendPending())
+  if (IoPending())
     return absl::FailedPreconditionError("Drain quorum append before deleting prefix");
   if (!io_failure_.ok())
     return io_failure_;

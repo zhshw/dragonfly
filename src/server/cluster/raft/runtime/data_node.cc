@@ -681,10 +681,11 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
         if (local->open_batch == batch)
           local->open_batch.reset();
       };
-      batch->status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
-        seal();
-        return AppendSetBatch(*local, *batch, state, done);
-      });
+      batch->status =
+          local->raft->VisitDataUntil(deadline, [&](RaftGroup::State state, bool* done) {
+            seal();
+            return AppendSetBatch(*local, *batch, state, done);
+          });
 
       // VisitUntil can stop before invoking the callback, for example during shutdown.
       if (!batch->status.ok())
@@ -713,7 +714,7 @@ absl::Status DataNodeImpl::WaitApplied(shared_ptr<LocalPartition> local, const P
                                        DataWritePosition* position) {
   if (proposal.stored)
     *position = {local->id, proposal.end.epoch, proposal.end.end_offset};
-  auto status = local->raft->VisitUntil(deadline, [&](RaftGroup::State state, bool* done) {
+  auto status = local->raft->VisitDataUntil(deadline, [&](RaftGroup::State state, bool* done) {
     if (stopping_ || state.election.state().role != QuorumRole::kLeader ||
         state.election.state().election.epoch != proposal.end.epoch)
       return ClusterDown();
@@ -763,7 +764,7 @@ absl::Status DataNodeImpl::QueueSet(shared_ptr<LocalPartition> local, PendingSet
 void DataNodeImpl::DrainSets(shared_ptr<LocalPartition> local) {
   while (true) {
     SetBatch batch;
-    auto status = local->raft->VisitUntil(
+    auto status = local->raft->VisitDataUntil(
         steady_clock::now() + seconds(5), [&](RaftGroup::State state, bool* done) {
           if (batch.requests.empty()) {
             lock_guard lock(local->batch_mu);
@@ -828,6 +829,8 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
   int64_t offset = state.log.End().end_offset;
   const auto timestamp =
       duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+  if (state.log.FlushPending() && batch.requests.front()->condition)
+    return absl::OkStatus();
   size_t records_size = 0;
   for (size_t i = 0; i < batch.requests.size(); ++i) {
     auto* request = batch.requests[i];
@@ -884,6 +887,8 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
     request->end = {epoch, ++offset};
     records_size += *encoded_size;
   }
+  if (state.log.FlushPending() && !state.log.FitsActiveSegment(records_size, offset))
+    return absl::OkStatus();
   *done = true;
   if (records_size == 0)
     return absl::OkStatus();

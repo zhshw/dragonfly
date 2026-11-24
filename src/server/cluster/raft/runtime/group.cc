@@ -75,6 +75,8 @@ using PeerTask = variant<monostate, OutboundVote, EpochNotification, Pull>;
 // The disk queue owns every election, log and timer mutation. Each peer's RPC runs
 // on its own fiber, so a disconnected voter cannot stall the majority or disk queue.
 class RaftGroup::Impl {
+  enum class IoAccess { kIdle, kData, kFetch };
+
  public:
   Impl(VoteTarget target, vector<CampaignVoter> voters, const filesystem::path& dir,
        unique_ptr<PartitionLog> log, Kind kind, bool observer, ApplyCommitted apply,
@@ -178,22 +180,26 @@ class RaftGroup::Impl {
     return epoch < 0 || stopping_ ? nullopt : optional<int32_t>{epoch};
   }
 
-  absl::Status Visit(Operation operation) {
-    return RunOnWorker([&] {
-      Tick();
-      if (failed_ || stopping_)
-        return absl::UnavailableError("Quorum is unavailable");
-      return operation({campaign_, replication_, *log_});
-    });
+  absl::Status Visit(Operation operation, IoAccess access = IoAccess::kIdle) {
+    return RunOnWorker(
+        [&] {
+          Tick();
+          if (failed_ || stopping_)
+            return absl::UnavailableError("Quorum is unavailable");
+          return operation({campaign_, replication_, *log_});
+        },
+        access);
   }
 
   absl::Status VisitUntil(steady_clock::time_point deadline,
-                          absl::FunctionRef<absl::Status(State, bool*)> operation) {
+                          absl::FunctionRef<absl::Status(State, bool*)> operation,
+                          bool data_only = false) {
     while (steady_clock::now() < deadline) {
       // Subscribe before checking the ticket so a concurrent commit cannot be missed.
       auto key = commit_changed_.prepareWait();
       bool done = false;
-      auto status = Visit([&](State state) { return operation(state, &done); });
+      auto status = Visit([&](State state) { return operation(state, &done); },
+                          data_only ? IoAccess::kData : IoAccess::kIdle);
       if (!status.ok() || done)
         return status;
       commit_changed_.wait_until(key.epoch(), deadline);
@@ -208,12 +214,15 @@ class RaftGroup::Impl {
   }
 
   template <typename F>
-  auto RunOnWorker(F&& operation, bool allow_pending = false) -> decltype(operation()) {
+  auto RunOnWorker(
+      F&& operation, IoAccess access = IoAccess::kIdle,
+      absl::FunctionRef<bool()> ready = [] { return true; }) -> decltype(operation()) {
     util::detail::ResultMover<decltype(operation())> result;
     while (true) {
       auto key = io_changed_.prepareWait();
       bool ran = worker_.Await([&] {
-        if (log_->AppendPending() && !allow_pending)
+        if ((log_->AppendPending() && access != IoAccess::kFetch) ||
+            (log_->FlushPending() && access == IoAccess::kIdle) || !ready())
           return false;
         const auto commit = CommitState();
         const auto end = log_->End();
@@ -251,7 +260,7 @@ class RaftGroup::Impl {
   }
 
   void MaybeFlushBuffered() {
-    if (failed_ || stopping_ || log_->AppendPending() || !log_->BufferedFlushDue())
+    if (failed_ || stopping_ || log_->IoPending() || !log_->BufferedFlushDue())
       return;
     auto started = log_->TryFlushBufferedAsync(
         async_io_, [this](absl::Status status) { CheckBufferedFlush(status); });
@@ -261,6 +270,22 @@ class RaftGroup::Impl {
       CheckBufferedFlush(log_->FlushBuffered());
   }
 
+  void CompleteIO(const PartitionLog::IoCallback& completion, int result) {
+    const auto commit = CommitState();
+    const auto end = log_->End();
+    const bool flushing = log_->FlushPending();
+    completion(result);
+    const bool flushed = flushing && !log_->FlushPending();
+    if (!log_->AppendPending()) {
+      Tick();
+      MaybeFlushBuffered();
+    }
+    if (flushed)
+      commit_changed_.notifyAll();
+    io_changed_.notifyAll();
+    NotifyProgress(commit, end);
+  }
+
 #ifdef __linux__
   void SubmitIO(int fd, int64_t offset, string_view bytes, PartitionLog::IoCallback done) {
 #if DFLY_RAFT_USE_FOLLY
@@ -268,17 +293,8 @@ class RaftGroup::Impl {
     // Folly retries a full queue in its own event loop; no network proactor or fiber is involved.
     auto completion = make_shared<PartitionLog::IoCallback>(std::move(done));
     folly_io_->Submit(fd, offset, bytes, [this, completion](int result) {
-      return worker_.GetQueue(0)->TryAdd([this, completion, result] {
-        const auto commit = CommitState();
-        const auto end = log_->End();
-        (*completion)(result);
-        if (!log_->AppendPending()) {
-          Tick();
-          MaybeFlushBuffered();
-          io_changed_.notifyAll();
-        }
-        NotifyProgress(commit, end);
-      });
+      return worker_.GetQueue(0)->TryAdd(
+          [this, completion, result] { CompleteIO(*completion, result); });
     });
 #else
     auto* proactor = static_cast<fb2::UringProactor*>(disk_pool_->at(0));
@@ -287,17 +303,7 @@ class RaftGroup::Impl {
       auto entry = proactor->GetSubmitEntry([this, completion](auto*, int result, auto, auto) {
         // CQE callbacks cannot block on the bounded worker queue.
         fb2::Fiber([this, completion, result] {
-          worker_.Add([this, completion, result] {
-            const auto commit = CommitState();
-            const auto end = log_->End();
-            (*completion)(result);
-            if (!log_->AppendPending()) {
-              Tick();
-              MaybeFlushBuffered();
-              io_changed_.notifyAll();
-            }
-            NotifyProgress(commit, end);
-          });
+          worker_.Add([this, completion, result] { CompleteIO(*completion, result); });
         }).Detach();
       });
       if (offset < 0)
@@ -386,11 +392,8 @@ class RaftGroup::Impl {
       return status;
     snapshots_.SyncRole();
     changes_.Poll(NowMs());
-    if (auto hw = replication_.HighWatermark(); hw && apply_ && *hw != applied_) {
-      if (auto s = apply_(*log_, *hw); !s.ok())
-        return s;
-      applied_ = *hw;
-    }
+    if (auto s = Apply(); !s.ok())
+      return s;
     auto role = campaign_.state().role;
     auto epoch = campaign_.state().election.epoch;
     if (role != role_ || epoch != epoch_) {
@@ -406,10 +409,21 @@ class RaftGroup::Impl {
     return absl::OkStatus();
   }
 
+  absl::Status Apply() {
+    if (auto hw = replication_.HighWatermark(); hw && apply_ && *hw != applied_) {
+      if (auto s = apply_(*log_, *hw); !s.ok())
+        return s;
+      applied_ = *hw;
+    }
+    return absl::OkStatus();
+  }
+
   void Tick() {
     if (failed_)
       return;
-    auto status = PollTimers();
+
+    // Only ordinary data can advance during a flush; election and structural work must drain it.
+    auto status = log_->FlushPending() ? Apply() : PollTimers();
     if (!status.ok()) {
       failed_ = true;
       LOG(ERROR) << "Stopped quorum " << campaign_.target().topic << ": " << status;
@@ -440,6 +454,12 @@ class RaftGroup::Impl {
     Tick();
     if (failed_)
       return {};
+    if (log_->FlushPending()) {
+      if (role_ == QuorumRole::kFollower && campaign_.state().election.leader_id == key.id &&
+          !replication_.RequestedSnapshot())
+        return Pull::kFetch;
+      return {};
+    }
     auto notification = notifications_.extract(key.id);
     if (notification)
       return std::move(notification.mapped());
@@ -467,7 +487,7 @@ class RaftGroup::Impl {
   void RunPeer(const CampaignVoter& voter, const atomic_bool& active) {
     PeerConnection peer(voter.endpoint, kRequestTimeoutMs, kMaxRaftFrame);
     while (!stopping_ && active) {
-      auto task = RunOnWorker([&] { return Next(voter.key); });
+      auto task = RunOnWorker([&] { return Next(voter.key); }, IoAccess::kData);
       if (auto* vote = get_if<OutboundVote>(&task)) {
         VoteResponse response;
         bool pre_vote = vote->request.topics[0].partitions[0].pre_vote;
@@ -529,13 +549,15 @@ class RaftGroup::Impl {
     int16_t version;
     if (peer.Negotiate<FetchRequest>(kMinRaftFetchVersion, &version))
       return false;
-    auto fetch = RunOnWorker([&]() -> optional<OutboundFetch> {
-      if (failed_ || campaign_.state().role != QuorumRole::kFollower ||
-          campaign_.state().election.leader_id != leader)
-        return nullopt;
-      const auto max_bytes = kind_ == Kind::kData ? kMaxDataFetchBytes : kMaxFetchBytes;
-      return replication_.PrepareFetch(leader, version, 100, max_bytes);
-    });
+    auto fetch = RunOnWorker(
+        [&]() -> optional<OutboundFetch> {
+          if (failed_ || campaign_.state().role != QuorumRole::kFollower ||
+              campaign_.state().election.leader_id != leader)
+            return nullopt;
+          const auto max_bytes = kind_ == Kind::kData ? kMaxDataFetchBytes : kMaxFetchBytes;
+          return replication_.PrepareFetch(leader, version, 100, max_bytes);
+        },
+        IoAccess::kData);
     if (!fetch)
       return false;
     FetchResponse response;
@@ -543,34 +565,40 @@ class RaftGroup::Impl {
     if (peer.Call(fetch->request, version, &response))
       return false;
     const bool waited = steady_clock::now() - start >= milliseconds(fetch->request.max_wait_ms);
-    return RunOnWorker([&] {
-      if (!active)
-        return false;
-      const auto end = log_->End();
-      const auto hw = replication_.HighWatermark();
-      bool idle_response = false;
-      if (response.responses.size() == 1 && response.responses.front().partitions.size() == 1) {
-        const auto& part = response.responses.front().partitions.front();
-        idle_response = part.diverging_epoch.epoch < 0 && part.snapshot_id.epoch < 0 &&
-                        (!part.records.data || part.records.data->empty());
-      }
-      bool reset = false;
-      auto s =
-          replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response), &reset);
-      if (!s.ok()) {
-        VLOG(1) << "Fetch from node " << leader << ": " << s;
-        return false;
-      }
-      if (!reset)
-        return false;
-      ResetDeadline(NowMs());
-      if (log_->End() != end || replication_.HighWatermark() != hw ||
-          replication_.RequestedSnapshot())
-        return true;
+    return RunOnWorker(
+        [&] {
+          if (!active)
+            return false;
+          const auto end = log_->End();
+          const auto hw = replication_.HighWatermark();
+          bool idle_response = false;
+          if (response.responses.size() == 1 && response.responses.front().partitions.size() == 1) {
+            const auto& part = response.responses.front().partitions.front();
+            idle_response = part.diverging_epoch.epoch < 0 && part.snapshot_id.epoch < 0 &&
+                            (!part.records.data || part.records.data->empty());
+          }
+          bool reset = false;
+          auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response),
+                                                     &reset);
+          if (!s.ok()) {
+            VLOG(1) << "Fetch from node " << leader << ": " << s;
+            return false;
+          }
+          if (!reset)
+            return false;
+          ResetDeadline(NowMs());
+          if (log_->End() != end || replication_.HighWatermark() != hw ||
+              replication_.RequestedSnapshot())
+            return true;
 
-      // An idle long poll already waited. Re-arm it immediately so the next append can wake it.
-      return waited && idle_response;
-    });
+          // An idle long poll already waited. Re-arm it immediately so the next append can wake it.
+          return waited && idle_response;
+        },
+        IoAccess::kData,
+        [&] {
+          return !log_->FlushPending() ||
+                 replication_.CanReceiveDuringFlush(leader, fetch->sequence, response);
+        });
   }
 
   void Discover(PeerConnection& peer, const CampaignVoter& voter, const atomic_bool& active) {
@@ -794,7 +822,7 @@ error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
                                               &can_wait, initial ? &parked : nullptr);
             return s.ok() ? error_code{} : make_error_code(errc::io_error);
           },
-          true);
+          IoAccess::kFetch);
       if (result != errc::resource_unavailable_try_again)
         return result;
       io_changed_.wait(io_key.epoch());
@@ -878,6 +906,11 @@ optional<int32_t> RaftGroup::LeaderEpoch() const {
 absl::Status RaftGroup::VisitUntil(steady_clock::time_point deadline,
                                    absl::FunctionRef<absl::Status(State, bool*)> operation) {
   return impl_->VisitUntil(deadline, operation);
+}
+
+absl::Status RaftGroup::VisitDataUntil(steady_clock::time_point deadline,
+                                       absl::FunctionRef<absl::Status(State, bool*)> operation) {
+  return impl_->VisitUntil(deadline, operation, true);
 }
 
 }  // namespace dfly::cluster::raft

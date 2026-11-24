@@ -23,6 +23,14 @@ def instrument(relative):
     source = (REPO / relative).read_text()
     edits = []
     if relative == RAFT + "runtime/group.cc":
+        receive = re.search(
+            r"(?m)^( +)auto s =\s+replication_\.ReceiveFetchResponse\(leader, "
+            r"fetch->sequence, std::move\(response\),\s+&reset\);",
+            source,
+        )
+        if receive is None:
+            raise ValueError("Missing follower receive instrumentation anchor")
+        indent = receive[1]
         edits = [
             (
                 "      commit_changed_.wait_until(key.epoch(), deadline);",
@@ -60,12 +68,13 @@ def instrument(relative):
                 "    observed_rpc.Finish();",
             ),
             (
-                "      auto s =\n"
-                "          replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response), &reset);",
-                '      dfly_observe::Scope observed_response("raft.fetch.receive", end.end_offset);\n'
-                "      auto s =\n"
-                "          replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response), &reset);\n"
-                "      observed_response.Finish();",
+                receive[0],
+                indent
+                + 'dfly_observe::Scope observed_response("raft.fetch.receive", end.end_offset);\n'
+                + receive[0]
+                + "\n"
+                + indent
+                + "observed_response.Finish();",
             ),
         ]
     elif relative == RAFT + "runtime/data_node.cc":

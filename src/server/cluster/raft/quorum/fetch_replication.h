@@ -122,6 +122,10 @@ class FetchReplication {
   [[nodiscard]] absl::Status ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
                                                   protocol::FetchResponse response,
                                                   bool* reset_fetch_timeout = nullptr);
+
+  // Admission only. Defer role changes, controls and extent replacement until the flush drains.
+  bool CanReceiveDuringFlush(int32_t source_id, uint64_t sequence,
+                             const protocol::FetchResponse& response) const;
   std::optional<LogPosition> RequestedSnapshot() const {
     const auto& state = campaign_.state();
     if (state.role != QuorumRole::kFollower || state.election.epoch != request_epoch_ ||

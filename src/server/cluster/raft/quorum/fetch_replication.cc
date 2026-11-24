@@ -440,6 +440,27 @@ optional<OutboundFetch> FetchReplication::PrepareFetch(int32_t peer_id, int16_t 
   return fetch;
 }
 
+bool FetchReplication::CanReceiveDuringFlush(int32_t source_id, uint64_t sequence,
+                                             const FetchResponse& response) const {
+  const auto& state = campaign_.state();
+  if (request_peer_ != source_id || sequence != sequence_ || state.storage_error ||
+      state.role != QuorumRole::kFollower || state.role != request_role_ ||
+      state.election.epoch != request_epoch_ || state.election.leader_id != source_id ||
+      response.error_code != 0 || response.responses.size() != 1 ||
+      response.responses.front().topic_id != topic_id_ ||
+      response.responses.front().partitions.size() != 1)
+    return false;
+  const auto& part = response.responses.front().partitions.front();
+  if (part.partition_index != campaign_.target().partition || part.error_code != 0 ||
+      part.current_leader.leader_id != source_id ||
+      part.current_leader.leader_epoch != request_epoch_ || part.diverging_epoch.epoch >= 0 ||
+      part.diverging_epoch.end_offset >= 0 || part.snapshot_id.epoch >= 0 ||
+      part.snapshot_id.end_offset >= 0)
+    return false;
+  return !part.records.data || part.records.data->empty() ||
+         log_.CanAppendDuringFlush(*part.records.data);
+}
+
 absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
                                                     FetchResponse response,
                                                     bool* reset_fetch_timeout) {

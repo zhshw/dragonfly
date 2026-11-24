@@ -257,6 +257,49 @@ TEST_F(FetchReplicationTest, MemoryMajorityCommitsBeforeEitherDataLogFlushes) {
   EXPECT_EQ(b.fetch.HighWatermark(), 2);
   EXPECT_EQ(a.log->DurableEnd().end_offset, 1);
   EXPECT_EQ(b.log->DurableEnd().end_offset, 1);
+
+  // Both nodes continue ordinary replication while their previous cut is being synced.
+  test::ControlledIO leader_flush, follower_flush;
+  auto completed = [](absl::Status s) { EXPECT_TRUE(s.ok()); };
+  ASSERT_TRUE(a.log->TryFlushBufferedAsync(leader_flush.Submitter(), completed).value());
+  ASSERT_TRUE(b.log->TryFlushBufferedAsync(follower_flush.Submitter(), completed).value());
+  ASSERT_TRUE(a.fetch.Append(Batch(2, 5), 5).ok());
+  io.Complete();
+  auto next = b.fetch.PrepareFetch(kA.id, 18, 0, 1 << 20).value();
+  auto response = Handle(&a, next);
+  ASSERT_TRUE(b.fetch.CanReceiveDuringFlush(kA.id, next.sequence, response));
+  EXPECT_FALSE(b.fetch.CanReceiveDuringFlush(kA.id, next.sequence + 1, response));
+  EXPECT_FALSE(b.fetch.CanReceiveDuringFlush(kC.id, next.sequence, response));
+  for (int change = 0; change < 5; ++change) {
+    auto structural = response;
+    auto& part = structural.responses.front().partitions.front();
+    if (change == 0)
+      ++part.current_leader.leader_epoch;
+    else if (change == 1)
+      part.diverging_epoch.epoch = 5;
+    else if (change == 2)
+      part.snapshot_id.epoch = 5;
+    else if (change == 3)
+      part.error_code = 74;
+    else {
+      const array<int32_t, 1> voters{1};
+      part.records.data = MakeLeaderChangeBatch(2, 5, 1, 1, voters, voters).value();
+    }
+    EXPECT_FALSE(b.fetch.CanReceiveDuringFlush(kA.id, next.sequence, structural));
+  }
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, next.sequence, std::move(response)).ok());
+  auto confirm = b.fetch.PrepareFetch(kA.id, 18, 0, 1 << 20).value();
+  ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, confirm.sequence, Handle(&a, confirm)).ok());
+  EXPECT_EQ(a.fetch.HighWatermark(), 3);
+  EXPECT_EQ(b.fetch.HighWatermark(), 3);
+  EXPECT_EQ(a.log->DurableEnd().end_offset, 1);
+  EXPECT_EQ(b.log->DurableEnd().end_offset, 1);
+  leader_flush.Complete();
+  follower_flush.Complete();
+  leader_flush.Complete();
+  follower_flush.Complete();
+  EXPECT_EQ(a.log->DurableEnd().end_offset, 2);
+  EXPECT_EQ(b.log->DurableEnd().end_offset, 2);
   EXPECT_TRUE(a.log->FlushBuffered().ok());
   EXPECT_TRUE(b.log->FlushBuffered().ok());
   EXPECT_EQ(a.log->DurableEnd(), a.log->End());

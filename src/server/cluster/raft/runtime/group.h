@@ -59,6 +59,11 @@ class RaftGroup {
   absl::Status VisitUntil(std::chrono::steady_clock::time_point deadline,
                           absl::FunctionRef<absl::Status(State, bool* done)> operation);
 
+  // Ordinary data and applied-position checks may run during a memory flush. The operation
+  // must defer controls/rollover with done=false; flush completion also wakes this visitor.
+  absl::Status VisitDataUntil(std::chrono::steady_clock::time_point deadline,
+                              absl::FunctionRef<absl::Status(State, bool* done)> operation);
+
  private:
   class Impl;
   explicit RaftGroup(std::unique_ptr<Impl> impl);
