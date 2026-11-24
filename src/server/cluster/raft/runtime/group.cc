@@ -25,6 +25,7 @@
 #include "util/fibers/pool.h"
 #include "util/fibers/proactor_base.h"
 #if DFLY_RAFT_USE_FOLLY
+#include "server/cluster/raft/runtime/group_loop.h"
 #include "server/cluster/raft/storage/folly_io.h"
 #elif defined(__linux__)
 #include "util/fibers/uring_proactor.h"
@@ -125,11 +126,6 @@ class RaftGroup::Impl {
 
   ~Impl() {
     Join();
-#if DFLY_RAFT_USE_FOLLY
-
-    // Join the completion producer before destroying the recipient worker queue.
-    folly_io_.reset();
-#endif
     if (disk_pool_)
       disk_pool_->Stop();
   }
@@ -140,8 +136,7 @@ class RaftGroup::Impl {
 #ifdef __linux__
     if (kind_ == Kind::kData && absl::GetFlag(FLAGS_raft_async_io)) {
 #if DFLY_RAFT_USE_FOLLY
-      folly_io_ = make_unique<FollyIo>();
-      LOG(INFO) << "Raft file I/O: io_uring (Folly)";
+      LOG(INFO) << "Raft group loop and file I/O: io_uring (Folly)";
 #else
       disk_pool_.reset(fb2::Pool::IOUring(256, 1));
       disk_pool_->Run();
@@ -163,6 +158,7 @@ class RaftGroup::Impl {
     stopping_ = true;
     fetch_changed_.notifyAll();
     commit_changed_.notifyAll();
+    WakeData();
   }
 
   void Join() {
@@ -178,6 +174,68 @@ class RaftGroup::Impl {
   optional<int32_t> LeaderEpoch() const {
     const int32_t epoch = leader_epoch_.load(memory_order_acquire);
     return epoch < 0 || stopping_ ? nullopt : optional<int32_t>{epoch};
+  }
+
+  void SetDataDriver(DataDriver driver) {
+    RunOnWorker([&] { data_driver_ = std::move(driver); });
+  }
+
+  void SetApplyLane(ApplyStep step, function<bool()> busy) {
+    RunOnWorker([&] {
+      apply_step_ = std::move(step);
+      apply_busy_ = std::move(busy);
+    });
+  }
+
+  void CompleteApply(function<void()> completion) {
+    worker_.Await([&] {
+      const auto before = CommitState();
+      const auto end = log_->End();
+      completion();
+      if (!log_->AppendPending())
+        Tick();
+      io_changed_.notifyAll();
+      commit_changed_.notifyAll();
+      NotifyProgress(before, end);
+    });
+  }
+
+  void Encode(function<void()> work, function<void()> completion) {
+    CHECK(!encoding_);
+    encoding_ = true;
+    auto done = [this, completion = std::move(completion)] {
+      const auto before = CommitState();
+      const auto end = log_->End();
+      completion();
+      encoding_ = false;
+      io_changed_.notifyAll();
+      commit_changed_.notifyAll();
+      NotifyProgress(before, end);
+    };
+#if DFLY_RAFT_USE_FOLLY
+    worker_.io().Encode(std::move(work), std::move(done));
+#else
+    auto job =
+        make_shared<pair<function<void()>, function<void()>>>(std::move(work), std::move(done));
+    encoder_.Add([this, job] {
+      job->first();
+      worker_.Add([job] { job->second(); });
+    });
+#endif
+  }
+
+  void WakeData() {
+    if (data_wake_queued_.exchange(true, memory_order_acq_rel))
+      return;
+    if (!worker_.GetQueue(0)->TryAdd([this] {
+          data_wake_queued_.store(false, memory_order_release);
+          const auto before = CommitState();
+          const auto end = log_->End();
+          if (!log_->AppendPending())
+            Tick();
+          NotifyProgress(before, end);
+        }))
+      data_wake_queued_.store(false, memory_order_release);
   }
 
   absl::Status Visit(Operation operation, IoAccess access = IoAccess::kIdle) {
@@ -208,7 +266,7 @@ class RaftGroup::Impl {
   }
 
  private:
-  auto CommitState() const {
+  tuple<QuorumRole, int32_t, optional<int64_t>, bool> CommitState() const {
     const auto& state = campaign_.state();
     return tuple{state.role, state.election.epoch, replication_.HighWatermark(), failed_};
   }
@@ -222,8 +280,12 @@ class RaftGroup::Impl {
       auto key = io_changed_.prepareWait();
       bool ran = worker_.Await([&] {
         if ((log_->AppendPending() && access != IoAccess::kFetch) ||
-            (log_->FlushPending() && access == IoAccess::kIdle) || !ready())
+            ((log_->FlushPending() || encoding_ || (apply_busy_ && apply_busy_())) &&
+             access == IoAccess::kIdle) ||
+            !ready()) {
+          NotifyProgress(CommitState(), log_->End());
           return false;
+        }
         const auto commit = CommitState();
         const auto end = log_->End();
         result.Apply(operation);
@@ -238,6 +300,18 @@ class RaftGroup::Impl {
   }
 
   template <typename Commit> void NotifyProgress(const Commit& before, LogPosition end) {
+    auto next_deadline = data_driver_
+                             ? data_driver_({campaign_, replication_, *log_}, failed_ || stopping_)
+                             : nullopt;
+#if DFLY_RAFT_USE_FOLLY
+    if (next_deadline != data_deadline_) {
+      data_deadline_ = next_deadline;
+      worker_.io().SetDeadline(next_deadline, [this] {
+        data_deadline_.reset();
+        NotifyProgress(CommitState(), log_->End());
+      });
+    }
+#endif
     const auto& state = campaign_.state();
     const int32_t leader_epoch =
         !failed_ && state.role == QuorumRole::kLeader ? state.election.epoch : -1;
@@ -290,11 +364,10 @@ class RaftGroup::Impl {
   void SubmitIO(int fd, int64_t offset, string_view bytes, PartitionLog::IoCallback done) {
 #if DFLY_RAFT_USE_FOLLY
 
-    // Folly retries a full queue in its own event loop; no network proactor or fiber is involved.
-    auto completion = make_shared<PartitionLog::IoCallback>(std::move(done));
-    folly_io_->Submit(fd, offset, bytes, [this, completion](int result) {
-      return worker_.GetQueue(0)->TryAdd(
-          [this, completion, result] { CompleteIO(*completion, result); });
+    // The CQE is already on the serial group owner; no worker queue or epoll bridge is needed.
+    worker_.io().Submit(fd, offset, bytes, [this, done = std::move(done)](int result) {
+      CompleteIO(done, result);
+      return true;
     });
 #else
     auto* proactor = static_cast<fb2::UringProactor*>(disk_pool_->at(0));
@@ -410,6 +483,13 @@ class RaftGroup::Impl {
   }
 
   absl::Status Apply() {
+    if (auto hw = replication_.HighWatermark(); hw && apply_step_) {
+      auto result = apply_step_(*log_, *hw);
+      if (!result.ok())
+        return result.status();
+      applied_ = *result;
+      return absl::OkStatus();
+    }
     if (auto hw = replication_.HighWatermark(); hw && apply_ && *hw != applied_) {
       if (auto s = apply_(*log_, *hw); !s.ok())
         return s;
@@ -555,7 +635,11 @@ class RaftGroup::Impl {
               campaign_.state().election.leader_id != leader)
             return nullopt;
           const auto max_bytes = kind_ == Kind::kData ? kMaxDataFetchBytes : kMaxFetchBytes;
-          return replication_.PrepareFetch(leader, version, 100, max_bytes);
+
+          // Advertise receipt while the lane works, but do not park an obsolete applied offset
+          // in a long poll. An empty immediate response waits for the local batch event below.
+          const auto max_wait = apply_busy_ && apply_busy_() ? 0 : 100;
+          return replication_.PrepareFetch(leader, version, max_wait, max_bytes);
         },
         IoAccess::kData);
     if (!fetch)
@@ -565,7 +649,9 @@ class RaftGroup::Impl {
     if (peer.Call(fetch->request, version, &response))
       return false;
     const bool waited = steady_clock::now() - start >= milliseconds(fetch->request.max_wait_ms);
-    return RunOnWorker(
+    auto applied = commit_changed_.prepareWait();
+    bool await_apply = false;
+    const bool progressed = RunOnWorker(
         [&] {
           if (!active)
             return false;
@@ -588,6 +674,8 @@ class RaftGroup::Impl {
           if (!reset)
             return false;
           ResetDeadline(NowMs());
+          await_apply =
+              idle_response && fetch->request.max_wait_ms == 0 && apply_busy_ && apply_busy_();
           if (log_->End() != end || replication_.HighWatermark() != hw ||
               replication_.RequestedSnapshot())
             return true;
@@ -600,6 +688,11 @@ class RaftGroup::Impl {
           return !log_->FlushPending() ||
                  replication_.CanReceiveDuringFlush(leader, fetch->sequence, response);
         });
+    if (await_apply) {
+      commit_changed_.wait_until(applied.epoch(),
+                                 steady_clock::now() + milliseconds(kRequestTimeoutMs));
+    }
+    return progressed;
   }
 
   void Discover(PeerConnection& peer, const CampaignVoter& voter, const atomic_bool& active) {
@@ -672,17 +765,25 @@ class RaftGroup::Impl {
   const Kind kind_;
   const bool observer_;
   ApplyCommitted apply_;
+  ApplyStep apply_step_;
+  function<bool()> apply_busy_;
+  DataDriver data_driver_;
+  atomic_bool data_wake_queued_{false};
+  optional<steady_clock::time_point> data_deadline_;
+  bool encoding_ = false;
   fb2::EventCount fetch_changed_;
   fb2::EventCount commit_changed_;
   fb2::EventCount io_changed_;
   PartitionLog::AsyncIO async_io_;
   unique_ptr<fb2::Pool> disk_pool_;
-#if DFLY_RAFT_USE_FOLLY
-  unique_ptr<FollyIo> folly_io_;
-#endif
   int64_t applied_ = -1;
   map<int32_t, int64_t> discovery_after_;
+#if DFLY_RAFT_USE_FOLLY
+  GroupLoop worker_;
+#else
   fb2::FiberQueueThreadPool worker_{1};
+  fb2::FiberQueueThreadPool encoder_{1};
+#endif
   absl::BitGen random_;
   int64_t deadline_ = 0;
   QuorumRole role_ = QuorumRole::kUnattached;
@@ -902,6 +1003,26 @@ absl::Status RaftGroup::Visit(Operation operation) {
 
 optional<int32_t> RaftGroup::LeaderEpoch() const {
   return impl_->LeaderEpoch();
+}
+
+void RaftGroup::SetDataDriver(DataDriver driver) {
+  impl_->SetDataDriver(std::move(driver));
+}
+
+void RaftGroup::WakeData() {
+  impl_->WakeData();
+}
+
+void RaftGroup::SetApplyLane(ApplyStep step, function<bool()> busy) {
+  impl_->SetApplyLane(std::move(step), std::move(busy));
+}
+
+void RaftGroup::CompleteApply(function<void()> completion) {
+  impl_->CompleteApply(std::move(completion));
+}
+
+void RaftGroup::Encode(function<void()> work, function<void()> completion) {
+  impl_->Encode(std::move(work), std::move(completion));
 }
 
 absl::Status RaftGroup::VisitUntil(steady_clock::time_point deadline,

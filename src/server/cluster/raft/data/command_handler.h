@@ -6,6 +6,8 @@
 
 #include <absl/status/statusor.h>
 
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,6 +15,7 @@
 #include <vector>
 
 #include "common/backed_args.h"
+#include "facade/reply_progress.h"
 #include "server/cluster/cluster_defs.h"
 #include "server/cluster/raft/data/write_position.h"
 #include "server/common_types.h"
@@ -44,13 +47,16 @@ struct DataReplicationState {
   ClusterNodeInfo leader;
   std::vector<DataReplicaStatus> replicas;
   bool connected_to_leader = false;
+
+  // Wait for a change since this snapshot. The owner and its generation remain alive in the
+  // callback; progress arriving between the snapshot and the wait must not be missed.
+  std::function<void(std::chrono::steady_clock::time_point)> await_change{};
 };
 
-// Owns completion independently of the connection. Published by ready reaching zero only after
-// majority durability and local application (or failure); position also fences unknown outcomes.
-struct PendingDataWrite {
+// A bounded record, independently owned by execution and the connection. Read status and position
+// only after IsReady(); a group watermark authorizes success, terminal errors fence late progress.
+struct PendingDataWrite : facade::ReplyProgress {
   virtual ~PendingDataWrite() = default;
-  util::fb2::EmbeddedBlockingCounter ready{1};
   absl::Status status;
   DataWritePosition position;
 };

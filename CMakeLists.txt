@@ -95,7 +95,7 @@ option(DF_USE_SSL "Provide support for SSL connections" ON)
 
 find_package(OpenSSL)
 
-option(WITH_RAFT_FOLLY "Use Folly for Raft io_uring file operations" OFF)
+option(WITH_RAFT_FOLLY "Use Folly for the Raft group loop, io_uring files and node RPC" OFF)
 set(RAFT_FOLLY_SOURCE_DIR "" CACHE PATH "Optional Folly source tree for the Raft I/O build")
 if(WITH_RAFT_FOLLY)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")

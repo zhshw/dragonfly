@@ -370,6 +370,50 @@ TEST_F(SetEffectTest, SharedCacheRejectsExcessCapacityAndInvalidRangesWithoutLos
   EXPECT_EQ(seen, 1u);
 }
 
+TEST_F(SetEffectTest, DetachedApplyPinsDataAndPublishesOnlyTheCompletedPrefix) {
+  CommittedEffects state(10);
+  auto first = MakeSetEffectBatch(0, 3, 10, first_).value();
+  ASSERT_TRUE(log_->Append(first, 3).ok());
+  const size_t key_offset = first.size() - 1 - first_.key.size() - first_.value.size();
+  auto buffer = make_shared<const string>(std::move(first));
+  weak_ptr<const string> lifetime = buffer;
+  state.RememberAppended({3, 1}, buffer->size(), first_, buffer, key_offset);
+  buffer.reset();
+  auto batch = state.PrepareApply(*log_, 1).value();
+  ASSERT_NE(batch, nullptr);
+  EXPECT_EQ(batch->size(), 1u);
+  EXPECT_EQ(state.applied_offset(), 0);
+  EXPECT_FALSE(lifetime.expired());
+  EXPECT_EQ(batch->View(0).value, first_.value);
+
+  // Fetch may append/cache the next prefix while the engine owns this batch.
+  ASSERT_TRUE(Append(first_).ok());
+  state.RememberAppended({3, 2}, 128, first_);
+  EXPECT_FALSE(state.PrepareApply(*log_, 2).ok());
+  EXPECT_FALSE(state.FinishApply(*batch, 2).ok());
+  ASSERT_TRUE(state.FinishApply(*batch, 1).ok());
+  EXPECT_EQ(state.applied_offset(), 1);
+  EXPECT_FALSE(state.FinishApply(*batch, 1).ok());
+  batch.reset();
+  EXPECT_TRUE(lifetime.expired());
+  batch = state.PrepareApply(*log_, 2).value();
+  ASSERT_NE(batch, nullptr);
+  ASSERT_TRUE(state.FinishApply(*batch, 0).ok());
+  EXPECT_EQ(state.applied_offset(), 1);
+
+  // An application error leaves the uncompleted tail for recovery from WAL.
+  size_t replayed = 0;
+  ASSERT_TRUE(state
+                  .ApplyTo(*log_, 2,
+                           [&](const SetEffect&) {
+                             ++replayed;
+                             return absl::OkStatus();
+                           })
+                  .ok());
+  EXPECT_EQ(replayed, 1u);
+  EXPECT_EQ(state.applied_offset(), 2);
+}
+
 TEST_F(SetEffectTest, FollowerSharesValidatedBufferAcrossCommitAndNoopBoundaries) {
   const array<int32_t, 1> voters{1};
   string bytes = MakeLeaderChangeBatch(0, 3, 1, 1, voters, voters).value();

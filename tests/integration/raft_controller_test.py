@@ -187,7 +187,7 @@ class ControllerProcessTest(unittest.TestCase):
             f"--raft_quorum_voters={self.voters}",
             f"--dir={self.root / str(node)}",
             *getattr(self, "bootstrap_flags", []),
-            "--force_epoll",
+            "--force_epoll=false",
             "--proactor_threads=1",
             "--port=0",
             "--logtostderr",

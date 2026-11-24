@@ -95,11 +95,14 @@ set(DFLY_RAFT_USE_FOLLY ${WITH_RAFT_FOLLY})
 configure_file(storage/io_config.h.in generated/raft_io_config.h)
 target_include_directories(dfly_raft_transport PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 if(WITH_RAFT_FOLLY)
-  add_library(dfly_raft_folly storage/folly_io.cc)
+  add_library(dfly_raft_folly storage/folly_io.cc transport/folly_rpc.cc)
   target_compile_features(dfly_raft_folly PUBLIC cxx_std_20)
   if(TARGET Folly::folly_io_async_io_uring_backend)
     target_link_libraries(dfly_raft_folly PRIVATE Folly::folly_io_async_io_uring_backend
-                          Folly::folly_io_async_scoped_event_base_thread)
+                          Folly::folly_io_async_scoped_event_base_thread
+                          Folly::folly_io_async_async_io_uring_socket
+                          Folly::folly_io_async_server_socket
+                          Folly::folly_executors_cpu_thread_pool_executor)
     set(raft_folly_test_lib Folly::folly_synchronization_baton)
   else()
     target_link_libraries(dfly_raft_folly PRIVATE Folly::folly)
@@ -112,3 +115,4 @@ if (DF_USE_SSL)
   target_compile_definitions(dfly_raft_transport PRIVATE DFLY_USE_SSL)
 endif()
 helio_cxx_test(transport/raft_listener_test dfly_raft_transport LABELS DFLY)
+target_include_directories(raft_listener_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)

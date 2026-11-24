@@ -127,6 +127,11 @@ class RaftDataGroupFixture(unittest.TestCase):
         for node in self.raft:
             if node != self.new_controller:
                 self.start(node)
+        for node in self.resp:
+            with self.client(node) as client:
+                self.wait_for(client.ping)
+                self.assertEqual(client.info("server")["multiplexing_api"], "iouring")
+        print(f"Client I/O backend verified: iouring ({len(self.resp)} nodes)", flush=True)
 
     def start(self, node):
         voters = self.voters
@@ -138,7 +143,7 @@ class RaftDataGroupFixture(unittest.TestCase):
             "--cluster_mode=raft",
             f"--raft_cluster_id={self.cluster_id}",
             f"--raft_quorum_voters={voters}",
-            "--force_epoll",
+            "--force_epoll=false",
             f"--proactor_threads={self.data_threads if node in self.resp else 1}",
             "--logtostderr",
         ]
@@ -441,6 +446,7 @@ class RaftPipelineTest(RaftDataGroupFixture):
         )
         self.addCleanup(client.close)
         client.ping()
+        self.assertEqual(client.info("server")["multiplexing_api"], "iouring")
         return client, key, by_port[master[1]], by_port[follower[1]]
 
     def test_pipeline_admits_before_majority_and_survives_disconnect(self):

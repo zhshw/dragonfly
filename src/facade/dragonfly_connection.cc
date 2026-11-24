@@ -2172,7 +2172,7 @@ void Connection::DrainConnectionQueues() {
 
     // Wait for the in-flight async commands processing by consumer to finish before recycling.
     if (curr->IsDeferredReply() && !curr->CanReply()) {
-      curr->Blocker()->Wait();
+      curr->WaitReply();
     }
 
     ReleaseParsedCommand(curr);
@@ -3625,7 +3625,7 @@ void Connection::DestroyParsedQueue() {
     // Being able to drop an in-flight transaction would require it keeping no pointers
     // at all to any context data - too costly for now! (maybe let it own the arguments?)
     if (cmd->IsDeferredReply() && !cmd->CanReply())
-      cmd->Blocker()->Wait();  // explicitly wait for it to finish
+      cmd->WaitReply();  // explicitly wait for it to finish
     ReleaseParsedCommand(cmd);
   }
 
@@ -4471,7 +4471,7 @@ auto Connection::IoLoopV2() -> IoLoopResult {
 }
 
 Connection::WaitEvent::WaitEvent(ParsedCommand* cmd, util::fb2::detail::Waiter* w)
-    : key(cmd->Blocker()->OnCompletion(w)) {
+    : key(cmd->SubscribeReply(w)) {
 }
 
 void ResetStats() {

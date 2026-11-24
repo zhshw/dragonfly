@@ -112,8 +112,25 @@ void ParsedCommand::Resolve(payload::Payload&& pl) {
 bool ParsedCommand::CanReply() const {
   DCHECK(is_deferred_reply_);
   dfly::Overloaded ov{[](const payload::Payload& pl) { return pl.index() > 0 /* not monostate */; },
-                      [](const SuspendedCommand& task) { return task.blocker->IsCompleted(); }};
+                      [](const SuspendedCommand& task) {
+                        return task.progress ? task.progress->IsReady()
+                                             : task.blocker->IsCompleted();
+                      }};
   return std::visit(ov, reply_);
+}
+
+void ParsedCommand::WaitReply() {
+  auto& task = std::get<SuspendedCommand>(reply_);
+  if (task.progress)
+    task.progress->Wait();
+  else
+    task.blocker->Wait();
+}
+
+std::optional<util::fb2::EventCount::SubKey> ParsedCommand::SubscribeReply(
+    util::fb2::detail::Waiter* waiter) {
+  auto& task = std::get<SuspendedCommand>(reply_);
+  return task.progress ? task.progress->Subscribe(waiter) : task.blocker->OnCompletion(waiter);
 }
 
 void ParsedCommand::SendReply() {

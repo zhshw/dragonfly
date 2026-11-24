@@ -17,6 +17,7 @@
 #include "server/cluster/raft/data/kv_rdb.h"
 #include "server/cluster/raft/data/set_effect.h"
 #include "server/cluster/raft/data/set_executor.h"
+#include "server/cluster/raft/data/write_progress.h"
 #include "server/cluster/raft/metadata/metadata_image.h"
 #include "server/cluster/raft/quorum/fetch_replication.h"
 #include "server/cluster/raft/runtime/data_snapshot.h"
@@ -54,6 +55,8 @@ absl::Status ClusterDown() {
   return absl::UnavailableError("-CLUSTERDOWN Data group unavailable");
 }
 
+struct AsyncPendingSet;
+
 struct PendingSet {
   DbIndex db;
   SlotId slot;
@@ -67,7 +70,9 @@ struct PendingSet {
   size_t encoded_bytes = 0;
   size_t key_offset = 0;
   LogPosition end{};
-  fb2::EmbeddedBlockingCounter appended{1};
+  fb2::EmbeddedBlockingCounter* appended = nullptr;
+  AsyncPendingSet* async = nullptr;
+  const steady_clock::time_point deadline = steady_clock::now() + seconds(5);
 };
 
 struct SetBatch {
@@ -75,6 +80,11 @@ struct SetBatch {
   size_t value_bytes = 0;
   size_t byte_budget = SIZE_MAX;
   absl::Status status;
+  bool encoding = false;
+  absl::Status encode_status;
+  shared_ptr<const string> encoded;
+  LogPosition base{};
+  uint64_t generation = 0;
   fb2::EmbeddedBlockingCounter appended{1};
 };
 
@@ -94,9 +104,10 @@ struct LocalPartition {
   deque<PendingSet*> ready_sets;
   size_t queued_bytes = 0;
   size_t queued_requests = 0;
-  bool draining = false;
-  size_t drainers = 0;
-  size_t set_waiters = 0;
+  SetBatch active_batch;
+  deque<shared_ptr<AsyncPendingSet>> pending_writes;
+  atomic<shared_ptr<WriteEpoch>> reply_epoch;
+  base::mpmc_bounded_queue<shared_ptr<AsyncPendingSet>> admissions{256};
 
   // Reservations include completed writes until their ordered replies release the ticket.
   atomic_size_t async_bytes{0};
@@ -106,21 +117,29 @@ struct LocalPartition {
   CommittedEffects effects;
   DataSnapshotter snapshots;
 
-  // The group worker applies one committed effect at a time on the owner proactor.
+  // One persistent apply lane executes committed batches on the owner proactor.
   // Keeping its executor lets journal replay activate each DB once across all shards.
   JournalExecutor apply_executor;
+  fb2::FiberQueue apply_queue{8};
+  fb2::Fiber apply_fiber;
+  shared_ptr<CommittedEffects::ApplyBatch> applying;
+  absl::Status apply_status;
   DataApplyProgress progress;
+  atomic_uint64_t replica_version{0};
+  fb2::EventCount replica_changed;
   unique_ptr<RaftGroup> raft;
   unique_ptr<SlotMigrationDriver> migrations;
   RpcHandlers handlers;
 };
 
-struct AsyncPendingSet final : PendingDataWrite {
+struct AsyncPendingSet final : WatermarkWrite {
   AsyncPendingSet(shared_ptr<LocalPartition> local, DbIndex db, string_view key, string_view value,
-                  int32_t epoch, cmn::BackedArguments* owned_args)
-      : local(std::move(local)),
+                  shared_ptr<WriteEpoch> epoch, cmn::BackedArguments* owned_args)
+      : WatermarkWrite(epoch),
+        local(std::move(local)),
         reserved_bytes(key.size() + value.size()),
-        proposal{db, KeySlot(key), {}, {}, nullopt, epoch} {
+        proposal{db, KeySlot(key), {}, {}, nullopt, epoch->epoch} {
+    proposal.async = this;
     if (owned_args) {
       input.SwapArgs(*owned_args);
       proposal.key = input[1];
@@ -136,6 +155,7 @@ struct AsyncPendingSet final : PendingDataWrite {
   ~AsyncPendingSet() override {
     local->async_bytes.fetch_sub(reserved_bytes);
     local->async_requests.fetch_sub(1);
+    local->queue_changed.notifyAll();
   }
 
   void ReleaseInput() {
@@ -154,6 +174,7 @@ struct AsyncPendingSet final : PendingDataWrite {
   string key;
   string value;
   PendingSet proposal;
+  bool execution_done = false;
 };
 
 class DataNodeImpl final : public DataNode {
@@ -199,11 +220,12 @@ class DataNodeImpl final : public DataNode {
     handlers.fetch_snapshot = Forward(&RpcHandlers::fetch_snapshot);
     handlers.fetch_slot_image = Forward(&RpcHandlers::fetch_slot_image);
     handlers.describe_quorum = Forward(&RpcHandlers::describe_quorum);
-    auto listener =
-        make_unique<RaftListener>(kMaxRaftFrame, std::move(handlers), [this] { RequestStop(); });
-    if (auto ec = acceptor->AddListener(listen_.host.c_str(), listen_.port, listener.get()); ec)
+    rpc_server_ =
+        make_unique<RaftServer>(kMaxRaftFrame, std::move(handlers), [this] { RequestStop(); });
+    if (auto ec = rpc_server_->Listen(listen_.host, listen_.port, acceptor); ec)
       return absl::ErrnoToStatus(ec.value(), "Binding data quorum listener");
-    listener.release();
+    acceptor_ = acceptor;
+    acceptor_->TriggerOnBreakSignal([this] { RequestStop(); });
     return absl::OkStatus();
   }
 
@@ -215,6 +237,8 @@ class DataNodeImpl final : public DataNode {
 
   void Stop() override {
     RequestStop();
+    rpc_server_->Stop();
+    acceptor_->TriggerOnBreakSignal({});
     if (control_fiber_.IsJoinable())
       control_fiber_.Join();
     if (migration_fiber_.IsJoinable())
@@ -223,10 +247,10 @@ class DataNodeImpl final : public DataNode {
       snapshot_fiber_.Join();
     if (auto group = partition_.load()) {
       group->raft->Join();
-      group->queue_changed.await([&] {
-        lock_guard lock(group->batch_mu);
-        return group->drainers == 0 && group->set_waiters == 0;
-      });
+      group->raft->SetDataDriver({});
+      group->apply_queue.Shutdown();
+      if (group->apply_fiber.IsJoinable())
+        group->apply_fiber.Join();
     }
     observer_->Join();
   }
@@ -247,8 +271,11 @@ class DataNodeImpl final : public DataNode {
   void RequestStop() {
     stopping_ = true;
     observer_->RequestStop();
-    if (auto group = partition_.load())
+    if (auto group = partition_.load()) {
       group->raft->RequestStop();
+      group->replica_version.fetch_add(1);
+      group->replica_changed.notifyAll();
+    }
   }
 
   template <typename R, typename S>
@@ -265,11 +292,13 @@ class DataNodeImpl final : public DataNode {
   shared_ptr<PendingDataWrite> TrySetImpl(DbIndex db, string_view key, string_view value,
                                           cmn::BackedArguments* owned_args);
   absl::Status QueueSet(shared_ptr<LocalPartition> local, PendingSet* request);
-  void DrainSets(shared_ptr<LocalPartition> local);
+  optional<steady_clock::time_point> PumpSets(LocalPartition& local, RaftGroup::State state,
+                                              bool unavailable);
   absl::Status WaitApplied(shared_ptr<LocalPartition> local, const PendingSet& proposal,
                            steady_clock::time_point deadline, DataWritePosition* position);
   absl::Status AppendSetBatch(LocalPartition& local, SetBatch& batch, RaftGroup::State state,
                               bool* done);
+  absl::Status CommitSetBatch(LocalPartition& local, SetBatch& batch, RaftGroup::State state);
   absl::Status OpenPartition(const MetadataImage& image, const Broker& local);
   void BrokerLoop();
   void MigrationLoop();
@@ -287,6 +316,8 @@ class DataNodeImpl final : public DataNode {
   Uuid incarnation_{};
   MetadataLoader loader_;
   unique_ptr<RaftGroup> observer_;
+  unique_ptr<RaftServer> rpc_server_;
+  util::AcceptServer* acceptor_ = nullptr;
   atomic<shared_ptr<const MetadataImage>> image_;
   atomic<shared_ptr<LocalPartition>> partition_;
   int64_t registered_epoch_ = -1;
@@ -354,6 +385,44 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
     if (!opened.ok())
       return opened.status();
     local->raft = *std::move(opened);
+    local->raft->SetApplyLane(
+        [this, replica = local.get(), apply](const PartitionLog& log,
+                                             int64_t hw) -> absl::StatusOr<int64_t> {
+          if (!replica->apply_status.ok())
+            return replica->apply_status;
+          if (replica->applying || stopping_)
+            return replica->effects.applied_offset();
+          if (replica->effects.applied_offset() >= log.StartOffset() &&
+              replica->effects.applied_offset() <= hw) {
+            auto batch = replica->effects.PrepareApply(log, hw);
+            if (!batch.ok())
+              return batch.status();
+            if (*batch) {
+              replica->applying = *batch;
+              CHECK(replica->apply_queue.TryAdd([replica, batch = *batch] {
+                size_t completed = 0;
+                absl::Status status;
+                for (; completed < batch->size(); ++completed) {
+                  status = ExecuteSetEffect(replica->apply_executor, batch->View(completed));
+                  if (!status.ok())
+                    break;
+                }
+                replica->raft->CompleteApply([replica, batch, completed, status] {
+                  auto finish = replica->effects.FinishApply(*batch, completed);
+                  replica->apply_status = finish.ok() ? status : finish;
+                  replica->applying.reset();
+                });
+              }));
+              return replica->effects.applied_offset();
+            }
+          }
+
+          // Recovery, conditional no-ops and migration records retain their serialized barrier.
+          if (auto s = apply(log, hw); !s.ok())
+            return s;
+          return replica->effects.applied_offset();
+        },
+        [replica = local.get()] { return bool(replica->applying); });
     if (auto s = local->raft->Visit([replica = local.get()](RaftGroup::State state) {
           state.replication.SetDataApplyHooks(
               [replica](auto* p) {
@@ -361,6 +430,8 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
               },
               [replica](ReplicaKey key, const auto& p, int64_t offset, int64_t now) {
                 replica->progress.Observe(key, p, offset, now);
+                replica->replica_version.fetch_add(1);
+                replica->replica_changed.notifyAll();
               });
           state.replication.SetFetchedRecordsHook(
               [replica](const PartitionLog& log, const shared_ptr<const void>& buffer,
@@ -371,6 +442,11 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
         });
         !s.ok())
       return s;
+    local->apply_fiber = owner_->LaunchFiber([local] { local->apply_queue.Run(); });
+    local->raft->SetDataDriver(
+        [this, replica = local.get()](RaftGroup::State state, bool unavailable) {
+          return PumpSets(*replica, state, unavailable);
+        });
     local->handlers = local->raft->Handlers();
     local->migrations = make_unique<SlotMigrationDriver>(
         id, identity_.node_id, identity_.cluster_id, incarnation_, *local->raft, local->effects,
@@ -570,52 +646,42 @@ shared_ptr<PendingDataWrite> DataNodeImpl::TrySetImpl(DbIndex db, string_view ke
   constexpr size_t kQueueBytes = 8U << 20;
   constexpr size_t kQueueRequests = 256;
   const size_t bytes = key.size() + value.size();
-  unique_lock lock(local->batch_mu, try_to_lock);
-  if (!lock.owns_lock() || stopping_)
-    return nullptr;
-  const size_t reserved = local->async_bytes.load();
-  const size_t requests = local->async_requests.load();
-  if ((requests &&
-       (requests >= kQueueRequests || bytes > kQueueBytes - min(kQueueBytes, reserved))) ||
-      (local->queued_requests && (local->queued_requests >= kQueueRequests ||
-                                  bytes > kQueueBytes - min(kQueueBytes, local->queued_bytes))))
-    return nullptr;
-
   auto epoch = local->raft->LeaderEpoch();
   if (!epoch)
     return nullptr;
-  auto request = make_shared<AsyncPendingSet>(local, db, key, value, *epoch, owned_args);
-  local->async_bytes.fetch_add(bytes);
-  local->async_requests.fetch_add(1);
-  local->ready_sets.push_back(&request->proposal);
-  local->queued_bytes += bytes;
-  ++local->queued_requests;
-  ++local->set_waiters;
-  const bool launch = !exchange(local->draining, true);
-  if (launch)
-    ++local->drainers;
-  lock.unlock();
-  const auto deadline = steady_clock::now() + seconds(5);
-
-  // Post locally so admission never yields, even if the owner's dispatch queue is full. The
-  // ticket owns input and completion; this fiber never accesses the command or its connection.
-  fb2::Fiber("raft-set-confirm", [this, local, request, launch, deadline] {
-    if (launch)
-      owner_->Dispatch([this, local] { DrainSets(local); });
-    request->proposal.appended.Wait();
-    request->ReleaseInput();
-    request->status = request->proposal.status;
-    if (request->status.ok())
-      request->status = WaitApplied(local, request->proposal, deadline, &request->position);
-    else if (absl::IsDeadlineExceeded(request->status))
-      request->status = absl::UnavailableError("-TRYAGAIN Data group is catching up");
-    request->ready.Dec();
-    {
-      lock_guard lock(local->batch_mu);
-      --local->set_waiters;
+  const auto count = local->async_requests.fetch_add(1);
+  if (count >= kQueueRequests) {
+    local->async_requests.fetch_sub(1);
+    return nullptr;
+  }
+  auto reserved = local->async_bytes.load();
+  do {
+    if ((reserved || count) && bytes > kQueueBytes - min(kQueueBytes, reserved)) {
+      local->async_requests.fetch_sub(1);
+      return nullptr;
     }
-    local->queue_changed.notifyAll();
-  }).Detach();
+  } while (!local->async_bytes.compare_exchange_weak(reserved, reserved + bytes));
+  auto progress = local->reply_epoch.load();
+  while (!progress || progress->epoch != *epoch) {
+    if (progress && progress->epoch > *epoch) {
+      local->async_bytes.fetch_sub(bytes);
+      local->async_requests.fetch_sub(1);
+      return nullptr;
+    }
+    auto next = make_shared<WriteEpoch>(*epoch);
+    if (local->reply_epoch.compare_exchange_weak(progress, next)) {
+      progress = std::move(next);
+      break;
+    }
+  }
+  auto request = make_shared<AsyncPendingSet>(local, db, key, value, progress, owned_args);
+
+  // The reservation covers every outstanding record, so the admission ring always has a slot.
+  // Input ownership changes only after capacity is reserved, never on a rejected TrySetOwned.
+  CHECK(local->admissions.try_enqueue(request));
+
+  // One bounded record enters the group; no per-command execution context or confirmation task.
+  local->raft->WakeData();
   return request;
 }
 
@@ -645,7 +711,27 @@ absl::StatusOr<bool> DataNodeImpl::ProposeSet(DbIndex db, string_view key, strin
       return route.ok() ? ClusterDown() : route.status();
     });
   }
+  if (!condition && SupportsAsyncSet()) {
+    const auto deadline = steady_clock::now() + seconds(5);
+    while (!stopping_ && steady_clock::now() < deadline) {
+      auto changed = local->queue_changed.prepareWait();
+      if (auto write = TrySet(db, key, value)) {
+        write->Wait();
+        *position = write->position;
+        if (!write->status.ok())
+          return write->status;
+        return true;
+      }
+      if (!local->raft->LeaderEpoch())
+        break;
+      local->queue_changed.wait_until(changed.epoch(), deadline);
+    }
+    return absl::UnavailableError("-TRYAGAIN Data group has no admission capacity");
+  }
+
+  fb2::EmbeddedBlockingCounter appended{1};
   PendingSet proposal{db, slot, key, value, condition, *epoch};
+  proposal.appended = &appended;
   const auto deadline = steady_clock::now() + seconds(5);
   if (absl::GetFlag(FLAGS_raft_drain_writes)) {
     if (auto status = QueueSet(local, &proposal); !status.ok()) {
@@ -730,7 +816,6 @@ absl::Status DataNodeImpl::QueueSet(shared_ptr<LocalPartition> local, PendingSet
   constexpr size_t kQueueBytes = 8U << 20;
   constexpr size_t kQueueRequests = 256;
   const size_t bytes = request->key.size() + request->value.size();
-  bool launch = false;
   while (true) {
     auto key = local->queue_changed.prepareWait();
     {
@@ -747,78 +832,136 @@ absl::Status DataNodeImpl::QueueSet(shared_ptr<LocalPartition> local, PendingSet
         local->ready_sets.push_back(request);
         local->queued_bytes += bytes;
         ++local->queued_requests;
-        launch = !exchange(local->draining, true);
-        if (launch)
-          ++local->drainers;
         break;
       }
     }
     local->queue_changed.wait_until(key.epoch(), steady_clock::now() + milliseconds(100));
   }
-  if (launch)
-    owner_->Dispatch([this, local] { DrainSets(local); });
-  request->appended.Wait();
+  local->raft->WakeData();
+  request->appended->Wait();
   return request->status;
 }
 
-void DataNodeImpl::DrainSets(shared_ptr<LocalPartition> local) {
-  while (true) {
-    SetBatch batch;
-    auto status = local->raft->VisitDataUntil(
-        steady_clock::now() + seconds(5), [&](RaftGroup::State state, bool* done) {
-          if (batch.requests.empty()) {
-            lock_guard lock(local->batch_mu);
-
-            // Amortize barriers under backlog without enlarging sparse client batches.
-            batch.byte_budget = local->queued_bytes >= (4U << 20) ? (4U << 20) : (1U << 20);
-            while (!local->ready_sets.empty() && batch.requests.size() < 32) {
-              auto* next = local->ready_sets.front();
-              const size_t bytes = next->key.size() + next->value.size();
-              if (!batch.requests.empty() &&
-                  (next->condition || next->epoch != batch.requests.front()->epoch ||
-                   batch.value_bytes + bytes > batch.byte_budget))
-                break;
-              batch.requests.push_back(next);
-              batch.value_bytes += bytes;
-              local->ready_sets.pop_front();
-              if (next->condition)
-                break;
-            }
-          }
-          return AppendSetBatch(*local, batch, state, done);
-        });
-    bool again;
-    {
-      lock_guard lock(local->batch_mu);
-
-      // Shutdown or storage failure may prevent VisitUntil from taking any requests.
-      if (batch.requests.empty()) {
-        batch.requests.assign(local->ready_sets.begin(), local->ready_sets.end());
-        local->ready_sets.clear();
-        for (const auto* request : batch.requests)
-          batch.value_bytes += request->key.size() + request->value.size();
-      }
-      local->queued_bytes -= batch.value_bytes;
-      local->queued_requests -= batch.requests.size();
-      again = !local->ready_sets.empty();
-      if (!again)
-        local->draining = false;
+optional<steady_clock::time_point> DataNodeImpl::PumpSets(LocalPartition& local,
+                                                          RaftGroup::State state,
+                                                          bool unavailable) {
+  const auto& election = state.election.state();
+  const auto now = steady_clock::now();
+  vector<shared_ptr<WriteEpoch>> changed;
+  auto remember = [&](const shared_ptr<WriteEpoch>& epoch) {
+    if (find(changed.begin(), changed.end(), epoch) == changed.end())
+      changed.push_back(epoch);
+  };
+  {
+    lock_guard lock(local.batch_mu);
+    shared_ptr<AsyncPendingSet> accepted;
+    while (local.admissions.try_dequeue(accepted)) {
+      local.ready_sets.push_back(&accepted->proposal);
+      local.queued_bytes += accepted->reserved_bytes;
+      ++local.queued_requests;
+      local.pending_writes.push_back(std::move(accepted));
     }
-    local->queue_changed.notifyAll();
-    for (auto* request : batch.requests) {
-      if (request->status.ok() && !status.ok())
-        request->status = status;
-      request->appended.Dec();
-    }
-    if (!again) {
-      {
-        lock_guard lock(local->batch_mu);
-        --local->drainers;
+    auto reply_epoch = local.reply_epoch.load();
+    if (!unavailable && election.role == QuorumRole::kLeader && reply_epoch &&
+        reply_epoch->epoch == election.election.epoch) {
+      const auto r =
+          min({state.log.End().end_offset, state.replication.HighWatermark().value_or(-1),
+               local.effects.applied_offset()});
+      if (r > reply_epoch->reply_offset.load(memory_order_relaxed)) {
+        reply_epoch->reply_offset.store(r, memory_order_release);
+        remember(reply_epoch);
       }
-      local->queue_changed.notifyAll();
-      return;
+    }
+    for (auto it = local.pending_writes.begin(); it != local.pending_writes.end();) {
+      auto& write = **it;
+      if (!write.IsReady() &&
+          (unavailable || election.role != QuorumRole::kLeader ||
+           write.epoch()->epoch != election.election.epoch || now >= write.proposal.deadline)) {
+        write.Reject(absl::UnavailableError("-TRYAGAIN Outcome of Raft write is unknown"));
+        remember(write.epoch());
+      }
+      if (write.execution_done && write.IsReady())
+        it = local.pending_writes.erase(it);
+      else
+        ++it;
     }
   }
+
+  // I/O completions and control events must still be processed when admission is saturated.
+  // At most one bounded batch is prepared per event; remaining input arranges one more wake.
+  if (!state.log.AppendPending() && !local.active_batch.encoding) {
+    auto& batch = local.active_batch;
+    if (batch.requests.empty()) {
+      lock_guard lock(local.batch_mu);
+      batch.byte_budget = local.queued_bytes >= (4U << 20) ? (4U << 20) : (1U << 20);
+      while (!local.ready_sets.empty() && (unavailable || batch.requests.size() < 32)) {
+        auto* next = local.ready_sets.front();
+        const size_t bytes = next->key.size() + next->value.size();
+        if (!unavailable && !batch.requests.empty() &&
+            (next->condition || next->epoch != batch.requests.front()->epoch ||
+             batch.value_bytes + bytes > batch.byte_budget))
+          break;
+        batch.requests.push_back(next);
+        batch.value_bytes += bytes;
+        local.ready_sets.pop_front();
+        if (!unavailable && next->condition)
+          break;
+      }
+    }
+    if (!batch.requests.empty()) {
+      bool done = false;
+      auto status = unavailable ? ClusterDown() : AppendSetBatch(local, batch, state, &done);
+      if (done || !status.ok()) {
+        {
+          lock_guard lock(local.batch_mu);
+          local.queued_bytes -= batch.value_bytes;
+          local.queued_requests -= batch.requests.size();
+        }
+        for (auto* request : batch.requests) {
+          if (request->status.ok() && !status.ok())
+            request->status = status;
+          if (auto* write = request->async) {
+            if (request->status.ok())
+              write->Bind({local.id, request->end.epoch, request->end.end_offset});
+            else
+              write->Reject(request->status);
+            write->ReleaseInput();
+            write->execution_done = true;
+            remember(write->epoch());
+          } else {
+            request->appended->Dec();
+          }
+        }
+        batch.requests.clear();
+        batch.value_bytes = 0;
+        batch.encoded.reset();
+        batch.encode_status = absl::OkStatus();
+        local.queue_changed.notifyAll();
+        local.raft->WakeData();
+      }
+    }
+  }
+  optional<steady_clock::time_point> deadline;
+  {
+    lock_guard lock(local.batch_mu);
+    erase_if(local.pending_writes,
+             [](const auto& write) { return write->execution_done && write->IsReady(); });
+    auto track = [&](steady_clock::time_point value) {
+      if (value > now && (!deadline || value < *deadline))
+        deadline = value;
+    };
+    for (const auto& write : local.pending_writes) {
+      if (!write->IsReady())
+        track(write->proposal.deadline);
+    }
+    for (const auto* request : local.ready_sets)
+      track(request->deadline);
+    for (const auto* request : local.active_batch.requests)
+      track(request->deadline);
+  }
+  for (const auto& epoch : changed)
+    epoch->changed.notifyAll();
+  return deadline;
 }
 
 absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch,
@@ -826,27 +969,53 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
   const auto& election = state.election.state();
   const auto hw = state.replication.HighWatermark();
   const int32_t epoch = election.election.epoch;
+  if (!batch.encode_status.ok())
+    return batch.encode_status;
+  if (batch.encoded) {
+    if (batch.base.epoch != state.log.End().epoch ||
+        batch.base.end_offset != state.log.End().end_offset ||
+        batch.generation != state.log.content_generation()) {
+      batch.encoded.reset();
+      for (auto* request : batch.requests)
+        request->effect.reset();
+      local.raft->WakeData();
+      return absl::OkStatus();
+    }
+    *done = true;
+    return CommitSetBatch(local, batch, state);
+  }
   int64_t offset = state.log.End().end_offset;
   const auto timestamp =
       duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
-  if (state.log.FlushPending() && batch.requests.front()->condition)
+  if (state.log.FlushPending() && batch.requests.front()->condition &&
+      steady_clock::now() < batch.requests.front()->deadline)
     return absl::OkStatus();
   size_t records_size = 0;
   for (size_t i = 0; i < batch.requests.size(); ++i) {
     auto* request = batch.requests[i];
+
+    // A rollover/flush barrier can retry preparation after routing or deadlines have changed.
+    request->effect.reset();
+    if (steady_clock::now() >= request->deadline) {
+      request->status = absl::UnavailableError("-TRYAGAIN Data group is catching up");
+      continue;
+    }
+    if (request->async && request->async->IsReady()) {
+      request->status = request->async->status;
+      continue;
+    }
     auto route = Route(request->slot, &local);
     if (!route.ok()) {
       request->status = route.status();
       continue;
     }
-    if (stopping_ || election.role != QuorumRole::kLeader || request->epoch != epoch || !hw ||
-        local.effects.applied_offset() < *hw) {
+    if (stopping_ || election.role != QuorumRole::kLeader || request->epoch != epoch || !hw) {
       request->status = ClusterDown();
       continue;
     }
     if (request->condition) {
       DCHECK_EQ(batch.requests.size(), 1u);
-      if (local.effects.applied_offset() != offset)
+      if (local.effects.applied_offset() != offset || local.effects.applied_offset() < *hw)
         return absl::OkStatus();
       auto exists = owner_->Await([&] {
         JournalExecutor executor(service_);
@@ -892,18 +1061,53 @@ absl::Status DataNodeImpl::AppendSetBatch(LocalPartition& local, SetBatch& batch
   *done = true;
   if (records_size == 0)
     return absl::OkStatus();
-  string records;
-  records.reserve(records_size);
-  for (auto* request : batch.requests) {
-    if (request->effect) {
-      auto s = AppendSetEffectBatch(request->end.end_offset - 1, epoch, timestamp, *request->effect,
-                                    &records, &request->key_offset);
-      if (!s.ok())
-        return s;
+  batch.base = state.log.End();
+  batch.generation = state.log.content_generation();
+  auto encode = [&batch, epoch, timestamp, records_size] {
+    string records;
+    records.reserve(records_size);
+    for (auto* request : batch.requests) {
+      if (request->effect) {
+        auto s = AppendSetEffectBatch(request->end.end_offset - 1, epoch, timestamp,
+                                      *request->effect, &records, &request->key_offset);
+        if (!s.ok()) {
+          batch.encode_status = s;
+          return;
+        }
+      }
     }
+    batch.encoded = make_shared<const string>(std::move(records));
+  };
+  if (&batch == &local.active_batch) {
+    *done = false;
+    batch.encoding = true;
+    local.raft->Encode(std::move(encode), [&batch] { batch.encoding = false; });
+    return absl::OkStatus();
+  }
+  encode();
+  if (!batch.encode_status.ok())
+    return batch.encode_status;
+  return CommitSetBatch(local, batch, state);
+}
+
+absl::Status DataNodeImpl::CommitSetBatch(LocalPartition& local, SetBatch& batch,
+                                          RaftGroup::State state) {
+  const auto& election = state.election.state();
+  const auto epoch = election.election.epoch;
+  for (const auto* request : batch.requests) {
+    if (!request->effect)
+      continue;
+    if (election.role != QuorumRole::kLeader || request->epoch != epoch || stopping_ ||
+        steady_clock::now() >= request->deadline)
+      return ClusterDown();
+    auto route = Route(request->slot, &local);
+    if (!route.ok())
+      return route.status();
+    if (route->owner.generation != request->effect->generation)
+      return ClusterDown();
   }
   bool may_have_appended = false;
-  auto buffer = make_shared<const string>(std::move(records));
+  auto buffer = batch.encoded;
   auto status = state.replication.Append(buffer, epoch, &may_have_appended);
   if (!status.ok()) {
     if (may_have_appended)
@@ -924,6 +1128,11 @@ absl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState() {
   if (!local || !image || stopping_)
     return ClusterDown();
   DataReplicationState result{};
+  const auto version = local->replica_version.load();
+  result.await_change = [local, version](steady_clock::time_point deadline) {
+    local->replica_changed.await_until([&] { return local->replica_version.load() != version; },
+                                       deadline);
+  };
   auto status = local->raft->Visit([&](RaftGroup::State s) {
     const auto& state = s.election.state();
     if (!state.election.leader_id ||

@@ -110,7 +110,7 @@ class AsyncReplicationFixture(RaftDataGroupFixture):
             f"--bind={HOST}",
             f"--dir={self.root / str(node)}",
             "--dbfilename=",
-            "--force_epoll",
+            "--force_epoll=false",
             "--logtostderr",
         ]
         with (self.root / f"{node}.log").open("ab") as log:
@@ -121,6 +121,7 @@ class AsyncReplicationFixture(RaftDataGroupFixture):
         self.addCleanup(self.stop, node)
         with self.client(node) as client:
             self.wait_for(client.ping)
+            self.assertEqual(client.info("server")["multiplexing_api"], "iouring")
             self.assertEqual(client.execute_command("DFLYCLUSTER", "CONFIG", self.config), b"OK")
             if node in self.upstream:
                 result = client.execute_command("REPLICAOF", HOST, self.resp[self.upstream[node]])

@@ -4144,7 +4144,10 @@ void ServerFamily::Wait(facade::CmdArgParser parser, CommandContext* cmd_cntx) {
           now >= deadline || context->conn_closing ||
           ServerState::tlocal()->gstate() != GlobalState::ACTIVE)
         return rb->SendLong(count);
-      ThisFiber::SleepUntil(min(deadline, now + 100ms));
+      if (state->await_change)
+        state->await_change(min(deadline, now + 100ms));
+      else
+        ThisFiber::SleepUntil(min(deadline, now + 100ms));
     }
   }
 

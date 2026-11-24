@@ -9,11 +9,11 @@
 | 平台记录 | 吞吐（MiB/s） | 批次 P95（ms） |
 | --- | ---: | ---: |
 | 基线 v3 | 169.56 | 113.75 |
-| 上一轮 v10（P1-6） | 460.88 | 44.01 |
-| 本轮 v13（P1-7） | **486.54** | **45.25** |
+| 上一轮 v13（P1-7） | 486.54 | 45.25 |
+| 本轮 v14b（Folly io_uring 首版修正） | **499.85** | **38.21** |
 | 对比参照 `v10:cluster` | 605.47 | 34.63 |
 
-v13 较 v3 累计吞吐 **+186.9%**，达到原 cluster 参照的 **80.4%**。较 v10 归档吞吐中位数 **+5.6%**、算术均值 **+5.2%**，批次 P95 中位数 **+2.8%**，尾延迟未改善。v11/v12 代码未合入，本轮是对 v10 的独立增量；三轮跨轮对照不代表所有负载。 [v13 平台总览](http://127.0.0.1:8787/#/v13/overview)
+v14b 较 v3 累计吞吐 **+194.8%**，达到原 cluster 参照的 **82.6%**。较 v13 吞吐中位数 **+2.7%**、算术均值 **+6.6%**，批次 P95 中位数 **−15.6%**。v14b 延续 v14 的 Folly io_uring 批次事件循环架构，仅修复首版的 applied 上报和 WAIT 唤醒 bug；上一轮明确选择 **v13**，v14 保留首版记录。相较 v13，测试网络后端同时从 epoll 改为 io_uring，不能拆分归因。**Leader 峰值 RSS 从 424.54 升至 668.01 MiB，内存仍需优化。** [v14b 平台](http://127.0.0.1:8787/#/v14b/overview) · [实验结论](profile/v14b-batch-progress.md)
 
 ## 使用 profile
 
@@ -23,12 +23,12 @@ v13 较 v3 累计吞吐 **+186.9%**，达到原 cluster 参照的 **80.4%**。�
 
 ### 用 CLI 运行 benchmark
 
-创建新实验 `v14`，选 v13 为上一轮，并沿用其基线与对比参照。
+创建新实验 `v15`，选 v14b 为上一轮，并沿用其基线与对比参照。
 
 ```sh
-profile create -id v14 -title '本轮优化' -previous v13
-profile run -id v14
-profile show -id v14
+profile create -id v15 -title '本轮优化' -previous v14b
+profile run -id v15
+profile show -id v15
 ```
 
 `run` 等待本轮 benchmark 和诊断结果入库，`show` 查看三轮正式数据。需要独立测量时，在执行机用 `profile run -config FILE`，配置中的 `output` 指向新目录。 [CLI 参数](../../tools/profile/README.md#cli)
@@ -60,15 +60,16 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 | 接收 | RESP 参数 → SET 执行 | RESP 参数 → 异步票据 → 排队 |
 | 复制准备 | shard journal 编码并流式发送 | effect → Kafka batch → drain 聚合 → WAL 缓冲 |
 | 确认 | 本地 SET 回复，WAIT 追踪副本应用 | WAL 接收 → follower Fetch → HW → 本地应用 → SET 回复 |
-| 应用 | replica flow 消费 journal 并执行 | 组 worker → owner 批量 → 命令分发 → shard |
+| 应用 | replica flow 消费 journal 并执行 | GroupLoop → 独立 ApplyLane → 命令分发 → shard |
 | 重放数据 | 接收的 journal 数据 | 普通 effect 复用不可变 WAL 缓冲，缺口从 WAL 重放 |
 
 两套集群设计独立。Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责。
 
 ## 下一轮优先项
 
-1. **P0-2 评估 shard 内合批。** v13 Leader worker 排队区间并集为 **263.28 ms**，apply 为 **159.61 ms**，两者会重叠。owner 已经批量接收，批内仍逐笔走 `ExecuteSetEffect` 和 shard 调度。先验证减少逐笔调度能否缩短 apply 和 worker 排队。 [v13 Trace](http://127.0.0.1:8787/#/v13/trace)
-2. **Leader 分散发送复试前先查慢轮。** v12 吞吐中位数 **+0.7%**，第二轮明显偏慢，稳定收益尚未确认，代码暂回退。Follower 借用解码已在 v13 实现，吞吐 **+5.6%**，P95 未改善；继续减少复制不能替代对排队和合批节奏的分析。 [v12 实验](profile/v12-fetch-scatter.md) · [v13 实验](profile/v13-fetch-borrow.md)
+1. **先做 shard 合批，减少逐笔跨线程投递与等待。** v14b ApplyLane 内仍逐笔同步分发 SET；参考原 cluster 按 shard 分组、一次投递并复用本地事务的方式，补充 shard 排队、执行和投递次数。当前 **86.53 ms** 应用区间包含实际写入及等待，不能全部当作可节省时间。 [v14b 源码对照与计划](profile/v14b-batch-progress.md#下一步批次传递到-shard)
+2. **配合调整应用批次预算，再查 WAL batch。** 1 MiB 上限使当前 256 KiB/value 的应用批次最多装 3 条；WAL 提交也从 **176 增到 257 批**。记录批次笔数、字节数、就绪数量与截断原因。历史失败结论继续保留，避免重复试验。 [v11 复用编码](profile/v11-leader-wal-append.md)
+3. **同步约束内存增量。** v14b Leader 峰值 RSS 较 v13 增加 **243.47 MiB**。检查编码/WAL 缓冲跨线程释放、分配器保留页及 Folly 每 peer loop/接收缓冲，用分配证据区分来源。当前吞吐有收益，尚未兑现内存优化。 [v14b 诊断](profile/v14b-batch-progress.md)
 
 ## 优化项与当前状态
 
@@ -83,25 +84,27 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 
 <a id="follower-receipt-progress"></a>
 
-### P0-1b follower 接收确认快路径（已回退）
+### P0-1b follower 接收确认快路径
 
-提前 Fetch 缩短了接收到发出下一次请求的等待，正式吞吐和 P95 未获益。普通追加完成后，下一次 Fetch 仍经过 group worker 串行应用。独立、有界且按顺序推进 applied 的异步应用队列待验证，需覆盖换主、控制记录、截断、快照、迁移和存储失败。 [提前 Fetch 实验](profile/p0-1b-follower-receipt.md)
+早期仅提前 Fetch 的试验未获吞吐和 P95 收益，已经回退。v14b 在新结构中使用独立、有界的 ApplyLane，普通应用在途时继续报告接收位置；遇到空响应等待本地批次事件，再报告 applied，避免旧水位被长轮询扣留。它与共享回复水位、Folly RPC 一起测量，不能单独归因。 [早期试验](profile/p0-1b-follower-receipt.md) · [v14b](profile/v14b-batch-progress.md)
 
 ### P0-2 批量应用与借用 SET 参数
 
-已实现最多 32 笔 / 1 MiB 的 owner 批量投递，按 1 ms 预算返回已完成前缀，SET 同步借用 key/value。下一步评估 shard 内合批，减少逐笔分发和跨线程等待。验证需覆盖 DbSlice 与事务行为、同 key 顺序、控制记录、迁移与快照边界，以及部分失败时连续 applied 前缀。 [v5 批量应用](profile/v5-batched-apply.md)
+v5 实现最多 32 笔 / 1 MiB 的 owner 批量投递和借用 key/value；v14b 将普通缓存前缀交给独立 ApplyLane，完成事件只发布实际成功前缀。下一步评估 shard 内合批，减少逐笔分发和跨线程等待。验证需覆盖 DbSlice 与事务行为、同 key 顺序、控制记录、迁移与快照边界及部分失败。 [v5](profile/v5-batched-apply.md) · [v14b](profile/v14b-batch-progress.md)
+
+v13 的 owner 排队仅 **10.41 ms**；owner 批内执行 **138.23 ms**，其中逐笔 `journal.apply` 为 **137.53 ms**。进一步合批应针对 SET 内的 shard 投递与等待，先区分其与实际写入的耗时，不能把整个 apply 或 worker 排队作为可节省预算。 [v13 复核](profile/v13-fetch-borrow.md#trace-复核)
 
 <a id="ticket-completion-review"></a>
 
-### P1-3 按 applied offset 批量完成票据（备选）
+### P1-3 按 applied offset 批量完成票据（已进入新架构首版）
 
-普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，订阅提交变化、按截止时间等待，醒来后逐笔回查 worker。v10 的 **1024 笔写对应 139 次 apply**。按 offset 对齐后，apply 完成到 `WaitApplied` 返回的 P95 为 **1.63 ms**，16 个 pipeline 批尾的额外等待最大为 **31 µs**。`WaitApplied` 在 Leader 栈中可识别到 **2 / 255 个 CPU 样本**。P1-3 的主要目标是减少 fiber、回查和唤醒。 [确认路径](../../src/server/cluster/raft/runtime/data_node.cc#L598) · [v10 Trace](http://127.0.0.1:8787/#/v10/trace)
+v13 的普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，醒来后逐笔回查 worker。其 **1024 笔写对应 124 次 apply**，应用后确认 P95 为 **0.744 ms**；16 个 pipeline 批尾额外等待最大 **95.3 µs**、合计 **0.604 ms**。这些历史数据支持减少执行上下文和回查，尚不能单独证明吞吐收益。 [v13 Trace](http://127.0.0.1:8787/#/v13/trace)
 
 1. 追加成功后，组内队列按 `(epoch, end_offset)` 登记并持有票据。登记与检查 applied 进度由同一组 worker 串行处理，覆盖应用先完成的情况。
 2. 组仍为同任期 Leader 时，状态机推进连续 applied 前缀就立即批量完成已覆盖的票据。按连接所在 proactor 合并通知，连接按 FIFO 回复，票据释放时归还准入额度。
 3. 每组只为最早的截止时间安排一个定时器。超时、换主、存储失败和关闭统一收尾，每个票据只完成一次。
 
-**第一版复用现有 proactor 唤醒即可。** applied 事件触发成功确认，组级定时器处理超时。`MSG_RING` 需要发送方也在支持该操作的 io_uring proactor 上，普通 worker 发出的唤醒可走现有 eventfd 路径。先沿用 v10 的 epoll 连接路径，测每千笔回查与唤醒次数、应用后确认 P95 和正式吞吐。合批后若唤醒仍是热点，再测 io_uring 的增量。 [应用进度](../../src/server/cluster/raft/runtime/group.cc#L412) · [唤醒实现](../../helio/util/fibers/uring_proactor.cc#L1072) · [P1-3 历史复核](profile/p1-3-review.md)
+**新架构首版已移除普通 SET 的逐笔确认 fiber 和 applied 回查。** 每组发布 `R=min(本地确认位置, HW, applied)`，同任期记录按共享水位完成，连接只订阅队首并按 FIFO 回复；组内一个定时器处理最早截止时间。Folly 直接处理组 I/O 和节点 RPC，测试 RESP 后端也改为 io_uring，不再沿用 epoll。宿主引擎的连接唤醒仍使用原有通知接口，未增加逐笔 `MSG_RING`。这是架构组合改动，性能变化不能单独归因于 P1-3。 [新结构与实现边界](raft-batch-event-loop.md) · [P1-3 历史复核](profile/p1-3-review.md)
 
 <a id="follower-received-cache"></a>
 
@@ -133,7 +136,7 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 
 - 正式测量用未插桩 Release，默认 1 连接、pipeline 64。独立诊断用来定位等待和 CPU 热点，正式吞吐和 P95 用来判断收益。
 - 正确性核对原连接 `WAIT 1`、离线副本重启、`WAIT 2` 和全量读回。按改动覆盖同 key、条件写、段边界、慢副本、换主、截断与故障注入。共享路径同时验证 `flush`。
-- 无稳定收益的试验回退代码，保留平台指标与实验结论。
+- 小范围优化试验无稳定收益时回退代码，保留平台指标与实验结论。[批次事件驱动新架构](raft-batch-event-loop.md#9-实验推进约定)按用户约定持续迭代：先出第一版测试，性能不佳继续在当前实验实现上分析、优化，不自动回退代码。
 
 <a id="experiments"></a>
 
@@ -153,3 +156,5 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 - [v11 Leader WAL 追加复用编码结果（已回退）](profile/v11-leader-wal-append.md)
 - [v12 Fetch records 分散发送（收益待确认，暂回退）](profile/v12-fetch-scatter.md)
 - [v13 Follower Fetch records 借用解码](profile/v13-fetch-borrow.md)
+- [v14 Folly io_uring 批次事件循环首版](profile/v14-batch-event-loop.md)
+- [v14b Folly io_uring 批次事件循环（首版修正）](profile/v14b-batch-progress.md)

@@ -25,3 +25,14 @@ Raft memory、1 连接、pipeline 64、256 MiB、256 KiB/value，计时包含原
 Debug、Release、ASAN+UBSAN 各 **61 项单测**通过，覆盖协议输出、借用生命周期、连接复用与断开、CRC 拒绝、截断和缓存预算/释放；flush/memory pipeline、落后副本快照恢复 **3 项集成回归**通过。平台另完成 **29 项单测、1 项集成回归**，三轮均通过副本确认、恢复与全量读回，独立诊断的 **2150 条观测**已在 Langfuse 核验。
 
 候选补丁、二进制、额外验证日志和原始测量保存在执行机 `~/.local/state/dragonfly-raft-workflow/runs/v13/v13-run-001/`，不提交 Git。
+
+## Trace 复核
+
+复用本轮时间线和 CPU 栈，未重跑 benchmark。区间交集表示时间重叠，不能直接当作因果或可节省时间。
+
+- Leader worker 排队 **263.28 ms**：与 apply 重叠 **153.53 ms（58.3%）**、编码 **61.72 ms（23.4%）**、追加准备 **30.31 ms（11.5%）**，三者之外 **17.73 ms**。应用是主要重叠项。
+- Follower Fetch RPC **329.19 ms**：与上述 Leader 三阶段分别重叠 **69.44 / 73.90 / 33.86 ms**，合计 **177.20 ms**。Leader 在处理 Fetch 前可经 `Tick()` 执行 apply；RPC 包含等待响应，不能全归为网络或复制。Follower 接收追加 **75.13 ms**、apply **88.33 ms** 均不与自身 RPC 重叠。
+- Leader apply **159.61 ms** 中，owner 批执行 **138.23 ms**，其中逐笔 `journal.apply` **137.53 ms**；另有 owner 排队 **10.41 ms**。火焰图中 SET 写入 `LargeString` 的复制占 **24 / 253** 样本，shard 合批仍需保留这部分数据写入。Fetch 完整帧复制为 **16 / 253** 样本，日志读取缓冲清零为 **8 / 253**，仍有局部优化空间。
+- 1024 个确认全部匹配到 124 次 apply。应用后确认 P95 **0.744 ms**；16 个 pipeline 批尾额外等待最大 **95.3 µs**、合计 **0.604 ms**，票据完成暂列备选。
+
+**P0-2 值得评估，但最大收益尚未证实。** 下一步应把逐笔 SET 的 shard 投递、等待和执行分开计时，再决定合批范围。复核程序和结果保存在该执行目录的 `trace-review/`。

@@ -11,8 +11,10 @@
 
 #include <chrono>
 
+#include "raft_io_config.h"
 #include "server/cluster/raft/transport/peer_connection.h"
 #include "util/accept_server.h"
+#include "util/fibers/fiberqueue_threadpool.h"
 #include "util/fibers/pool.h"
 #include "util/fibers/synchronization.h"
 
@@ -36,13 +38,16 @@ class RaftListenerTest : public testing::Test {
   }
 
   void StartListener(protocol::RpcHandlers handlers, std::function<void()> on_pre_shutdown = {}) {
-    pool_.reset(util::fb2::Pool::Epoll(1));
+#if !DFLY_RAFT_USE_FOLLY
+    pool_.reset(util::fb2::Pool::IOUring(256, 1));
     pool_->Run();
     server_ = std::make_unique<util::AcceptServer>(pool_.get(), false);
-    listener_ = new RaftListener(4096, std::move(handlers), std::move(on_pre_shutdown));
-    ASSERT_FALSE(server_->AddListener("127.0.0.1", 0, listener_));
-    port_ = listener_->socket()->LocalEndpoint().port();
-    server_->Run();
+#endif
+    listener_ = std::make_unique<RaftServer>(4096, std::move(handlers), std::move(on_pre_shutdown));
+    ASSERT_FALSE(listener_->Listen("127.0.0.1", 0, server_.get()));
+    port_ = listener_->port();
+    if (server_)
+      server_->Run();
 
     fd_ = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(fd_, 0);
@@ -58,16 +63,30 @@ class RaftListenerTest : public testing::Test {
   void TearDown() override {
     if (fd_ >= 0)
       close(fd_);
+    listener_->Stop();
     if (server_)
       server_->Stop(true);
-    pool_->Stop();
+    if (pool_)
+      pool_->Stop();
+  }
+
+  template <typename F> void RunClient(F&& callback) {
+#if DFLY_RAFT_USE_FOLLY
+    // The test caller only waits for RPC completion. No epoll/Helio network proactor is started.
+    client_.Await(std::forward<F>(callback));
+#else
+    pool_->GetNextProactor()->Await(std::forward<F>(callback));
+#endif
   }
 
   uint16_t port_ = 0;
   int fd_ = -1;
   std::unique_ptr<util::ProactorPool> pool_;
   std::unique_ptr<util::AcceptServer> server_;
-  RaftListener* listener_ = nullptr;
+  std::unique_ptr<RaftServer> listener_;
+#if DFLY_RAFT_USE_FOLLY
+  util::fb2::FiberQueueThreadPool client_{1};
+#endif
 };
 
 TEST_F(RaftListenerTest, FragmentedAndPipelinedRequestsKeepCorrelationAndOrder) {
@@ -102,7 +121,7 @@ TEST_F(RaftListenerTest, FragmentedAndPipelinedRequestsKeepCorrelationAndOrder) 
 }
 
 TEST_F(RaftListenerTest, PeerNegotiatesAndReconnectsAfterUnacknowledgedRequest) {
-  pool_->GetNextProactor()->Await([&] {
+  RunClient([&] {
     PeerConnection peer({"127.0.0.1", port_}, 1000, 4096);
     int16_t version = -1;
     EXPECT_EQ(peer.Negotiate<protocol::FetchRequest>(13, &version),
@@ -157,7 +176,7 @@ class FetchResponseListenerTest : public RaftListenerTest {
 };
 
 TEST_F(FetchResponseListenerTest, PeerReadsLargeResponseAndReusesConnection) {
-  pool_->GetNextProactor()->Await([&] {
+  RunClient([&] {
     PeerConnection peer({"127.0.0.1", port_}, 2000, 512 * 1024);
     protocol::FetchRequest request;
     protocol::FetchResponse response, expected;
@@ -172,7 +191,7 @@ TEST_F(FetchResponseListenerTest, PeerReadsLargeResponseAndReusesConnection) {
         retained.responses[0].partitions[0].records.borrowed->owner;
 
     // A new connection would be closed, so this Fetch must reuse the stream at the next frame.
-    listener_->pause_accepting();
+    listener_->Pause();
     request.max_bytes = 17;
     records = payload_.substr(0, request.max_bytes);
     ASSERT_FALSE(peer.Call(request, 18, &response));
@@ -187,7 +206,7 @@ TEST_F(FetchResponseListenerTest, PeerReadsLargeResponseAndReusesConnection) {
 }
 
 TEST_F(FetchResponseListenerTest, PeerRejectsOversizedResponseAndReconnects) {
-  pool_->GetNextProactor()->Await([&] {
+  RunClient([&] {
     PeerConnection peer({"127.0.0.1", port_}, 2000, 4096);
     protocol::FetchRequest request;
     protocol::FetchResponse response, expected;
@@ -224,7 +243,9 @@ TEST_F(ParkedFetchListenerTest, ShutdownReleasesFetchBeforeDrainingConnections) 
             protocol::CodecError::kOk);
   ASSERT_EQ(write(fd_, wire.data(), wire.size()), static_cast<ssize_t>(wire.size()));
   ASSERT_TRUE(parked_.WaitFor(std::chrono::seconds(5)));
-  server_->Stop(true);
+  listener_->Stop();
+  if (server_)
+    server_->Stop(true);
   server_.reset();
 }
 

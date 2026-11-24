@@ -11,6 +11,7 @@
 #include "common/backed_args.h"
 #include "facade/memcache_parser.h"
 #include "facade/reply_payload.h"
+#include "facade/reply_progress.h"
 #include "util/fibers/synchronization.h"
 
 namespace facade {
@@ -142,8 +143,10 @@ class ParsedCommand : public cmn::BackedArguments {
   void SendLong(long val);
 
   // Whether SendReply() can be called. Only valid in deferred mode.
-  // If the reply is not ready yet, it is guaranteed to be tracked by non-null Blocker()
   bool CanReply() const;
+
+  void WaitReply();
+  std::optional<util::fb2::EventCount::SubKey> SubscribeReply(util::fb2::detail::Waiter* waiter);
 
   // Reaching zero on blocker means CanReply() will turn true.
   // Waits for underlying awaitable (usually transaction)
@@ -167,6 +170,10 @@ class ParsedCommand : public cmn::BackedArguments {
     reply_ = SuspendedCommand{blocker, coro};
   }
 
+  void Resolve(ReplyProgress* progress, std::coroutine_handle<> coro) {
+    reply_ = SuspendedCommand{progress, coro};
+  }
+
  protected:
   virtual void ReuseInternal() = 0;
 
@@ -178,12 +185,19 @@ class ParsedCommand : public cmn::BackedArguments {
         : blocker{blocker}, coro{coro} {
     }
 
+    SuspendedCommand(ReplyProgress* progress, std::coroutine_handle<> coro)
+        : progress{progress}, coro{coro} {
+    }
+
     SuspendedCommand(SuspendedCommand&& other) noexcept
-        : blocker{other.blocker}, coro{std::exchange(other.coro, {})} {
+        : blocker{other.blocker}, progress{other.progress}, coro{std::exchange(other.coro, {})} {
     }
 
     SuspendedCommand& operator=(SuspendedCommand&& other) noexcept {
+      if (coro)
+        coro.destroy();
       blocker = other.blocker;
+      progress = other.progress;
       coro = std::exchange(other.coro, {});
       return *this;
     }
@@ -191,7 +205,8 @@ class ParsedCommand : public cmn::BackedArguments {
     // To destroy the coroutine when cancelling (as the handle is non owning)
     ~SuspendedCommand();
 
-    util::fb2::EmbeddedBlockingCounter* blocker;
+    util::fb2::EmbeddedBlockingCounter* blocker = nullptr;
+    ReplyProgress* progress = nullptr;
     std::coroutine_handle<> coro;
   };
 

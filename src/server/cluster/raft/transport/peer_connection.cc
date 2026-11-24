@@ -8,8 +8,11 @@
 
 #include <algorithm>
 
+#include "raft_io_config.h"
+#include "server/cluster/raft/transport/folly_rpc.h"
 #include "util/fibers/dns_resolve.h"
 #include "util/fibers/proactor_base.h"
+#include "util/fibers/synchronization.h"
 
 namespace dfly::cluster::raft {
 
@@ -17,12 +20,49 @@ PeerConnection::PeerConnection(QuorumEndpoint endpoint, uint32_t timeout_ms, siz
     : endpoint_(std::move(endpoint)), timeout_ms_(timeout_ms), max_frame_size_(max_frame_size) {
 }
 
+PeerConnection::~PeerConnection() {
+  Close();
+}
+
 void PeerConnection::Close() {
+#if DFLY_RAFT_USE_FOLLY
+  if (folly_) {
+    util::fb2::Done done;
+    folly_->Close([done]() mutable { done.Notify(); });
+    done.Wait();
+  }
+#endif
   if (socket_) {
     std::ignore = socket_->Close();
     socket_.reset();
   }
   versions_ = {};
+  connected_ = false;
+}
+
+std::error_code PeerConnection::ExchangeFrame(
+    std::string wire,
+    absl::FunctionRef<bool(std::string_view, const std::shared_ptr<const void>&, size_t)> decode) {
+#if DFLY_RAFT_USE_FOLLY
+  util::fb2::Done done;
+  std::error_code result;
+  folly_->Exchange(endpoint_.host, endpoint_.port, std::move(wire), max_frame_size_, timeout_ms_,
+                   [&](std::error_code ec, std::string_view bytes,
+                       const std::shared_ptr<const void>& owner, size_t capacity) {
+                     result = ec;
+                     if (!ec && !decode(bytes, owner, capacity))
+                       result = std::make_error_code(std::errc::protocol_error);
+                     done.Notify();
+                   });
+  done.Wait();
+  return result;
+#else
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
+  socket_->set_timeout(timeout_ms_);
+  if (auto ec = socket_->Write(io::Buffer(wire)); ec)
+    return ec;
+  return ReceiveFrame(deadline, decode);
+#endif
 }
 
 std::error_code PeerConnection::ReceiveFrame(
@@ -72,8 +112,12 @@ std::error_code PeerConnection::ReceiveFrame(
 }
 
 std::error_code PeerConnection::EnsureConnected() {
-  if (socket_)
+  if (connected_)
     return {};
+#if DFLY_RAFT_USE_FOLLY
+  if (!folly_)
+    folly_ = std::make_shared<FollyRpcClient>();
+#else
   auto* owner = util::fb2::ProactorBase::me();
   boost::system::error_code parse_error;
   auto ip = boost::asio::ip::make_address(endpoint_.host, parse_error);
@@ -92,6 +136,7 @@ std::error_code PeerConnection::EnsureConnected() {
     Close();
     return ec;
   }
+#endif
 
   // ApiVersions v0 works before the peer's flexible-header support is known.
   protocol::ApiVersionsResponse versions;
@@ -102,6 +147,7 @@ std::error_code PeerConnection::EnsureConnected() {
     return std::make_error_code(std::errc::protocol_error);
   }
   versions_ = std::move(versions);
+  connected_ = true;
   return {};
 }
 

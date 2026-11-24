@@ -4,5 +4,5 @@
 
 #pragma once
 
-// Both implementations use io_uring. This selects the file I/O library at build time only.
+// Selects the Raft group loop, file I/O and node RPC implementation at build time.
 #cmakedefine01 DFLY_RAFT_USE_FOLLY

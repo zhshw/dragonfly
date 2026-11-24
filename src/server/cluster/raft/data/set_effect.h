@@ -72,6 +72,7 @@ absl::Status AppendSetEffectBatch(int64_t offset, int32_t epoch, int64_t timesta
 // the exclusive applied offset of an already restored KV image with the same group identity.
 class CommittedEffects {
  public:
+  class ApplyBatch;
   explicit CommittedEffects(int32_t group_id, int64_t applied_offset = 0);
 
   int64_t applied_offset() const {
@@ -135,6 +136,12 @@ class CommittedEffects {
   absl::Status ApplyToBatched(const PartitionLog& log, int64_t high_watermark, ApplySetBatch apply,
                               ApplySlotImage apply_image);
 
+  // Detach a bounded committed ordinary prefix on the serial owner. Its immutable backing stays
+  // alive in ApplyBatch while the engine works; only FinishApply advances state on the owner.
+  // Null asks the caller to process a control/recovery barrier through ApplyToBatched.
+  absl::StatusOr<std::shared_ptr<ApplyBatch>> PrepareApply(const PartitionLog& log, int64_t hw);
+  absl::Status FinishApply(const ApplyBatch& batch, size_t completed);
+
  private:
   absl::Status ApplyTransferRecord(std::string_view payload, LogPosition end,
                                    ApplySlotImage apply_image);
@@ -177,6 +184,24 @@ class CommittedEffects {
   // advances independently of group apply and cannot determine which slots to snapshot.
   std::vector<int64_t> slot_generations_;
   SlotTransferState transfers_;
+};
+
+class CommittedEffects::ApplyBatch {
+ public:
+  size_t size() const {
+    return records_.size();
+  }
+  SetEffectView View(size_t i) const {
+    return records_[i].View();
+  }
+  int64_t end_offset() const {
+    return records_.back().end.end_offset;
+  }
+
+ private:
+  friend class CommittedEffects;
+  std::vector<PendingEffect> records_;
+  int64_t begin_offset_;
 };
 
 }  // namespace dfly::cluster::raft

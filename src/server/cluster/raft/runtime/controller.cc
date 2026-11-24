@@ -391,17 +391,19 @@ absl::Status RunController(const filesystem::path& dir, const string& cluster_id
       return status;
   }
   ActiveController controller(group, loader, cluster_id, std::move(bootstrap));
-  auto listener = make_unique<RaftListener>(kMaxRaftFrame, controller.Handlers());
+  auto listener =
+      make_unique<RaftServer>(kMaxRaftFrame, controller.Handlers(), [&] { group.RequestStop(); });
   const auto& local = endpoints->at(node_id);
-  if (auto ec = acceptor->AddListener(local.host.c_str(), local.port, listener.get()); ec)
+  if (auto ec = listener->Listen(local.host, local.port, acceptor); ec)
     return absl::ErrnoToStatus(ec.value(), "Binding controller listener");
-  listener.release();
   auto handle_admin = [&](span<const string_view> args) { return controller.ExecuteAdmin(args); };
   if (auto status = AddControllerAdminListener(admin, handle_admin, pool, acceptor); !status.ok())
     return status;
+  fb2::Done stopped;
   acceptor->TriggerOnBreakSignal([&] {
     controller.Stop();
     group.RequestStop();
+    stopped.Notify();
   });
   acceptor->Run();
   auto owner = pool->GetNextProactor();
@@ -411,9 +413,14 @@ absl::Status RunController(const filesystem::path& dir, const string& cluster_id
     controller_status = controller.Run(owner);
     if (!controller_status.ok())
       acceptor->Stop();
+    stopped.Notify();
   });
-  acceptor->Wait();
+
+  // A native Folly controller may have no RESP/admin listeners in the host acceptor.
+  stopped.Wait();
+  acceptor->Stop(true);
   controller.Stop();
+  listener->Stop();
   controller_fiber.Join();
   group.Join();
   acceptor->TriggerOnBreakSignal({});

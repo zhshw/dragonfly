@@ -7,6 +7,7 @@
 #include "server/cluster/raft/data/command_handler.h"
 #include "server/cluster/raft/data/set_effect.h"
 #include "server/cluster/raft/data/set_executor.h"
+#include "server/cluster/raft/data/write_progress.h"
 #include "server/cluster_support.h"
 #include "server/journal/executor.h"
 #include "server/test_utils.h"
@@ -15,10 +16,60 @@ namespace dfly::cluster::raft {
 namespace {
 using namespace std;
 
+TEST(WriteProgressTest, BindingAndEpochFenceProgressAndTerminalErrors) {
+  auto epoch = make_shared<WriteEpoch>(4);
+  WatermarkWrite first(epoch), rejected(epoch), next_epoch(make_shared<WriteEpoch>(5));
+  epoch->reply_offset.store(9);
+  EXPECT_FALSE(first.IsReady());
+  first.Bind({10, 4, 8});
+  EXPECT_TRUE(first.IsReady());
+  first.Reject(absl::UnavailableError("late failure"));
+  EXPECT_TRUE(first.status.ok());
+  rejected.Reject(absl::DeadlineExceededError("expired before binding"));
+  rejected.Bind({10, 4, 8});
+  EXPECT_TRUE(rejected.IsReady());
+  EXPECT_TRUE(absl::IsDeadlineExceeded(rejected.status));
+  EXPECT_LT(rejected.position.end_offset, 0);
+  next_epoch.Bind({10, 5, 8});
+  EXPECT_FALSE(next_epoch.IsReady());
+}
+
+TEST(WriteProgressTest, HeadSubscriptionSurvivesNonReadyProgress) {
+  auto epoch = make_shared<WriteEpoch>(4);
+  WatermarkWrite head(epoch);
+  head.Bind({10, 4, 8});
+  unsigned wakes = 0;
+  auto wake = [&] { ++wakes; };
+  util::fb2::detail::Waiter waiter{wake};
+  auto subscription = head.Subscribe(&waiter);
+  ASSERT_TRUE(subscription);
+  epoch->reply_offset.store(7);
+  epoch->changed.notifyAll();
+  EXPECT_FALSE(head.IsReady());
+  epoch->reply_offset.store(8);
+  epoch->changed.notifyAll();
+  EXPECT_TRUE(head.IsReady());
+  EXPECT_EQ(wakes, 2u);
+  subscription.reset();
+  epoch->changed.notifyAll();
+  EXPECT_EQ(wakes, 2u);
+}
+
 class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
  protected:
   struct TestWrite : PendingDataWrite {
     cmn::BackedArguments input;
+    util::fb2::EmbeddedBlockingCounter ready{1};
+    bool IsReady() const override {
+      return ready.IsCompleted();
+    }
+    void Wait() override {
+      ready.Wait();
+    }
+    std::optional<util::fb2::EventCount::SubKey> Subscribe(
+        util::fb2::detail::Waiter* waiter) override {
+      return ready.OnCompletion(waiter);
+    }
   };
 
   void SetUp() override {
@@ -108,12 +159,14 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
                                 .local_applied_offset = 8,
                                 .leader = {"node-a", "127.0.0.1", 7001},
                                 .replicas = {{{"node-b", "127.0.0.1", 7002}, applied_}},
-                                .connected_to_leader = !leader_};
+                                .connected_to_leader = !leader_,
+                                .await_change = replica_wait_};
   }
 
   int32_t epoch_ = 3;
   bool leader_ = true;
   optional<int64_t> applied_;
+  function<void(chrono::steady_clock::time_point)> replica_wait_;
   vector<SlotRange> routes_{{0, 16383}};
   size_t known_nodes_ = 1;
   size_t assigned_groups_ = 1;
@@ -402,6 +455,21 @@ TEST_F(DataDispatchTest, WaitUsesThisConnectionsAppliedPositionAndFencesOldTerms
   EXPECT_EQ(Run("writer", wait), 1);
   leader_ = false;
   EXPECT_THAT(Run("writer", wait), facade::ErrArg("WAIT cannot be used with replica instances."));
+}
+
+TEST_F(DataDispatchTest, WaitRechecksImmediatelyAfterReplicaProgressNotification) {
+  ready_ = true;
+  std::array<string_view, 3> set{"SET", "k", "v"};
+  std::array<string_view, 3> wait{"WAIT", "1", "5000"};
+  EXPECT_EQ(Run("writer", set), "OK");
+  applied_ = 7;
+  unsigned waits = 0;
+  replica_wait_ = [&](chrono::steady_clock::time_point) {
+    ++waits;
+    applied_ = 8;
+  };
+  EXPECT_EQ(Run("writer", wait), 1);
+  EXPECT_EQ(waits, 1u);
 }
 
 TEST_F(DataDispatchTest, RoleAndReplicationInfoUseTheSameLiveGroup) {

@@ -294,8 +294,7 @@ OpStatus MultiCommandSquasher::SquashedHopCb(EngineShard* es, RespVersion resp_v
       if (!do_async) {
         move_reply(&dispatched);  // Async commands resolve the context directly
       } else if (!ctx->CanReply()) {
-        ctx->Blocker()
-            ->Wait();  // Transaction didn't finish inline (likely locked key), wait for it
+        ctx->WaitReply();  // Transaction didn't finish inline (likely locked key), wait for it
       }
     }
   }

@@ -286,6 +286,61 @@ absl::Status CommittedEffects::ApplyTo(const PartitionLog& log, int64_t hw, Appl
       apply_image);
 }
 
+absl::StatusOr<shared_ptr<CommittedEffects::ApplyBatch>> CommittedEffects::PrepareApply(
+    const PartitionLog& log, int64_t hw) {
+  if (!log.io_failure().ok())
+    return log.io_failure();
+  if (applying_)
+    return absl::FailedPreconditionError("Group apply is already in progress");
+  if (hw < applied_offset() || hw > log.End().end_offset)
+    return absl::InvalidArgumentError("Invalid data group high watermark");
+  SynchronizeCache(log);
+  while (!pending_.empty() && pending_.front().end.end_offset <= applied_offset()) {
+    ForgetFront();
+    pending_.pop_front();
+  }
+  auto batch = make_shared<ApplyBatch>();
+  batch->begin_offset_ = applied_offset();
+  batch->records_.reserve(32);
+  size_t bytes = 0;
+  int64_t next = applied_offset() + 1;
+  while (!pending_.empty() && pending_.front().end.end_offset == next && next <= hw) {
+    const auto& item = pending_.front();
+    const auto view = item.View();
+    if (view.action != SetEffect::Action::kReplace || batch->size() == 32 ||
+        (batch->size() && item.encoded_bytes > (1U << 20) - min(bytes, size_t{1U << 20})))
+      break;
+    if (auto s = ValidateEffect(view); !s.ok()) {
+      if (batch->size() == 0)
+        return s;
+      break;
+    }
+    bytes += item.encoded_bytes;
+    ForgetFront();
+    batch->records_.push_back(std::move(pending_.front()));
+    pending_.pop_front();
+    ++next;
+  }
+  if (batch->size() == 0)
+    return nullptr;
+  applying_ = true;
+  return batch;
+}
+
+absl::Status CommittedEffects::FinishApply(const ApplyBatch& batch, size_t completed) {
+  if (!applying_ || applied_offset() != batch.begin_offset_ || completed > batch.size())
+    return absl::FailedPreconditionError("Stale or invalid apply completion");
+  for (size_t i = 0; i < completed; ++i) {
+    const auto& item = batch.records_[i];
+    const auto view = item.View();
+    slot_generations_[view.slot] = view.generation;
+    applied_ = item.end;
+    applied_bytes_ += item.encoded_bytes;
+  }
+  applying_ = false;
+  return absl::OkStatus();
+}
+
 absl::Status CommittedEffects::ApplyToBatched(const PartitionLog& log, int64_t hw,
                                               ApplySetBatch apply, ApplySlotImage apply_image) {
   if (!log.io_failure().ok())

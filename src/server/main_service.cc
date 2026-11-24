@@ -1470,7 +1470,7 @@ struct RaftSetReply {
     }
     RaftSetReply get_return_object() {
       cmd->SetDeferredReply();
-      cmd->Resolve(&write->ready, coroutine_handle<promise_type>::from_promise(*this));
+      cmd->Resolve(write, coroutine_handle<promise_type>::from_promise(*this));
       return {};
     }
     suspend_always initial_suspend() noexcept {

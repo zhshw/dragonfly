@@ -15,11 +15,13 @@
 #include "util/fiber_socket_base.h"
 
 namespace dfly::cluster::raft {
+class FollyRpcClient;
 
 // Owned by one peer's request fiber. Negotiate again whenever that peer reconnects.
 class PeerConnection {
  public:
   PeerConnection(QuorumEndpoint endpoint, uint32_t timeout_ms, size_t max_frame_size);
+  ~PeerConnection();
 
   // Close on the owning proactor after the last request has completed.
   void Close();
@@ -51,6 +53,9 @@ class PeerConnection {
 
  private:
   std::error_code EnsureConnected();
+  std::error_code ExchangeFrame(
+      std::string wire,
+      absl::FunctionRef<bool(std::string_view, const std::shared_ptr<const void>&, size_t)> decode);
   std::error_code ReceiveFrame(
       std::chrono::steady_clock::time_point deadline,
       absl::FunctionRef<bool(std::string_view, const std::shared_ptr<const void>&, size_t)> decode);
@@ -65,15 +70,9 @@ class PeerConnection {
     if (protocol::EncodeRequestFrame(header, request, version, &wire) != protocol::CodecError::kOk)
       return std::make_error_code(std::errc::invalid_argument);
 
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms_);
-    socket_->set_timeout(timeout_ms_);
-    if (auto ec = socket_->Write(io::Buffer(wire)); ec) {
-      Close();
-      return ec;
-    }
-    auto ec = ReceiveFrame(deadline, [&](std::string_view bytes,
-                                         const std::shared_ptr<const void>& owner,
-                                         size_t capacity) {
+    auto ec = ExchangeFrame(std::move(wire), [&](std::string_view bytes,
+                                                 const std::shared_ptr<const void>& owner,
+                                                 size_t capacity) {
       auto frame = [&] {
         if constexpr (std::is_same_v<Response, protocol::FetchResponse>) {
           if (owner)
@@ -95,6 +94,8 @@ class PeerConnection {
   size_t max_frame_size_;
   int32_t sequence_ = 0;
   std::unique_ptr<util::FiberSocketBase> socket_;
+  std::shared_ptr<FollyRpcClient> folly_;
+  bool connected_ = false;
   protocol::ApiVersionsResponse versions_;
 };
 

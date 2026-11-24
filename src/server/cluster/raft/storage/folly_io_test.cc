@@ -69,5 +69,33 @@ TEST(FollyIoTest, FullRecipientQueueDoesNotBlockOtherCompletions) {
   EXPECT_EQ(second_result, -EBADF);
 }
 
+TEST(FollyIoTest, EncodingLeavesTheGroupLoopAvailableForIoAndDeadline) {
+  FollyIo io;
+  folly::Baton<> encoding, release, encoded, completed, expired;
+  io.Run([&] {
+    io.Encode(
+        [&] {
+          encoding.post();
+          release.wait();
+        },
+        [&] { encoded.post(); });
+    io.SetDeadline(std::chrono::steady_clock::now() + std::chrono::hours(1),
+                   [] { ADD_FAILURE() << "Replaced deadline fired"; });
+    io.SetDeadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(1),
+                   [&] { expired.post(); });
+    io.Submit(-1, -1, {}, [&](int result) {
+      EXPECT_EQ(result, -EBADF);
+      completed.post();
+      return true;
+    });
+  });
+  encoding.wait();
+  completed.wait();
+  expired.wait();
+  release.post();
+  encoded.wait();
+  io.Drain();
+}
+
 }  // namespace
 }  // namespace dfly::cluster::raft

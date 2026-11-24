@@ -76,9 +76,19 @@ def instrument(relative):
                 + indent
                 + "observed_response.Finish();",
             ),
+            (
+                "    if (await_apply) {",
+                "    if (await_apply) {\n"
+                '      dfly_observe::Scope observed_local_apply("raft.fetch.await_local_apply");',
+            ),
         ]
     elif relative == RAFT + "runtime/data_node.cc":
         edits = [
+            (
+                "  result.await_change = [local, version](steady_clock::time_point deadline) {",
+                "  result.await_change = [local, version](steady_clock::time_point deadline) {\n"
+                '    dfly_observe::Scope observed_wait("raft.wait.replica_progress");',
+            ),
             (
                 "    if (owned_args) {",
                 '    dfly_observe::Scope observed_input(owned_args ? "raft.set.input_take"\n'
@@ -126,13 +136,14 @@ def instrument(relative):
                 '          dfly_observe::Scope observed_batch("raft.apply.owner_batch", effects.size());',
             ),
             (
-                "    request->proposal.appended.Wait();",
-                '    dfly_observe::Scope observed_appended("raft.set.await_append");\n'
-                "    request->proposal.appended.Wait();\n    observed_appended.Finish();",
+                "    while (local.admissions.try_dequeue(accepted)) {",
+                "    while (local.admissions.try_dequeue(accepted)) {\n"
+                '      dfly_observe::Record("raft.set.admission_queue", accepted->observed_input_start,\n'
+                "                           accepted->reserved_bytes);",
             ),
             (
                 "  if (proposal.stored)\n    *position",
-                '  dfly_observe::Scope observed_applied("raft.set.await_apply", proposal.end.end_offset);\n'
+                '  dfly_observe::Scope observed_applied("raft.set.barrier_await_apply", proposal.end.end_offset);\n'
                 "  if (proposal.stored)\n    *position",
             ),
             (
@@ -141,20 +152,47 @@ def instrument(relative):
                 "    local->queue_changed.wait_until(key.epoch(), steady_clock::now() + milliseconds(100));",
             ),
             (
-                "  request->appended.Wait();",
+                "  request->appended->Wait();",
                 '  dfly_observe::Scope observed_appended("raft.set.sync_await_append");\n'
-                "  request->appended.Wait();",
+                "  request->appended->Wait();",
             ),
             (
                 "  size_t records_size = 0;\n  for (size_t i = 0; i < batch.requests.size(); ++i)",
-                '  dfly_observe::Scope observed_encode("raft.set.encode", batch.requests.size(), batch.value_bytes);\n'
+                '  dfly_observe::Scope observed_prepare("raft.set.prepare", batch.requests.size(), batch.value_bytes);\n'
                 "  size_t records_size = 0;\n  for (size_t i = 0; i < batch.requests.size(); ++i)",
             ),
             (
-                "  bool may_have_appended = false;",
-                "  observed_encode.Finish();\n"
-                '  dfly_observe::Scope observed_submit("raft.set.submit", batch.requests.size(), records_size);\n'
-                "  bool may_have_appended = false;",
+                "  auto encode = [&batch, epoch, timestamp, records_size] {",
+                "  observed_prepare.Finish();\n"
+                "  const auto observed_encode_queue = dfly_observe::Now();\n"
+                "  auto encode = [&batch, epoch, timestamp, records_size, observed_encode_queue] {\n"
+                '    dfly_observe::Record("raft.set.encode_queue", observed_encode_queue, batch.requests.size());\n'
+                '    dfly_observe::Scope observed_encode("raft.set.encode", batch.requests.size(), records_size);',
+            ),
+            (
+                "  auto buffer = batch.encoded;",
+                "  auto buffer = batch.encoded;\n"
+                '  dfly_observe::Scope observed_submit("raft.set.submit", batch.requests.size(), buffer->size());',
+            ),
+            (
+                "        reply_epoch->reply_offset.store(r, memory_order_release);",
+                '        dfly_observe::Record("raft.reply.advance", dfly_observe::Now(),\n'
+                "                             reply_epoch->reply_offset.load(), r);\n"
+                "        reply_epoch->reply_offset.store(r, memory_order_release);",
+            ),
+            (
+                "              CHECK(replica->apply_queue.TryAdd([replica, batch = *batch] {",
+                "              const auto observed_queue = dfly_observe::Now();\n"
+                "              CHECK(replica->apply_queue.TryAdd([replica, batch = *batch, observed_queue] {\n"
+                '                dfly_observe::Record("raft.apply.lane_queue", observed_queue, batch->size());\n'
+                '                dfly_observe::Scope observed_apply("raft.apply.lane_run", batch->size(), batch->end_offset());',
+            ),
+            (
+                "                replica->raft->CompleteApply([replica, batch, completed, status] {",
+                "                observed_apply.Finish();\n"
+                "                const auto observed_complete = dfly_observe::Now();\n"
+                "                replica->raft->CompleteApply([replica, batch, completed, status, observed_complete] {\n"
+                '                  dfly_observe::Record("raft.apply.complete_queue", observed_complete, completed);',
             ),
             (
                 "  return absl::OkStatus();\n}\n\nabsl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState()",
@@ -165,6 +203,11 @@ def instrument(relative):
         ]
     elif relative == RAFT + "data/set_effect.cc":
         edits = [
+            (
+                "    batch->records_.push_back(std::move(pending_.front()));",
+                '    dfly_observe::Record("raft.apply.cache_hit", dfly_observe::Now(), next - 1);\n'
+                "    batch->records_.push_back(std::move(pending_.front()));",
+            ),
             (
                 "      next = std::move(pending_.front());",
                 '      dfly_observe::Record("raft.apply.cache_hit", dfly_observe::Now(), next_offset);\n'
