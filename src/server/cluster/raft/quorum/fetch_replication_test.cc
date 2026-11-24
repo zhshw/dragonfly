@@ -461,15 +461,18 @@ TEST_F(FetchReplicationTest, SmallFetchReturnsCompleteFirstBatchAndDiscardsParti
   auto a = Make(kA), b = Make(kB);
   Elect(&a, &b);
   vector<LogPosition> observed;
-  shared_ptr<const string> retained;
+  shared_ptr<const void> retained;
+  string_view retained_bytes;
   const char* expected_data = nullptr;
-  b.fetch.SetFetchedRecordsHook([&](const PartitionLog& log, const shared_ptr<const string>& buffer,
+  b.fetch.SetFetchedRecordsHook([&](const PartitionLog& log, const shared_ptr<const void>& buffer,
+                                    size_t capacity,
                                     span<const PartitionLog::ValidatedBatch> batches) {
     ASSERT_EQ(batches.size(), 1u);
     EXPECT_EQ(log.End(), batches.back().info.end);
-    EXPECT_EQ(buffer->data(), expected_data);
+    EXPECT_GE(capacity, batches.back().encoded_bytes);
     observed.push_back(batches.back().info.end);
     retained = buffer;
+    retained_bytes = {expected_data, batches.front().encoded_bytes};
   });
   auto control_size = a.log->Read(0, 1, 1).value().size();
   auto data = Batch(1, 5);
@@ -493,10 +496,21 @@ TEST_F(FetchReplicationTest, SmallFetchReturnsCompleteFirstBatchAndDiscardsParti
   EXPECT_EQ(b.fetch.HighWatermark(), 1);
   auto last = b.fetch.PrepareFetch(1, 18, 0, 1).value();
   auto complete = Handle(&a, last);
-  expected_data = complete.responses[0].partitions[0].records.data->data();
+  string wire;
+  ASSERT_EQ(Encode(complete, 18, &wire), CodecError::kOk);
+  auto backing = make_shared<const string>(std::move(wire));
+  weak_ptr<const string> lifetime = backing;
+  ASSERT_EQ(DecodeShared(*backing, 18, backing, backing->capacity(), &complete), CodecError::kOk);
+  expected_data = complete.responses[0].partitions[0].records.View()->data();
+  const void* expected_owner = backing.get();
+  backing.reset();
   ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, last.sequence, std::move(complete)).ok());
   EXPECT_EQ(observed, (vector<LogPosition>{{5, 1}, {5, 2}}));
-  EXPECT_EQ(*retained, data);
+  EXPECT_EQ(retained_bytes, data);
+  EXPECT_EQ(retained.get(), expected_owner);
+  EXPECT_FALSE(lifetime.expired());
+  retained.reset();
+  EXPECT_TRUE(lifetime.expired());
 
   // An old response must not republish its bytes into the application cache.
   ASSERT_TRUE(b.fetch.ReceiveFetchResponse(1, retry.sequence, full).ok());

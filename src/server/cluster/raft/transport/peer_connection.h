@@ -51,8 +51,9 @@ class PeerConnection {
 
  private:
   std::error_code EnsureConnected();
-  std::error_code ReceiveFrame(std::chrono::steady_clock::time_point deadline,
-                               absl::FunctionRef<bool(std::string_view)> decode);
+  std::error_code ReceiveFrame(
+      std::chrono::steady_clock::time_point deadline,
+      absl::FunctionRef<bool(std::string_view, const std::shared_ptr<const void>&, size_t)> decode);
 
   template <typename Request, typename Response>
   std::error_code Exchange(const Request& request, int16_t version, Response* response) {
@@ -70,9 +71,18 @@ class PeerConnection {
       Close();
       return ec;
     }
-    auto ec = ReceiveFrame(deadline, [&](std::string_view bytes) {
-      auto frame = protocol::DecodeResponseFrame(bytes, max_frame_size_, version,
-                                                 header.correlation_id, response);
+    auto ec = ReceiveFrame(deadline, [&](std::string_view bytes,
+                                         const std::shared_ptr<const void>& owner,
+                                         size_t capacity) {
+      auto frame = [&] {
+        if constexpr (std::is_same_v<Response, protocol::FetchResponse>) {
+          if (owner)
+            return protocol::DecodeResponseFrame(bytes, max_frame_size_, version,
+                                                 header.correlation_id, owner, capacity, response);
+        }
+        return protocol::DecodeResponseFrame(bytes, max_frame_size_, version, header.correlation_id,
+                                             response);
+      }();
       return frame.status == protocol::FrameStatus::kComplete && frame.consumed == bytes.size();
     });
     if (ec)

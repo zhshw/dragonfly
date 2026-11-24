@@ -176,6 +176,28 @@ TEST(FetchCodecTest, DecodeAndEncodeAllJavaBodies) {
     ASSERT_EQ(1u, reply.responses.size());
     ASSERT_EQ(1u, reply.responses[0].partitions.size());
     EXPECT_EQ(FromHex("010203"), reply.responses[0].partitions[0].records.data);
+
+    // Borrowed records outlive the caller's receive buffer and re-encode identically.
+    auto backing = std::make_shared<const std::string>(response);
+    std::weak_ptr<const std::string> lifetime = backing;
+    FetchResponse shared;
+    ASSERT_EQ(FrameStatus::kComplete,
+              DecodeResponseFrame(*backing, kMaxFrame, version, kCorrelation, backing,
+                                  backing->capacity(), &shared)
+                  .status);
+    const auto& records = shared.responses[0].partitions[0].records;
+    ASSERT_FALSE(records.data);
+    ASSERT_TRUE(records.borrowed);
+    EXPECT_GE(records.View()->data(), backing->data());
+    EXPECT_LT(records.View()->data(), backing->data() + backing->size());
+    EXPECT_EQ(records.borrowed->capacity, backing->capacity());
+    backing.reset();
+    EXPECT_FALSE(lifetime.expired());
+    EXPECT_EQ(shared, reply);
+    ASSERT_EQ(CodecError::kOk, EncodeResponseFrame(shared, version, kCorrelation, &encoded));
+    EXPECT_EQ(encoded, response);
+    shared = {};
+    EXPECT_TRUE(lifetime.expired());
   }
 }
 
@@ -260,6 +282,30 @@ TEST(FetchCodecTest, RetainsDivergingEpochSnapshotAndNullableRecords) {
                                   18, kCorrelation, &decoded)
                   .status);
     EXPECT_EQ(res, decoded);
+
+    auto backing = std::make_shared<const std::string>(frame);
+    std::weak_ptr<const std::string> lifetime = backing;
+    ASSERT_EQ(FrameStatus::kComplete, DecodeResponseFrame(*backing, frame.size(), 18, kCorrelation,
+                                                          backing, backing->capacity(), &decoded)
+                                          .status);
+    EXPECT_EQ(decoded, res);
+    EXPECT_EQ(FrameStatus::kNeedMore,
+              DecodeResponseFrame(std::string_view(frame).substr(0, frame.size() - 1), frame.size(),
+                                  18, kCorrelation, backing, backing->capacity(), &decoded)
+                  .status);
+    EXPECT_EQ(FrameStatus::kInvalidFrame,
+              DecodeResponseFrame(*backing, frame.size(), 18, kCorrelation + 1, backing,
+                                  backing->capacity(), &decoded)
+                  .status);
+    EXPECT_EQ(FrameStatus::kInvalidFrame,
+              DecodeResponseFrame(*backing, frame.size(), 18, kCorrelation, backing,
+                                  frame.size() - 1, &decoded)
+                  .status);
+    EXPECT_EQ(decoded, res);
+    backing.reset();
+    EXPECT_EQ(lifetime.expired(), !partition.records.data || partition.records.data->empty());
+    decoded = {};
+    EXPECT_TRUE(lifetime.expired());
   }
   std::string bytes;
   EXPECT_EQ(CodecError::kUnsupportedField, Encode(res, 11, &bytes));

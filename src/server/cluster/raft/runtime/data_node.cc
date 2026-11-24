@@ -363,9 +363,9 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
                 replica->progress.Observe(key, p, offset, now);
               });
           state.replication.SetFetchedRecordsHook(
-              [replica](const PartitionLog& log, const shared_ptr<const string>& buffer,
-                        span<const PartitionLog::ValidatedBatch> batches) {
-                replica->effects.RememberFetched(log, buffer, batches);
+              [replica](const PartitionLog& log, const shared_ptr<const void>& buffer,
+                        size_t capacity, span<const PartitionLog::ValidatedBatch> batches) {
+                replica->effects.RememberFetched(log, buffer, capacity, batches);
               });
           return absl::OkStatus();
         });

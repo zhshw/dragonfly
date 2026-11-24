@@ -574,8 +574,9 @@ class RaftGroup::Impl {
           bool idle_response = false;
           if (response.responses.size() == 1 && response.responses.front().partitions.size() == 1) {
             const auto& part = response.responses.front().partitions.front();
+            auto records = part.records.View();
             idle_response = part.diverging_epoch.epoch < 0 && part.snapshot_id.epoch < 0 &&
-                            (!part.records.data || part.records.data->empty());
+                            (!records || records->empty());
           }
           bool reset = false;
           auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response),

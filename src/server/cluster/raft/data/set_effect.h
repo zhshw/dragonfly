@@ -115,6 +115,8 @@ class CommittedEffects {
   // immutable bytes it validated. Control/migration/unsupported records still replay from WAL.
   void RememberFetched(const PartitionLog& log, const std::shared_ptr<const std::string>& buffer,
                        std::span<const PartitionLog::ValidatedBatch> batches);
+  void RememberFetched(const PartitionLog& log, const std::shared_ptr<const void>& buffer,
+                       size_t capacity, std::span<const PartitionLog::ValidatedBatch> batches);
 
   // Pending-cache budget: unique backing capacity for shared entries, encoded size for owned
   // effects. I/O and the currently applying batch can retain additional references.
@@ -140,7 +142,8 @@ class CommittedEffects {
   absl::Status ValidateEffect(const SetEffectView& effect) const;
 
   struct SharedEffect {
-    std::shared_ptr<const std::string> buffer;
+    std::shared_ptr<const void> buffer;
+    size_t capacity;
     SetEffectView view;
   };
 
@@ -162,7 +165,7 @@ class CommittedEffects {
   void SynchronizeCache(const PartitionLog& log);
 
   std::deque<PendingEffect> pending_;
-  std::unordered_map<const std::string*, size_t> buffer_uses_;
+  std::unordered_map<const void*, size_t> buffer_uses_;
   size_t pending_bytes_ = 0;
   uint64_t cache_generation_ = 0;
   int32_t group_id_;

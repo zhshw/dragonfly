@@ -257,6 +257,28 @@ def generate(schema_dir, names, stem, source="Kafka message schemas", frame_resp
             header.extend(
                 [
                     "",
+                    "// Decode records as views into immutable bytes retained by owner.",
+                    "// capacity charges the whole receive allocation; failures preserve out.",
+                ]
+            )
+            shared_decl = (
+                "CodecError DecodeShared(std::string_view bytes, int16_t version, "
+                "const std::shared_ptr<const void>& owner, size_t capacity, "
+                f"{name}* out)"
+            )
+            header.append(shared_decl + ";")
+            functions.extend(
+                [
+                    shared_decl + " {",
+                    "if (!owner) return CodecError::kInvalidData;",
+                    "return detail::DecodeMessage(bytes, version, owner, capacity, out);",
+                    "}",
+                    "",
+                ]
+            )
+            header.extend(
+                [
+                    "",
                     "// Encode a complete response frame without an intermediate body copy.",
                     "// On failure the destination keeps its previous value.",
                 ]

@@ -164,7 +164,8 @@ FrameStatus HandleApiVersions(std::string_view body, int16_t version, int32_t co
 
 template <typename Response>
 FrameResult ReadResponse(std::string_view input, size_t max_payload_size, int16_t version,
-                         int32_t correlation_id, Response* response) {
+                         int32_t correlation_id, const std::shared_ptr<const void>& owner,
+                         size_t capacity, Response* response) {
   std::string_view payload;
   auto result = ReadFrame(input, max_payload_size, &payload);
   if (result.status != FrameStatus::kComplete)
@@ -179,7 +180,13 @@ FrameResult ReadResponse(std::string_view input, size_t max_payload_size, int16_
     if (!reader.Tags(tags))
       return {FrameStatus::kInvalidFrame};
   }
-  auto error = Decode(reader.remaining(), version, response);
+  auto error = [&] {
+    if constexpr (std::is_same_v<Response, FetchResponse>) {
+      if (owner)
+        return DecodeShared(reader.remaining(), version, owner, capacity, response);
+    }
+    return Decode(reader.remaining(), version, response);
+  }();
   if constexpr (std::is_same_v<Response, ApiVersionsResponse>) {
     if (error != CodecError::kOk && version != 0)
       error = Decode(reader.remaining(), 0, response);
@@ -189,6 +196,12 @@ FrameResult ReadResponse(std::string_view input, size_t max_payload_size, int16_
   if (error != CodecError::kOk)
     return {FrameStatus::kInvalidFrame};
   return result;
+}
+
+template <typename Response>
+FrameResult ReadResponse(std::string_view input, size_t max_payload_size, int16_t version,
+                         int32_t correlation_id, Response* response) {
+  return ReadResponse(input, max_payload_size, version, correlation_id, {}, 0, response);
 }
 
 bool ReadHeaderTags(int16_t version, Reader* reader) {
@@ -360,6 +373,14 @@ CodecError EncodeRequestFrame(const RequestMetadata& metadata, const FetchReques
 FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
                                 int32_t correlation_id, FetchResponse* response) {
   return ReadResponse(input, max_payload_size, version, correlation_id, response);
+}
+
+FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size, int16_t version,
+                                int32_t correlation_id, const std::shared_ptr<const void>& owner,
+                                size_t capacity, FetchResponse* response) {
+  if (!owner || capacity < input.size())
+    return {FrameStatus::kInvalidFrame};
+  return ReadResponse(input, max_payload_size, version, correlation_id, owner, capacity, response);
 }
 
 CodecError EncodeRequestFrame(const RequestMetadata& metadata, const DescribeQuorumRequest& request,

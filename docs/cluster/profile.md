@@ -9,10 +9,11 @@
 | 平台记录 | 吞吐（MiB/s） | 批次 P95（ms） |
 | --- | ---: | ---: |
 | 基线 v3 | 169.56 | 113.75 |
-| 本轮 v10（P1-6） | **460.88** | **44.01** |
+| 上一轮 v10（P1-6） | 460.88 | 44.01 |
+| 本轮 v13（P1-7） | **486.54** | **45.25** |
 | 对比参照 `v10:cluster` | 605.47 | 34.63 |
 
-v10 较 v3 累计吞吐 **+171.8%**，达到原 cluster 参照的 **76.1%**。较上一轮 v9 归档吞吐 **+18.2%**、批次 P95 **−32.6%**，为跨轮对照。 [v10 平台总览](http://127.0.0.1:8787/#/v10/overview)
+v13 较 v3 累计吞吐 **+186.9%**，达到原 cluster 参照的 **80.4%**。较 v10 归档吞吐中位数 **+5.6%**、算术均值 **+5.2%**，批次 P95 中位数 **+2.8%**，尾延迟未改善。v11/v12 代码未合入，本轮是对 v10 的独立增量；三轮跨轮对照不代表所有负载。 [v13 平台总览](http://127.0.0.1:8787/#/v13/overview)
 
 ## 使用 profile
 
@@ -22,12 +23,12 @@ v10 较 v3 累计吞吐 **+171.8%**，达到原 cluster 参照的 **76.1%**。�
 
 ### 用 CLI 运行 benchmark
 
-创建新实验 `v11`，选 v10 为上一轮，并沿用其基线与对比参照。
+创建新实验 `v14`，选 v13 为上一轮，并沿用其基线与对比参照。
 
 ```sh
-profile create -id v11 -title '本轮优化' -previous v10
-profile run -id v11
-profile show -id v11
+profile create -id v14 -title '本轮优化' -previous v13
+profile run -id v14
+profile show -id v14
 ```
 
 `run` 等待本轮 benchmark 和诊断结果入库，`show` 查看三轮正式数据。需要独立测量时，在执行机用 `profile run -config FILE`，配置中的 `output` 指向新目录。 [CLI 参数](../../tools/profile/README.md#cli)
@@ -64,6 +65,11 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 
 两套集群设计独立。Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责。
 
+## 下一轮优先项
+
+1. **P0-2 评估 shard 内合批。** v13 Leader worker 排队区间并集为 **263.28 ms**，apply 为 **159.61 ms**，两者会重叠。owner 已经批量接收，批内仍逐笔走 `ExecuteSetEffect` 和 shard 调度。先验证减少逐笔调度能否缩短 apply 和 worker 排队。 [v13 Trace](http://127.0.0.1:8787/#/v13/trace)
+2. **Leader 分散发送复试前先查慢轮。** v12 吞吐中位数 **+0.7%**，第二轮明显偏慢，稳定收益尚未确认，代码暂回退。Follower 借用解码已在 v13 实现，吞吐 **+5.6%**，P95 未改善；继续减少复制不能替代对排队和合批节奏的分析。 [v12 实验](profile/v12-fetch-scatter.md) · [v13 实验](profile/v13-fetch-borrow.md)
+
 ## 优化项与当前状态
 
 <a id="wal-buffer-remaining"></a>
@@ -72,6 +78,8 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 ### P0-1 共享 WAL 缓冲与直接编码
 
 单条 SET 直接编码。drain 按长度、段边界和预算选定连续前缀，一次预留并写入最终缓冲，冻结后由 I/O 与 effect 共享。P0-1a 的 drain 合批缓冲预分配随直接聚合实现，收益按组合改动记录。 [v4 共享缓冲](profile/v4-wal-buffer.md) · [v6 直接聚合](profile/v6-drain-sharing.md)
+
+**Leader WAL 追加复用编码结果：v11 已试验并回退。** 追加准备区间并集 **41.95 → 0.99 ms**，但正式吞吐 **−0.3%**，批次 P95 **+19.1%**。相同 1024 笔写的提交次数 **153 → 177**，平均合批 **6.69 → 5.79 笔**，worker 排队 **211.95 → 213.22 ms**。处理变快可能改变 drain 收集窗口，单次诊断尚不能证明因果；各阶段时间也不能相加。**热点消失不等于吞吐收益，复试前先核实合批变小的原因，同时检查提交次数、关键排队和正式 P95。** [v11 实验](profile/v11-leader-wal-append.md)
 
 <a id="follower-receipt-progress"></a>
 
@@ -87,7 +95,13 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 
 ### P1-3 按 applied offset 批量完成票据（备选）
 
-v10 的 P1-6 已允许 `WaitApplied` 在后台同步期间查询本地 applied 进度。每笔票据仍独立回查。可按 `(epoch, end_offset)` 登记票据，在连续 applied 前缀推进时批量完成，重点验证完成等待、准入额度和调度成本，以及换主、失败、超时与关闭时的票据收尾。 [P1-3 复核](profile/p1-3-review.md)
+普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，订阅提交变化、按截止时间等待，醒来后逐笔回查 worker。v10 的 **1024 笔写对应 139 次 apply**。按 offset 对齐后，apply 完成到 `WaitApplied` 返回的 P95 为 **1.63 ms**，16 个 pipeline 批尾的额外等待最大为 **31 µs**。`WaitApplied` 在 Leader 栈中可识别到 **2 / 255 个 CPU 样本**。P1-3 的主要目标是减少 fiber、回查和唤醒。 [确认路径](../../src/server/cluster/raft/runtime/data_node.cc#L598) · [v10 Trace](http://127.0.0.1:8787/#/v10/trace)
+
+1. 追加成功后，组内队列按 `(epoch, end_offset)` 登记并持有票据。登记与检查 applied 进度由同一组 worker 串行处理，覆盖应用先完成的情况。
+2. 组仍为同任期 Leader 时，状态机推进连续 applied 前缀就立即批量完成已覆盖的票据。按连接所在 proactor 合并通知，连接按 FIFO 回复，票据释放时归还准入额度。
+3. 每组只为最早的截止时间安排一个定时器。超时、换主、存储失败和关闭统一收尾，每个票据只完成一次。
+
+**第一版复用现有 proactor 唤醒即可。** applied 事件触发成功确认，组级定时器处理超时。`MSG_RING` 需要发送方也在支持该操作的 io_uring proactor 上，普通 worker 发出的唤醒可走现有 eventfd 路径。先沿用 v10 的 epoll 连接路径，测每千笔回查与唤醒次数、应用后确认 P95 和正式吞吐。合批后若唤醒仍是热点，再测 io_uring 的增量。 [应用进度](../../src/server/cluster/raft/runtime/group.cc#L412) · [唤醒实现](../../helio/util/fibers/uring_proactor.cc#L1072) · [P1-3 历史复核](profile/p1-3-review.md)
 
 <a id="follower-received-cache"></a>
 
@@ -105,9 +119,15 @@ v10 的 P1-6 已允许 `WaitApplied` 在后台同步期间查询本地 applied �
 
 同任期、同段的普通写可在后台同步期间继续编码和追加。每轮同步按 64 MiB / 100 ms 条件触发，持久标记只发布开始时捕获的恢复切点。换主、控制记录、换段、截断、快照、关闭与 I/O 失败保留相应屏障。 [v10 实验](profile/v10-memory-flush-overlap.md) · [v9 Trace 复核](profile/v9-trace-review.md)
 
-### P1-7 Fetch 直接封帧
+### P1-7 Fetch 直接封帧与借用解码
 
 按 schema 计算字段长度后一次预留，直接写完整响应，去掉 body 到 frame 的中间复制和尾部扩容复制。共享 parked Fetch 缓冲或分散发送仍需评估所有权、部分发送、反压和内存预算。 [v8 Fetch 封帧](profile/v8-fetch-frame.md)
+
+**v12：Leader 分散发送 records，收益待确认，代码暂回退。** 三轮吞吐 **467.87 / 266.90 / 464.05 MiB/s**，中位数较 v10 **+0.7%**；均值 **−10.7%** 主要被第二轮拉低。另两轮略高于 v10 中位数，但 P95 一轮改善、一轮变差，不能直接判定方案导致退化，也不能排除慢轮后宣称稳定收益。第二轮 SET 阶段为 **958.84 ms**，末尾 WAIT 仅 **0.30 ms**；正式轮没有独立 Trace，不能用另跑的诊断解释该轮慢因。
+
+独立诊断的 Leader CPU **510 → 470 ms**，但 WAL 提交 **153 → 176 次**、worker 排队 **211.95 → 265.10 ms**。再次出现局部 CPU 改善与整体收益不一致。后续复试优先查慢轮与批次节奏；Follower 解码单独在 v13 测试。补丁、二进制、三轮原始数据和诊断均保留。 [v12 实验](profile/v12-fetch-scatter.md)
+
+**v13：Follower 借用 records 解码，保留实现。** 大 Fetch 的 records 引用不可变接收缓冲，WAL 校验与 effect 缓存共用其所有权，按整个接收缓冲容量计入缓存预算；小响应保留原路径。相对 v10，三轮吞吐中位数 **460.88 → 486.54 MiB/s（+5.6%）**、均值 **+5.2%**，P95 中位数 **44.01 → 45.25 ms（+2.8%）**。独立诊断 Follower CPU **256 → 200 ms**、memcpy 样本 **36 → 20**，1024 笔写全部命中缓存；Leader 排队 **211.95 → 263.28 ms**，仍需优化。结论是减少复制带来了本负载的吞吐收益，不能宣称尾延迟改善或把单次诊断变化全归因于此改动。 [v13 实验](profile/v13-fetch-borrow.md)
 
 ## 验证口径
 
@@ -130,3 +150,6 @@ v10 的 P1-6 已允许 `WaitApplied` 在后台同步期间查询本地 applied �
 - <a id="v9-input-experiment"></a>[v9 SET 输入所有权转交](profile/v9-input-ownership.md)
 - <a id="p0-1b-receipt-experiment"></a>[P0-1b follower 接收确认快路径（已回退）](profile/p0-1b-follower-receipt.md)
 - <a id="v10-flush-overlap-experiment"></a>[v10 memory 后台同步与普通追加并行](profile/v10-memory-flush-overlap.md)
+- [v11 Leader WAL 追加复用编码结果（已回退）](profile/v11-leader-wal-append.md)
+- [v12 Fetch records 分散发送（收益待确认，暂回退）](profile/v12-fetch-scatter.md)
+- [v13 Follower Fetch records 借用解码](profile/v13-fetch-borrow.md)

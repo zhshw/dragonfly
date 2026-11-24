@@ -165,6 +165,11 @@ TEST_F(FetchResponseListenerTest, PeerReadsLargeResponseAndReusesConnection) {
     records = payload_;
     ASSERT_FALSE(peer.Call(request, 18, &response));
     EXPECT_EQ(response, expected);
+    ASSERT_TRUE(response.responses[0].partitions[0].records.borrowed);
+    EXPECT_FALSE(response.responses[0].partitions[0].records.data);
+    auto retained = response;
+    std::weak_ptr<const void> lifetime =
+        retained.responses[0].partitions[0].records.borrowed->owner;
 
     // A new connection would be closed, so this Fetch must reuse the stream at the next frame.
     listener_->pause_accepting();
@@ -172,7 +177,12 @@ TEST_F(FetchResponseListenerTest, PeerReadsLargeResponseAndReusesConnection) {
     records = payload_.substr(0, request.max_bytes);
     ASSERT_FALSE(peer.Call(request, 18, &response));
     EXPECT_EQ(response, expected);
+    EXPECT_FALSE(response.responses[0].partitions[0].records.borrowed);
     peer.Close();
+    EXPECT_FALSE(lifetime.expired());
+    EXPECT_EQ(retained.responses[0].partitions[0].records.View(), payload_);
+    retained = {};
+    EXPECT_TRUE(lifetime.expired());
   });
 }
 

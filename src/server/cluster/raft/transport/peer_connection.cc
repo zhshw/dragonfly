@@ -25,8 +25,9 @@ void PeerConnection::Close() {
   versions_ = {};
 }
 
-std::error_code PeerConnection::ReceiveFrame(std::chrono::steady_clock::time_point deadline,
-                                             absl::FunctionRef<bool(std::string_view)> decode) {
+std::error_code PeerConnection::ReceiveFrame(
+    std::chrono::steady_clock::time_point deadline,
+    absl::FunctionRef<bool(std::string_view, const std::shared_ptr<const void>&, size_t)> decode) {
   size_t received = 0;
   auto receive = [&](io::MutableBytes buffer) -> std::error_code {
     auto left = deadline - std::chrono::steady_clock::now();
@@ -51,10 +52,10 @@ std::error_code PeerConnection::ReceiveFrame(std::chrono::steady_clock::time_poi
   if (!size || received > *size)
     return std::make_error_code(std::errc::protocol_error);
   io::MutableBytes buffer = io::MutableBuffer(first);
-  std::unique_ptr<uint8_t[]> large;
+  std::shared_ptr<uint8_t[]> large;
   if (*size >= buffer.size() && received < *size) {
     // The spare byte detects unsolicited data arriving with the end of the response.
-    large = std::make_unique_for_overwrite<uint8_t[]>(*size + 1);
+    large = std::make_shared_for_overwrite<uint8_t[]>(*size + 1);
     std::copy_n(buffer.data(), received, large.get());
     buffer = {large.get(), *size + 1};
   }
@@ -62,7 +63,10 @@ std::error_code PeerConnection::ReceiveFrame(std::chrono::steady_clock::time_poi
     if (auto ec = receive(buffer.subspan(received)); ec)
       return ec;
   }
-  if (received != *size || !decode(io::View(buffer.first(received))))
+  std::shared_ptr<const void> owner;
+  if (large)
+    owner = std::shared_ptr<const void>(large, large.get());
+  if (received != *size || !decode(io::View(buffer.first(received)), owner, large ? *size + 1 : 0))
     return std::make_error_code(std::errc::protocol_error);
   return {};
 }

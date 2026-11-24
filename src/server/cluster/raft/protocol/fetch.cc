@@ -327,6 +327,14 @@ CodecError Decode(std::string_view bytes, int16_t version, FetchResponse* out) {
   return detail::DecodeMessage(bytes, version, out);
 }
 
+CodecError DecodeShared(std::string_view bytes, int16_t version,
+                        const std::shared_ptr<const void>& owner, size_t capacity,
+                        FetchResponse* out) {
+  if (!owner)
+    return CodecError::kInvalidData;
+  return detail::DecodeMessage(bytes, version, owner, capacity, out);
+}
+
 CodecError EncodeResponseFrame(const FetchResponse& message, int16_t version,
                                int32_t correlation_id, std::string* out) {
   return detail::EncodeResponseFrameMessage(message, version, correlation_id, out);

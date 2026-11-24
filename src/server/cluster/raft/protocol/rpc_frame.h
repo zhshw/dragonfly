@@ -126,6 +126,12 @@ struct RequestMetadata {
                                               int16_t version, int32_t correlation_id,
                                               FetchResponse* response);
 
+// Retain immutable receive storage for nonempty records; capacity is the entire allocation.
+[[nodiscard]] FrameResult DecodeResponseFrame(std::string_view input, size_t max_payload_size,
+                                              int16_t version, int32_t correlation_id,
+                                              const std::shared_ptr<const void>& owner,
+                                              size_t capacity, FetchResponse* response);
+
 [[nodiscard]] CodecError EncodeRequestFrame(const RequestMetadata& header,
                                             const DescribeQuorumRequest& request, int16_t version,
                                             std::string* output);

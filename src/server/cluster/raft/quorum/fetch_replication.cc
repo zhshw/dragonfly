@@ -457,8 +457,8 @@ bool FetchReplication::CanReceiveDuringFlush(int32_t source_id, uint64_t sequenc
       part.diverging_epoch.end_offset >= 0 || part.snapshot_id.epoch >= 0 ||
       part.snapshot_id.end_offset >= 0)
     return false;
-  return !part.records.data || part.records.data->empty() ||
-         log_.CanAppendDuringFlush(*part.records.data);
+  auto records = part.records.View();
+  return !records || records->empty() || log_.CanAppendDuringFlush(*records);
 }
 
 absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
@@ -527,12 +527,21 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
     if (log_.LatestSnapshot() != cut)
       requested_snapshot_ = cut;
   } else {
-    if (part.records.data && !part.records.data->empty()) {
-      shared_ptr<const string> buffer;
-      string_view bytes = *part.records.data;
+    auto records = part.records.View();
+    if (records && !records->empty()) {
+      shared_ptr<const void> buffer;
+      size_t capacity = 0;
+      string_view bytes = *records;
       if (fetched_records_) {
-        buffer = make_shared<const string>(std::move(*part.records.data));
-        bytes = *buffer;
+        if (part.records.data) {
+          auto owned = make_shared<const string>(std::move(*part.records.data));
+          bytes = *owned;
+          capacity = owned->capacity();
+          buffer = std::move(owned);
+        } else {
+          buffer = part.records.borrowed->owner;
+          capacity = part.records.borrowed->capacity;
+        }
       }
       vector<PartitionLog::ValidatedBatch> appended;
 
@@ -546,7 +555,7 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
         if (auto s = RefreshMembership(); !s.ok())
           return s;
         if (fetched_records_)
-          fetched_records_(log_, buffer, appended);
+          fetched_records_(log_, buffer, capacity, appended);
       }
     }
     if (part.high_watermark >= 0)

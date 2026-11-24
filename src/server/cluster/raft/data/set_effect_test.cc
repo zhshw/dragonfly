@@ -384,15 +384,21 @@ TEST_F(SetEffectTest, FollowerSharesValidatedBufferAcrossCommitAndNoopBoundaries
                                                   : 3,
                                 3, 1, *effect)
                  .value();
-  auto buffer = make_shared<const string>(std::move(bytes));
-  weak_ptr<const string> lifetime = buffer;
+  const size_t prefix = 37;
+  const size_t capacity = prefix + bytes.size() + 41;
+  auto storage = make_shared_for_overwrite<char[]>(capacity);
+  copy(bytes.begin(), bytes.end(), storage.get() + prefix);
+  string_view payload(storage.get() + prefix, bytes.size());
+  shared_ptr<const void> buffer(storage, storage.get());
+  storage.reset();
+  weak_ptr<const void> lifetime = buffer;
   vector<PartitionLog::ValidatedBatch> appended;
-  ASSERT_TRUE(log_->AppendAsFollower(*buffer, 3, &appended).ok());
+  ASSERT_TRUE(log_->AppendAsFollower(payload, 3, &appended).ok());
   ASSERT_EQ(appended.size(), 4u);
   CommittedEffects state(10);
-  state.RememberFetched(*log_, buffer, appended);
-  EXPECT_EQ(state.cached_bytes(), buffer->capacity());
-  const auto retained_bytes = buffer->capacity();
+  state.RememberFetched(*log_, buffer, capacity, appended);
+  EXPECT_EQ(state.cached_bytes(), capacity);
+  const auto retained_bytes = capacity;
   const char* first_value = appended[1].records[0].value->data() + 26 + first_.key.size();
   buffer.reset();
   vector<string> seen;
@@ -480,7 +486,7 @@ TEST_F(SetEffectTest, FollowerCacheKeepsMigrationFencingAndFallsBackWhenOverBudg
   weak_ptr<const string> lifetime = oversized;
   ASSERT_TRUE(fallback_log->AppendAsFollower(*oversized, 3, &appended).ok());
   CommittedEffects fallback(10);
-  fallback.RememberFetched(*fallback_log, oversized, appended);
+  fallback.RememberFetched(*fallback_log, oversized, oversized->capacity(), appended);
   EXPECT_EQ(fallback.cached_bytes(), 0u);
   oversized.reset();
   EXPECT_TRUE(lifetime.expired());

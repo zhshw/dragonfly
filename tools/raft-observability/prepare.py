@@ -110,12 +110,12 @@ def instrument(relative):
                 "                         reserved_bytes, input.HeapMemory());",
             ),
             (
-                "                replica->effects.RememberFetched(log, buffer, batches);",
+                "                replica->effects.RememberFetched(log, buffer, capacity, batches);",
                 '                dfly_observe::Scope observed_cache("raft.fetch.cache_prepare", batches.size());\n'
-                "                replica->effects.RememberFetched(log, buffer, batches);\n"
+                "                replica->effects.RememberFetched(log, buffer, capacity, batches);\n"
                 "                observed_cache.Finish();\n"
                 '                dfly_observe::Record("raft.fetch.cache_bytes", dfly_observe::Now(),\n'
-                "                                     replica->effects.cached_bytes(), buffer->capacity());",
+                "                                     replica->effects.cached_bytes(), capacity);",
             ),
             (
                 "        // Re-enter once per bounded batch, preserving log order and the completed prefix.\n"
@@ -153,7 +153,7 @@ def instrument(relative):
             (
                 "  bool may_have_appended = false;",
                 "  observed_encode.Finish();\n"
-                '  dfly_observe::Scope observed_submit("raft.set.submit", batch.requests.size(), records.size());\n'
+                '  dfly_observe::Scope observed_submit("raft.set.submit", batch.requests.size(), records_size);\n'
                 "  bool may_have_appended = false;",
             ),
             (

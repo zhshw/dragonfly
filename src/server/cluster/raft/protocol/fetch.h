@@ -163,6 +163,12 @@ struct FetchResponse {
 CodecError Encode(const FetchResponse& message, int16_t version, std::string* out);
 CodecError Decode(std::string_view bytes, int16_t version, FetchResponse* out);
 
+// Decode records as views into immutable bytes retained by owner.
+// capacity charges the whole receive allocation; failures preserve out.
+CodecError DecodeShared(std::string_view bytes, int16_t version,
+                        const std::shared_ptr<const void>& owner, size_t capacity,
+                        FetchResponse* out);
+
 // Encode a complete response frame without an intermediate body copy.
 // On failure the destination keeps its previous value.
 CodecError EncodeResponseFrame(const FetchResponse& message, int16_t version,

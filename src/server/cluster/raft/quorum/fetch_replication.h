@@ -76,7 +76,7 @@ class FetchReplication {
   // Called on the group worker after a matched follower append and membership validation.
   // Views refer to this immutable buffer and cover only the successfully appended prefix.
   using FetchedRecords =
-      std::function<void(const PartitionLog&, const std::shared_ptr<const std::string>&,
+      std::function<void(const PartitionLog&, const std::shared_ptr<const void>&, size_t capacity,
                          std::span<const PartitionLog::ValidatedBatch>)>;
   void SetFetchedRecordsHook(FetchedRecords hook) {
     fetched_records_ = std::move(hook);

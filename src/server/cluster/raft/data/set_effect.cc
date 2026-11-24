@@ -194,7 +194,8 @@ void CommittedEffects::RememberAppended(LogPosition end, size_t encoded_bytes,
   auto view = effect;
   view.key = string_view(*buffer).substr(key_offset, effect.key.size());
   view.value = string_view(*buffer).substr(key_offset + effect.key.size(), effect.value.size());
-  Remember({end, encoded_bytes, SharedEffect{std::move(buffer), view}});
+  const size_t capacity = buffer->capacity();
+  Remember({end, encoded_bytes, SharedEffect{std::move(buffer), capacity, view}});
 }
 
 void CommittedEffects::Remember(PendingEffect effect) {
@@ -205,7 +206,7 @@ void CommittedEffects::Remember(PendingEffect effect) {
   auto* shared = get_if<SharedEffect>(&effect.effect);
   size_t charge = effect.encoded_bytes;
   if (shared)
-    charge = buffer_uses_.contains(shared->buffer.get()) ? 0 : shared->buffer->capacity();
+    charge = buffer_uses_.contains(shared->buffer.get()) ? 0 : shared->capacity;
 
   // When a quorum lags, subsequent proposals can still commit via the WAL.
   if (pending_.size() >= 4096 || charge > kMaxBatchSize - pending_bytes_)
@@ -226,8 +227,14 @@ void CommittedEffects::SynchronizeCache(const PartitionLog& log) {
 void CommittedEffects::RememberFetched(const PartitionLog& log,
                                        const shared_ptr<const string>& buffer,
                                        span<const PartitionLog::ValidatedBatch> batches) {
+  RememberFetched(log, buffer, buffer ? buffer->capacity() : 0, batches);
+}
+
+void CommittedEffects::RememberFetched(const PartitionLog& log,
+                                       const shared_ptr<const void>& buffer, size_t capacity,
+                                       span<const PartitionLog::ValidatedBatch> batches) {
   SynchronizeCache(log);
-  if (!buffer || !log.io_failure().ok() || buffer->capacity() > kMaxBatchSize)
+  if (!buffer || !log.io_failure().ok() || capacity > kMaxBatchSize)
     return;
   for (const auto& batch : batches) {
     if (batch.info.control || batch.records.size() != 1 || batch.records.front().key ||
@@ -238,7 +245,7 @@ void CommittedEffects::RememberFetched(const PartitionLog& log,
       continue;
 
     // Address/generation fencing remains at ordered application, after any migration records.
-    Remember({batch.info.end, batch.encoded_bytes, SharedEffect{buffer, *effect}});
+    Remember({batch.info.end, batch.encoded_bytes, SharedEffect{buffer, capacity, *effect}});
   }
 }
 
@@ -247,7 +254,7 @@ void CommittedEffects::ForgetFront() {
   if (auto* shared = get_if<SharedEffect>(&effect.effect)) {
     auto it = buffer_uses_.find(shared->buffer.get());
     if (--it->second == 0) {
-      pending_bytes_ -= shared->buffer->capacity();
+      pending_bytes_ -= shared->capacity;
       buffer_uses_.erase(it);
     }
   } else {

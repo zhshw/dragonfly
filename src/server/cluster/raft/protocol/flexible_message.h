@@ -35,8 +35,9 @@ template <typename T> Tagged(uint32_t, int16_t, T&, bool, bool) -> Tagged<T>;
 
 class Reader {
  public:
-  Reader(int16_t version, std::string_view bytes, bool flexible = true)
-      : version(version), bytes_(bytes), flexible_(flexible) {
+  Reader(int16_t version, std::string_view bytes, bool flexible = true,
+         const std::shared_ptr<const void>* owner = nullptr, size_t capacity = 0)
+      : version(version), bytes_(bytes), flexible_(flexible), owner_(owner), capacity_(capacity) {
   }
 
   std::string_view remaining() const {
@@ -113,13 +114,16 @@ class Reader {
     int32_t length;
     if (!Length(&length))
       return false;
+    value = {};
     if (length < 0) {
-      value.data.reset();
       return true;
     }
     if (static_cast<size_t>(length) > bytes_.size())
       return false;
-    value.data.emplace(bytes_.substr(0, length));
+    if (owner_ && length > 0)
+      value.borrowed = RecordBytes::Borrowed{*owner_, bytes_.substr(0, length), capacity_};
+    else
+      value.data.emplace(bytes_.substr(0, length));
     bytes_.remove_prefix(length);
     return true;
   }
@@ -222,12 +226,14 @@ class Reader {
   }
 
   template <typename T> bool ReadTag(std::string_view payload, Tagged<T> tag) {
-    Reader field(version, payload);
+    Reader field(version, payload, true, owner_, capacity_);
     return version >= tag.first_version && field.Field(tag.value) && field.empty();
   }
 
   std::string_view bytes_;
   bool flexible_;
+  const std::shared_ptr<const void>* owner_;
+  size_t capacity_;
 };
 
 template <bool kMeasure> class WriterImpl {
@@ -283,12 +289,13 @@ template <bool kMeasure> class WriterImpl {
   }
 
   bool Field(const RecordBytes& value) {
-    if (!value.data)
+    auto bytes = value.View();
+    if (!bytes)
       return Length(-1);
-    if (value.data->size() > std::numeric_limits<int32_t>::max())
+    if (bytes->size() > std::numeric_limits<int32_t>::max())
       return false;
-    Length(static_cast<int32_t>(value.data->size()));
-    return Append(*value.data);
+    Length(static_cast<int32_t>(bytes->size()));
+    return Append(*bytes);
   }
 
   template <typename T> bool Field(const std::optional<std::vector<T>>& values) {
@@ -502,15 +509,24 @@ CodecError EncodeResponseFrameMessage(const T& value, int16_t version, int32_t c
   return CodecError::kOk;
 }
 
-template <typename T> CodecError DecodeMessage(std::string_view bytes, int16_t version, T* out) {
+template <typename T>
+CodecError DecodeMessage(std::string_view bytes, int16_t version,
+                         const std::shared_ptr<const void>& owner, size_t capacity, T* out) {
   if (version < T::kMinVersion || version > T::kMaxVersion)
     return CodecError::kUnsupportedVersion;
+  if (owner && capacity < bytes.size())
+    return CodecError::kInvalidData;
   T value;
-  Reader reader(version, bytes, version >= T::kFirstFlexibleVersion);
+  Reader reader(version, bytes, version >= T::kFirstFlexibleVersion, owner ? &owner : nullptr,
+                capacity);
   if (!reader.Field(value) || !reader.empty())
     return CodecError::kInvalidData;
   *out = std::move(value);
   return CodecError::kOk;
+}
+
+template <typename T> CodecError DecodeMessage(std::string_view bytes, int16_t version, T* out) {
+  return DecodeMessage(bytes, version, {}, 0, out);
 }
 
 }  // namespace dfly::cluster::raft::protocol::detail
