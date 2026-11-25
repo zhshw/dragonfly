@@ -10,10 +10,10 @@
 | --- | ---: | ---: |
 | 基线 v3 | 169.56 | 113.75 |
 | 上一轮 v14b（Folly io_uring 首版修正） | 499.85 | 38.21 |
-| 本轮 v15（连续同 shard 的 SET 合批） | **493.28** | **34.70** |
+| 本轮 v15 宿主机复测（8 MiB 准入） | **515.03** | **33.59** |
 | 对比参照 `v10:cluster` | 605.47 | 34.63 |
 
-v15 的 **SET 批次 P95 已基本对齐原 cluster**。三轮中位数为 **34.70 ms**，与同负载参照 **34.63 ms** 相差 **0.07 ms（+0.2%）**，较 v14b 下降 **9.2%**。含 `WAIT 1` 的吞吐中位数为原 cluster 的 **81.5%**，较 v14b 下降 **1.3%**。三轮均完成副本确认与全量读回。 [v15 平台](http://172.31.23.2:8787/#/v15/overview) · [实验与 shard 投递计数](profile/v15-shard-apply.md)
+v15 用原版二进制在宿主机复测，含 `WAIT 1` 的吞吐中位数为原 cluster 的 **85.1%**，还差 **90.44 MiB/s**。SET 批次 P95 中位数为 **33.59 ms**，接近首次宿主机测量的 **34.70 ms**，其中一轮为 **61.55 ms**。三轮均完成副本确认与全量读回。 [v15 平台](http://172.31.23.2:8787/#/v15/overview) · [v15 复测详情](profile/v15-shard-apply.md#8-mib-复测)
 
 ## 使用 profile
 
@@ -67,9 +67,9 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 
 ## 下一轮优先项
 
-1. **验证交替 shard 的执行方案。** v15 已实现连续同 shard 合批。标准负载的 1024 笔写逐笔交替，远端仍有 512 次 L2 投递；每 4 笔切换 shard 的补充诊断将同量远端写合成 257 次投递。下一步要检验前项失败、重复应用与快照切点，决定能否安全地扩大分组范围。 [执行图与计数](profile/v15-shard-apply.md)
-2. **单独调整应用预算，再查 WAL 取批。** 256 KiB/value 加上编码开销后，1 MiB 上限每个 ApplyBatch 最多装 3 笔。v15 Leader 的 1024 笔写形成 381 个应用批、253 个 WAL 提交批。对照不同 key 排列的段长，再记录就绪数量与截断原因。 [v14b 计划](profile/v14b-batch-progress.md#下一步批次传递到-shard)
-3. **继续观测内存。** v15 Leader 峰值 RSS 为 668.68 MiB，v14b 为 668.01 MiB；Follower 分别为 421.43 和 420.39 MiB。缓冲跨线程释放、分配器保留页及 Folly 每 peer loop 的占用仍需单独测量。 [v15 诊断](profile/v15-shard-apply.md#shard-诊断与收益边界)
+1. **v16 先验证普通 SET 编码与 WAL 写入重叠。** 最新 v15 Trace 的 254 个相邻 WAL 批次中，187 个下一批在前一批写完前已就绪。按现有批形估算，约有 27 ms 编码可重叠。试验固定 8 MiB 准入额度，以正式吞吐和最慢批次延迟判断收益。 [v16 设计](profile/v16-wal-encode-overlap.md)
+2. **再按批尾证据决定是否调整应用。** 标准负载逐笔交替，两端各有 512 次 L2 投递。最新 v15 的 Leader 和 Follower 排队并集分别为 7.89 和 7.10 ms。若后续看到 HW 持续领先于 applied，再核对事务回放、应用批预算和扩大分组范围的可行性。 [v15 shard 诊断](profile/v15-shard-apply.md#shard-诊断与收益边界)
+3. **记录新增缓冲的内存成本。** 最新 v15 的 Leader 和 Follower 峰值 RSS 为 659.46 和 444.15 MiB。v16 记录私有预编码缓冲及其丢弃次数，同时对照两个节点的峰值 RSS。 [v15 宿主机复测](http://172.31.23.2:8787/#/v15/trace)
 
 ## 优化项与当前状态
 
@@ -159,3 +159,4 @@ v13 的普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，醒来后�
 - [v14 Folly io_uring 批次事件循环首版](profile/v14-batch-event-loop.md)
 - [v14b Folly io_uring 批次事件循环（首版修正）](profile/v14b-batch-progress.md)
 - [v15 已提交 SET 的 shard 合批](profile/v15-shard-apply.md)
+- [v16 普通 SET 编码与 WAL 追加重叠（设计）](profile/v16-wal-encode-overlap.md)
