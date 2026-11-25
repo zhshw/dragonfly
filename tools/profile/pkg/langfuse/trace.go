@@ -231,9 +231,17 @@ func readSpanCSV(path, node, role string, begin, end int64) ([]Span, error) {
 
 func Stages(events []Span) []Stage {
 	groups := map[string][]Span{}
+	emptyAdmission := map[string]Stage{}
 	for _, e := range events {
-		key := e.Node + "\x00" + e.Role + "\x00" + e.Stage
+		prefix := e.Node + "\x00" + e.Role + "\x00"
+		key := prefix + e.Stage
 		groups[key] = append(groups[key], e)
+		if e.Stage == "raft.set.admission.granted" && len(groups[key]) == 1 {
+			// Grants identify traces that collected admission even when no request was blocked.
+			for _, name := range []string{"raft.set.admission.rejected_bytes", "raft.set.admission.rejected_requests", "raft.set.admission.wait"} {
+				emptyAdmission[prefix+name] = Stage{Node: e.Node, Role: e.Role, Name: name}
+			}
+		}
 	}
 	var rows []Stage
 	round := func(v float64) float64 { return math.Round(v*1000) / 1000 }
@@ -250,6 +258,11 @@ func Stages(events []Span) []Stage {
 		sort.Float64s(durations)
 		n, first := len(group), group[0]
 		rows = append(rows, Stage{first.Node, first.Role, first.Stage, n, round(float64(total) / 1e6), round(UnionMS(spans)), round(durations[n/2]), round(durations[int(math.Ceil(float64(n)*.95))-1]), round(durations[n-1])})
+	}
+	for _, key := range sortedKeys(emptyAdmission) {
+		if _, observed := groups[key]; !observed {
+			rows = append(rows, emptyAdmission[key])
+		}
 	}
 	return rows
 }

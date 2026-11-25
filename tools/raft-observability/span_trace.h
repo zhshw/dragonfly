@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace dfly_observe {
@@ -63,6 +64,30 @@ inline void Record(const char* stage, int64_t start, int64_t arg0 = 0, int64_t a
     return;
   }
   buffer.events.push_back({start, end, stage, arg0, arg1});
+}
+
+// A declined parsed SET stays on the connection's proactor until retried or released.
+inline auto& AdmissionWaits() {
+  static thread_local std::unordered_map<const void*, int64_t> waits;
+  return waits;
+}
+
+inline void RecordAdmissionRejection(const void* command, const char* stage, int64_t bytes,
+                                     int64_t occupied) {
+  const auto since = Now();
+  Record(stage, since, bytes, occupied);
+  if (command)
+    AdmissionWaits().try_emplace(command, since);
+}
+
+inline void FinishAdmissionWait(const void* command, int64_t bytes) {
+  if (!command)
+    return;
+  auto& waits = AdmissionWaits();
+  if (auto it = waits.find(command); it != waits.end()) {
+    Record("raft.set.admission.wait", it->second, bytes);
+    waits.erase(it);
+  }
 }
 
 class Scope {

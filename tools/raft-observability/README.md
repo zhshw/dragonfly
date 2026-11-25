@@ -45,6 +45,11 @@ follower 对应 `raft.fetch.cache_bytes`，字段口径相同；`raft.fetch.cach
 `HeapMemory()`（含参数偏移存储，不含对象自身、KV 或 WAL）；复制回退的 string 容量不计入这个字段。
 `raft.set.input_release` 的 `arg0` 记录释放后剩余参数堆容量，`arg1` 为仍保留的准入字节；
 `raft.set.ticket_lifetime` 持续到票据销毁释放配额，字段与 input lifetime 一致。上述诊断只存在于独立插桩二进制。
+`raft.set.admission.granted` 记录准入后的预留字节数和请求数。
+`raft.set.admission.rejected_bytes` / `raft.set.admission.rejected_requests` 按拒绝原因计数，含重试，
+`arg0` 为请求字节数，`arg1` 为该原因对应的已预留额度。`raft.set.admission.wait` 从已解析 SET 首次被额度拒绝
+计到成功异步准入，`arg0` 为请求字节数。取消或未完成异步准入的 SET 只计拒绝次数。
+在平台 Trace 中筛选 `raft.set.admission.` 可查事件数、等待区间并集与 P95。已启用采集的零值会保留。
 已提交普通 SET 的 `raft.apply.shard_run` 每个连续同 shard 段记录一次，含本线程直接执行；
 `arg0` 为该段笔数，`arg1` 为 key 和 value 的总字节数。段执行时间包含事务锁等待。
 `raft.apply.shard_queue` 只记录跨线程投递，从提交 L2 到回调开始，含队列反压；

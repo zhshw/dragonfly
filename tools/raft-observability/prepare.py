@@ -85,6 +85,22 @@ def instrument(relative):
     elif relative == RAFT + "runtime/data_node.cc":
         edits = [
             (
+                "  if (count >= kQueueRequests) {",
+                "  if (count >= kQueueRequests) {\n"
+                '    dfly_observe::RecordAdmissionRejection(owned_args, "raft.set.admission.rejected_requests", bytes, count);',
+            ),
+            (
+                "    if ((reserved || count) && bytes > kQueueBytes - min(kQueueBytes, reserved)) {",
+                "    if ((reserved || count) && bytes > kQueueBytes - min(kQueueBytes, reserved)) {\n"
+                '      dfly_observe::RecordAdmissionRejection(owned_args, "raft.set.admission.rejected_bytes", bytes, reserved);',
+            ),
+            (
+                "  auto request = make_shared<AsyncPendingSet>(local, db, key, value, progress, owned_args);",
+                "  dfly_observe::FinishAdmissionWait(owned_args, bytes);\n"
+                '  dfly_observe::Record("raft.set.admission.granted", dfly_observe::Now(), reserved + bytes, count + 1);\n'
+                "  auto request = make_shared<AsyncPendingSet>(local, db, key, value, progress, owned_args);",
+            ),
+            (
                 "  result.await_change = [local, version](steady_clock::time_point deadline) {",
                 "  result.await_change = [local, version](steady_clock::time_point deadline) {\n"
                 '    dfly_observe::Scope observed_wait("raft.wait.replica_progress");',
@@ -295,6 +311,14 @@ def instrument(relative):
                 "                                 observed_issue, fd, result);",
             ),
         ]
+    elif relative == "src/facade/dragonfly_connection.cc":
+        edits = [
+            (
+                "void Connection::ReleaseParsedCommand(ParsedCommand* cmd) {",
+                "void Connection::ReleaseParsedCommand(ParsedCommand* cmd) {\n"
+                "  dfly_observe::AdmissionWaits().erase(static_cast<cmn::BackedArguments*>(cmd));",
+            )
+        ]
     elif relative == "src/server/journal/streamer.cc":
         edits = [
             (
@@ -350,6 +374,7 @@ def prepare(build, output, skip_build=False):
         RAFT + "data/set_executor.cc",
         RAFT + "log/partition_log.cc",
         RAFT + "storage/folly_io.cc",
+        "src/facade/dragonfly_connection.cc",
         "src/server/journal/streamer.cc",
         "src/server/journal/buffered_socket_writer.cc",
         "src/server/journal/executor.cc",

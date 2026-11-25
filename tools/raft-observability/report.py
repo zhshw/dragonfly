@@ -227,6 +227,12 @@ def report(run, go, flamegraph):
                 args=dict(arg0=event["arg0"], arg1=event["arg1"]),
             )
         )
+    # Each granted stage marks a node with the admission probe. Emit zero counts for
+    # absent rejection/wait stages so the platform distinguishes zero from old traces.
+    for node, role, stage in list(groups):
+        if stage == "raft.set.admission.granted":
+            for suffix in ("rejected_bytes", "rejected_requests", "wait"):
+                groups.setdefault((node, role, f"raft.set.admission.{suffix}"), [])
     rows = []
     for (node, role, stage), spans in sorted(groups.items()):
         durations = sorted((e["end_ns"] - e["start_ns"]) / 1e6 for e in spans)
@@ -238,9 +244,11 @@ def report(run, go, flamegraph):
                 count=len(spans),
                 sum_ms=round(sum(durations), 3),
                 union_ms=round(union_ns((e["start_ns"], e["end_ns"]) for e in spans) / 1e6, 3),
-                p50_ms=round(durations[len(durations) // 2], 3),
-                p95_ms=round(durations[math.ceil(len(durations) * 0.95) - 1], 3),
-                max_ms=round(max(durations), 3),
+                p50_ms=round(durations[len(durations) // 2], 3) if durations else 0,
+                p95_ms=(
+                    round(durations[math.ceil(len(durations) * 0.95) - 1], 3) if durations else 0
+                ),
+                max_ms=round(max(durations), 3) if durations else 0,
             )
         )
     (output / "spans.json").write_text(json.dumps(events) + "\n")

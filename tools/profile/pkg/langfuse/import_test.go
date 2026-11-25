@@ -14,6 +14,29 @@ import (
 	"testing"
 )
 
+func TestStagesIncludeZeroAdmissionCountsOnlyForInstrumentedNodes(t *testing.T) {
+	rows := Stages([]Span{
+		{Node: "11", Role: "leader", Stage: "raft.set.admission.granted", Start: 2, End: 3},
+		{Node: "11", Role: "leader", Stage: "raft.set.admission.wait", Start: 1, End: 2_000_001},
+		{Node: "12", Role: "follower", Stage: "journal.apply", Start: 2, End: 3},
+	})
+	if len(rows) != 5 {
+		t.Fatalf("expected five stages, got %+v", rows)
+	}
+	for _, row := range rows {
+		switch row.Name {
+		case "raft.set.admission.wait":
+			if row.Count != 1 || row.Union != 2 || row.P95 != 2 {
+				t.Fatalf("unexpected admission wait: %+v", row)
+			}
+		case "raft.set.admission.rejected_bytes", "raft.set.admission.rejected_requests":
+			if row != (Stage{Node: "11", Role: "leader", Name: row.Name}) {
+				t.Fatalf("unexpected empty admission stage: %+v", row)
+			}
+		}
+	}
+}
+
 func TestImportVerifiesEveryObservationAndSkipsExistingIDs(t *testing.T) {
 	run := t.TempDir()
 	reportDir := filepath.Join(run, "report")
