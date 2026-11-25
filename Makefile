@@ -47,7 +47,7 @@ HELIO_FLAGS = -DHELIO_RELEASE_FLAGS="-g" \
               -DLEGACY_GLOG=$(LEGACY_GLOG) \
 			  -DDF_ENABLE_MEMORY_TRACKING=$(TRACK_MEMORY_ALLOCS)
 
-.PHONY: default profile
+.PHONY: default profile profile-restart
 
 configure:
 	cmake -L -B $(RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release -GNinja $(HELIO_FLAGS)
@@ -78,5 +78,13 @@ release: configure build
 
 default: release
 
+ifeq ($(sort $(filter profile restart,$(MAKECMDGOALS))),profile restart)
+.PHONY: restart
+profile restart: profile-restart
+else
 profile:
 	$(MAKE) -C tools/profile up
+endif
+
+profile-restart:
+	$(MAKE) -C tools/profile restart

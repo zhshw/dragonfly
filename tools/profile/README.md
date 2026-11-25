@@ -19,19 +19,31 @@ v10 的上一轮使用 v9 的历史数据。旧实验按原有版本关系关联
 
 ## 启动
 
-在实验主机的仓库根目录运行。
+在实验主机的仓库根目录运行，有 Docker 权限的账号可以直接启动。
 
 ```sh
 make profile
 ```
 
-`make profile` 启动 Langfuse 和报告服务，再以当前用户身份启动宿主机上的 `profile-web`。只启动 Langfuse 和报告服务用 `make -C tools/profile langfuse`。 [Compose 配置](compose.yaml)
+`make profile` 启动 Compose 服务，再启动宿主机的 `profile-executor` 用户服务并等待就绪。首次在实验账号下运行 `make -C tools/profile build`，构建 `profile`、`profile-web` 和前端。Web 容器使用该账号的 UID/GID，默认发布 `0.0.0.0:8787`。可用 `BIN_DIR`、`WEB_DIST` 和 `PROFILE_LISTEN` 覆盖安装路径、前端目录和发布地址。 [Compose 配置](compose.yaml) · [打开实验平台](http://172.31.23.2:8787/)
 
-首次部署可用 `make -C tools/profile build` 构建 CLI 和 Web。默认使用 `/data/dragonfly-observability` 的配置和存储，工作流配置为 `config/profile.json`。 [数据盘准备](../raft-observability/README.md#部署与启动)
+`profile-web` 默认从 DaoCloud 拉取 Ubuntu 26.04，镜像固定到 Docker 官方发布的多架构索引摘要。可在 Compose 的环境文件中用 `PROFILE_WEB_IMAGE` 指定其他完整镜像地址。
+
+更新 Web 后，在仓库根目录重建容器。正在执行的 benchmark 由独立的宿主机进程继续运行。
+
+```sh
+make profile restart
+```
+
+从旧部署切换时，先等当前 benchmark 结束。若仍在使用旧的宿主机 `profile-web.service`，先运行一次 `sudo systemctl stop profile-web.service` 释放端口。只启动 Langfuse 和火焰图服务用 `make -C tools/profile langfuse`。 [数据盘准备](../raft-observability/README.md#部署与启动)
+
+构建、benchmark、Trace 采集和发布由宿主机的 `profile executor` 完成，使用配置中的 checkout、工具链和归档路径。Web 通过 `config/executor/executor.sock` 转发运行、进度、日志和删除请求，实验归档只读挂载入容器。执行器以实验账号的 systemd 用户服务运行，日志用 `journalctl --user -u profile-executor` 查看。更新执行器或修改工作流配置后，等本轮结束，运行 `systemctl --user stop profile-executor`，再用 `make -C tools/profile executor` 启动。 [工作流步骤](pkg/workflow/plan.go)
+
+执行器随用户的 systemd 实例运行。`loginctl show-user "$USER" -p Linger` 为 `Linger=no` 时，最后一个登录会话退出后，执行器会随用户实例停止。Web 仍可读取已归档的实验。
 
 ## 数据库与回填
 
-`make profile` 在 Langfuse 的 PostgreSQL 中准备 `dragonfly_experiments` 数据库和连接文件，沿用已有实验数据。 [迁移定义](models/schema.sql)
+Compose 的一次性服务 `profile-init` 在 Langfuse 的 PostgreSQL 中准备 `dragonfly_experiments` 数据库和连接文件，沿用已有实验数据。 [迁移定义](models/schema.sql)
 
 ```sh
 export PROFILE_DSN_FILE=/data/dragonfly-observability/config/raft-workflow.dsn
@@ -53,7 +65,7 @@ profile backfill -data "$experiment_data" -archive docs/cluster/benchmarks
 ```json
 {
   "repo": "~/workspace/db/dragonfly-io-uring-20261123",
-  "output": "~/.local/state/dragonfly-profile/runs",
+  "output": "~/.local/state/dragonfly-raft-workflow/runs",
   "release_build": "build-opt",
   "validation": [{
     "build": "build-dbg",

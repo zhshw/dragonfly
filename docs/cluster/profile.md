@@ -17,7 +17,7 @@ v15 用原版二进制在宿主机复测，含 `WAIT 1` 的吞吐中位数为原
 
 ## 使用 profile
 
-1. 在仓库根目录运行 `make profile` 启动 Langfuse 和 Web。 [打开 profile](http://127.0.0.1:8787/)
+1. 在仓库根目录运行 `make profile` 启动 Langfuse 和 Web。 [打开 profile](http://172.31.23.2:8787/)
 2. 点击「创建实验」，选择上一轮，并确认基线与同负载的对比参照。点击「运行 Benchmark」，平台运行本轮三次正式测试和独立诊断，复用已选对照的归档。
 3. 在「运行记录」查看三轮算术均值 Diff、合并日志和本轮验证。在「火焰图」和「Trace」对照上一轮与本轮，原 cluster 火焰图从总览的「查看基准诊断」进入。用「复制实验摘要」提取分析所需的指标。
 
@@ -35,7 +35,7 @@ profile show -id v15
 
 ### Trace 和火焰图分析示例
 
-查看 v10 应用完成到写入确认返回的延迟。 [v10 Trace](http://127.0.0.1:8787/#/v10/trace)
+查看 v10 应用完成到写入确认返回的延迟。 [v10 Trace](http://172.31.23.2:8787/#/v10/trace)
 
 ```sh
 profile trace -id v10 -analysis apply-to-confirm
@@ -49,7 +49,7 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
   -symbol 'CRC32::Extend' -caller-depth 8
 ```
 
-`CRC32::Extend` 的 55 个样本中，**31 个**来自 `AppendSingleRecordBatch` 编码，**24 个**来自 `TryAppendAsync` 的 WAL 追加校验。换成 `-symbol '__memcpy_avx'` 可用同样的方法定位复制来源。 [v10 火焰图](http://127.0.0.1:8787/#/v10/flamegraphs)
+`CRC32::Extend` 的 55 个样本中，**31 个**来自 `AppendSingleRecordBatch` 编码，**24 个**来自 `TryAppendAsync` 的 WAL 追加校验。换成 `-symbol '__memcpy_avx'` 可用同样的方法定位复制来源。 [v10 火焰图](http://172.31.23.2:8787/#/v10/flamegraphs)
 
 复核本地 A/B 归档时，用 `profile summarize` 一次汇总正式指标、关键等待和各节点 CPU 热点。 [CLI 汇总示例](../../tools/profile/README.md#汇总本地归档)
 
@@ -98,7 +98,7 @@ v13 的 owner 排队仅 **10.41 ms**；owner 批内执行 **138.23 ms**，其中
 
 ### P1-3 按 applied offset 批量完成票据（已进入新架构首版）
 
-v13 的普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，醒来后逐笔回查 worker。其 **1024 笔写对应 124 次 apply**，应用后确认 P95 为 **0.744 ms**；16 个 pipeline 批尾额外等待最大 **95.3 µs**、合计 **0.604 ms**。这些历史数据支持减少执行上下文和回查，尚不能单独证明吞吐收益。 [v13 Trace](http://127.0.0.1:8787/#/v13/trace)
+v13 的普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，醒来后逐笔回查 worker。其 **1024 笔写对应 124 次 apply**，应用后确认 P95 为 **0.744 ms**；16 个 pipeline 批尾额外等待最大 **95.3 µs**、合计 **0.604 ms**。这些历史数据支持减少执行上下文和回查，尚不能单独证明吞吐收益。 [v13 Trace](http://172.31.23.2:8787/#/v13/trace)
 
 1. 追加成功后，组内队列按 `(epoch, end_offset)` 登记并持有票据。登记与检查 applied 进度由同一组 worker 串行处理，覆盖应用先完成的情况。
 2. 组仍为同任期 Leader 时，状态机推进连续 applied 前缀就立即批量完成已覆盖的票据。按连接所在 proactor 合并通知，连接按 FIFO 回复，票据释放时归还准入额度。
@@ -142,7 +142,7 @@ v13 的普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，醒来后�
 
 ## 实验索引
 
-各实验文件保留实现与历史验证结论。逐轮指标、日志和诊断在平台按实验 ID 查询。 [实验列表](http://127.0.0.1:8787/)
+各实验文件保留实现与历史验证结论。逐轮指标、日志和诊断在平台按实验 ID 查询。 [实验列表](http://172.31.23.2:8787/)
 
 - [v3 初始基线与诊断](profile/v3-baseline.md)
 - [v4 共享 WAL 缓冲与直接编码](profile/v4-wal-buffer.md)

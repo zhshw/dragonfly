@@ -1,5 +1,10 @@
 name: dragonfly-observability
 
+x-readonly-bind: &readonly-bind
+  type: bind
+  read_only: true
+  bind: {create_host_path: false}
+
 x-langfuse-env: &langfuse-env
   DATABASE_URL: postgresql://langfuse:${POSTGRES_PASSWORD}@postgres:5432/langfuse
   NEXTAUTH_URL: ${LANGFUSE_PUBLIC_URL:-http://172.31.23.2:3007}
@@ -41,6 +46,7 @@ x-dependencies: &dependencies
 
 services:
   web:
+    container_name: profile-langfuse
     image: docker.langfuse.com/langfuse/langfuse:4.83.0
     restart: "on-failure:3"
     depends_on: *dependencies
@@ -63,6 +69,7 @@ services:
       options: {max-size: "10m", max-file: "2"}
 
   worker:
+    container_name: profile-worker
     image: docker.langfuse.com/langfuse/langfuse-worker:4.83.0
     restart: "on-failure:3"
     depends_on: *dependencies
@@ -70,6 +77,7 @@ services:
     logging: *logging
 
   postgres:
+    container_name: profile-postgres
     image: postgres:17
     restart: "on-failure:3"
     environment:
@@ -89,6 +97,7 @@ services:
     logging: *logging
 
   clickhouse:
+    container_name: profile-clickhouse
     image: clickhouse/clickhouse-server:26.3.62.3
     user: "101:101"
     restart: "on-failure:3"
@@ -113,6 +122,7 @@ services:
     logging: *logging
 
   minio:
+    container_name: profile-minio
     image: cgr.dev/chainguard/minio
     user: "1000:1000"
     restart: "on-failure:3"
@@ -136,6 +146,7 @@ services:
     logging: *logging
 
   redis:
+    container_name: profile-redis
     image: redis:7
     restart: "on-failure:3"
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
@@ -154,6 +165,7 @@ services:
     logging: *logging
 
   artifacts:
+    container_name: profile-artifacts
     image: nginx:1.28-alpine
     restart: "on-failure:3"
     ports: ["${OBSERVABILITY_BIND:-0.0.0.0}:3137:80"]
@@ -164,3 +176,70 @@ services:
         read_only: true
         bind: {create_host_path: false}
     logging: *logging
+
+  profile-init:
+    container_name: profile-init
+    profiles: [profile]
+    image: postgres:17
+    depends_on:
+      postgres: {condition: service_healthy}
+    entrypoint: ["/bin/bash", "/setup-postgres.sh"]
+    environment:
+      PROFILE_UID: ${PROFILE_UID:-1000}
+      PROFILE_GID: ${PROFILE_GID:-1000}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - {<<: *readonly-bind, source: ./ops/setup-postgres.sh, target: /setup-postgres.sh}
+      - ${PROFILE_ROOT:-/data/dragonfly-observability}/config:/config
+      - ${LANGFUSE_STORAGE_ROOT}/raft-workflow:/archive
+      - profile-runtime:/runtime
+    logging: *logging
+
+  profile-web:
+    container_name: profile-web
+    profiles: [profile]
+    image: ${PROFILE_WEB_IMAGE:-docker.m.daocloud.io/library/ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db}
+    restart: unless-stopped
+    depends_on:
+      profile-init: {condition: service_completed_successfully}
+      web: {condition: service_started}
+      worker: {condition: service_started}
+      artifacts: {condition: service_started}
+    user: "${PROFILE_UID:-1000}:${PROFILE_GID:-1000}"
+    ports: ["${PROFILE_LISTEN:-0.0.0.0:8787}:8787"]
+    entrypoint: ["/opt/profile-web"]
+    command:
+      - -listen
+      - 0.0.0.0:8787
+      - -web
+      - /opt/profile-ui
+      - -dsn-file
+      - /data/dragonfly-observability/config/raft-workflow.dsn
+      - -executor-socket
+      - /run/profile-executor/executor.sock
+      - -data
+      - ${LANGFUSE_STORAGE_ROOT}/raft-workflow/experiments
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    volumes:
+      - <<: *readonly-bind
+        source: ${PROFILE_BINARY:-${PROFILE_HOME:-/home/zhangshenwang}/.local/bin/profile-web}
+        target: /opt/profile-web
+      - <<: *readonly-bind
+        source: ${WEB_DIST:-./web/dist}
+        target: /opt/profile-ui
+      - profile-runtime:/data/dragonfly-observability/config:ro
+      - ${LANGFUSE_STORAGE_ROOT}/raft-workflow:${LANGFUSE_STORAGE_ROOT}/raft-workflow:ro
+      - <<: *readonly-bind
+        source: ${PROFILE_EXECUTOR_DIR:-${PROFILE_ROOT:-/data/dragonfly-observability}/config/executor}
+        target: /run/profile-executor
+    healthcheck:
+      test: ["CMD", "/opt/profile-web", "-check", "http://127.0.0.1:8787/api/v1/experiments"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    logging: *logging
+
+volumes:
+  profile-runtime:

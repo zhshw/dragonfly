@@ -27,7 +27,7 @@ Compose 固定 Langfuse `4.83.0`，数据库不发布宿主机端口。禁用公
 make -C tools/profile langfuse
 ```
 
-同时启动实验 Web 用 `make profile`。 [profile 使用说明](../profile/README.md#启动)
+`make profile` 同时启动 Web 容器和宿主机 benchmark 执行器。 [profile 使用说明](../profile/README.md#启动)
 
 ## 采集
 

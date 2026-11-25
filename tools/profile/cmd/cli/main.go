@@ -28,11 +28,13 @@ func main() {
 
 func cli(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("commands: create, run, show, trace, flamegraph, delete, refresh, import, import-target, backfill, sync, plan, status, report, summarize")
+		return errors.New("commands: create, run, show, trace, flamegraph, delete, refresh, import, import-target, backfill, sync, plan, status, report, summarize, executor")
 	}
 	f := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	dsnFile := cmp.Or(os.Getenv("PROFILE_DSN_FILE"), os.Getenv("RAFT_WORKFLOW_DSN_FILE"))
 	switch args[0] {
+	case "executor":
+		return executorCLI(ctx, f, args[1:], dsnFile)
 	case "create", "run", "show", "delete":
 		return experimentCLI(ctx, args[0], f, args[1:])
 	case "trace", "flamegraph":

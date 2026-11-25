@@ -1,58 +1,48 @@
 #!/usr/bin/env bash
-# Create an isolated experiment database in the existing observability PostgreSQL.
+# Run once under Compose before starting the experiment executor.
 set -euo pipefail
+umask 077
 
-owner=${SUDO_USER:?run with sudo from the experiment account}
-root=${1:-/data/dragonfly-observability}
-
-# Reuse the database connection file and artifact directory from existing deployments.
-work="$root/state/raft-workflow"
-dsn="$root/config/raft-workflow.dsn"
 db=dragonfly_experiments
+dsn=/config/raft-workflow.dsn
+owner="${PROFILE_UID}:${PROFILE_GID}"
+psql=(psql -XqAt -h postgres -U langfuse -d postgres -v ON_ERROR_STOP=1)
 
-mapfile -t postgres < <(docker ps \
-  --filter 'label=com.docker.compose.project=dragonfly-observability' \
-  --filter 'label=com.docker.compose.service=postgres' --format '{{.ID}}')
-if (( ${#postgres[@]} != 1 )); then
-  echo 'Expected one observability PostgreSQL container' >&2
-  exit 1
-fi
-psql() {
-  docker exec -i "${postgres[0]}" psql -XqAt -U langfuse -d postgres -v ON_ERROR_STOP=1 "$@"
-}
-
-address=$(docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${postgres[0]}")
-if [[ ! $address =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo 'PostgreSQL container must have a single IPv4 network address' >&2
-  exit 1
-fi
-install -d -m 0750 -o "$owner" -g "$(id -gn "$owner")" "$work"
-
+# Record a host-routable address for the existing CLI. The container uses Compose DNS.
+address=$("${psql[@]}" -c 'SELECT host(inet_server_addr())')
+exists=$("${psql[@]}" -c "SELECT count(*) FROM pg_roles WHERE rolname='$db'")
 if [[ -f $dsn ]]; then
   password=$(sed -n 's/^.* password=\([a-f0-9]\{64\}\) .*$/\1/p' "$dsn")
-  [[ $password =~ ^[a-f0-9]{64}$ ]]
+  [[ $password =~ ^[a-f0-9]{64}$ ]] || { echo 'Invalid experiment connection file' >&2; exit 1; }
+elif [[ $exists == 0 ]]; then
+  password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
 else
-  if [[ $(psql -c "SELECT count(*) FROM pg_roles WHERE rolname='$db'") != 0 ]]; then
-    echo 'Experiment role exists but its connection file is missing' >&2
-    exit 1
-  fi
-  password=$(openssl rand -hex 32)
-  # Feed the password through standard input and keep it out of command arguments.
-  psql <<SQL
+  echo 'Experiment role exists but its connection file is missing' >&2
+  exit 1
+fi
+
+# Write the credential before creating the role so a retry can finish interrupted provisioning.
+write_dsn() {
+  local file=$1 host=$2 tmp
+  tmp=$(mktemp "${file}.XXXXXX")
+  printf 'host=%s port=5432 dbname=%s user=%s password=%s sslmode=disable\n' \
+    "$host" "$db" "$db" "$password" > "$tmp"
+  chown "$owner" "$tmp"
+  mv -f "$tmp" "$file"
+}
+write_dsn "$dsn" "$address"
+if [[ $exists == 0 ]]; then
+  "${psql[@]}" <<SQL
 CREATE ROLE $db LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD '$password';
 SQL
 fi
-temporary=$(mktemp "$root/config/.profile-XXXXXX")
-trap 'rm -f "$temporary"' EXIT
-printf 'host=%s port=5432 dbname=%s user=%s password=%s sslmode=disable\n' \
-  "$address" "$db" "$db" "$password" > "$temporary"
-chown "$owner:$(id -gn "$owner")" "$temporary"
-chmod 0600 "$temporary"
-mv -f "$temporary" "$dsn"
-
-psql <<SQL
+"${psql[@]}" <<SQL
 SELECT format('CREATE DATABASE %I OWNER %I', '$db', '$db')
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='$db') \gexec
 REVOKE CONNECT ON DATABASE $db FROM PUBLIC;
 SQL
-printf 'PostgreSQL database %s ready; experiment directory %s\n' "$db" "$work"
+PGPASSWORD="$password" psql -XqAt -h postgres -U "$db" -d "$db" -c 'SELECT 1' >/dev/null
+
+install -d -m 0750 -o "$PROFILE_UID" -g "$PROFILE_GID" /archive /runtime
+write_dsn /runtime/raft-workflow.dsn postgres
+rm -f /runtime/langfuse.env

@@ -15,19 +15,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"dragonflydb.io/profile/models"
-	"dragonflydb.io/profile/pkg/execution"
 )
 
-func Handler(store models.Repository, web fs.FS, runner *execution.Manager) http.Handler {
+func Handler(store models.Repository, web fs.FS, executor http.Handler) http.Handler {
 	api := http.NewServeMux()
-	var deleteExperiment func(context.Context, string) (models.Deletion, error)
-	if runner != nil {
-		deleteExperiment = runner.Delete
-	} else if pg, ok := store.(*models.Postgres); ok {
-		deleteExperiment = pg.Delete
+	pg, postgres := store.(*models.Postgres)
+	if executor != nil {
+		for _, pattern := range []string{
+			"GET " + executionPath, "POST " + executionPath, "GET " + executionPath + "/log", deletePath,
+		} {
+			api.Handle(pattern, executor)
+		}
+	} else {
+		executionRoutes(api, store, nil)
+		var remove func(context.Context, string) (models.Deletion, error)
+		if postgres {
+			remove = pg.Delete
+		}
+		deleteRoute(api, remove)
 	}
 	api.HandleFunc("GET /api/v1/experiments", func(w http.ResponseWriter, r *http.Request) {
 		labels, err := store.List()
@@ -35,21 +42,7 @@ func Handler(store models.Repository, web fs.FS, runner *execution.Manager) http
 			respondError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"experiments": labels, "can_delete": deleteExperiment != nil})
-	})
-	api.HandleFunc("DELETE /api/v1/experiments/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if deleteExperiment == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "删除实验需要 PostgreSQL"})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		result, err := deleteExperiment(ctx, r.PathValue("id"))
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, map[string]any{"experiments": labels, "can_delete": executor != nil || postgres})
 	})
 	api.HandleFunc("GET /api/v1/comparison-targets", func(w http.ResponseWriter, _ *http.Request) {
 		targets, err := store.Targets()
@@ -135,7 +128,6 @@ func Handler(store models.Repository, web fs.FS, runner *execution.Manager) http
 		}
 		writeJSON(w, http.StatusOK, measurement)
 	})
-	executionRoutes(api, store, runner)
 	site := http.FileServer(http.FS(web))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")

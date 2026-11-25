@@ -9,16 +9,62 @@ import (
 	"errors"
 	"io"
 	"mime"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"time"
 
 	"dragonflydb.io/profile/models"
 	"dragonflydb.io/profile/pkg/execution"
 )
 
+const executionPath = "/api/v1/experiments/{id}/execution"
+const deletePath = "DELETE /api/v1/experiments/{id}"
+
+func ExecutorHandler(store models.Repository, runner *execution.Manager) http.Handler {
+	api := http.NewServeMux()
+	executionRoutes(api, store, runner)
+	deleteRoute(api, runner.Delete)
+	api.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	return api
+}
+
+func ExecutorProxy(socket string) http.Handler {
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: "profile-executor"})
+	proxy.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", socket)
+		},
+		ResponseHeaderTimeout: 15 * time.Second,
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "宿主机 Benchmark 执行器未就绪"})
+	}
+	return proxy
+}
+
+func deleteRoute(api *http.ServeMux, remove func(context.Context, string) (models.Deletion, error)) {
+	api.HandleFunc(deletePath, func(w http.ResponseWriter, r *http.Request) {
+		if remove == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "删除实验需要 PostgreSQL"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		result, err := remove(ctx, r.PathValue("id"))
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+}
+
 func executionRoutes(api *http.ServeMux, store models.Repository, runner *execution.Manager) {
-	const route = "/api/v1/experiments/{id}/execution"
-	api.HandleFunc("GET "+route, func(w http.ResponseWriter, r *http.Request) {
+	api.HandleFunc("GET "+executionPath, func(w http.ResponseWriter, r *http.Request) {
 		if _, err := store.Summary(r.PathValue("id")); err != nil {
 			respondError(w, err)
 			return
@@ -36,7 +82,7 @@ func executionRoutes(api *http.ServeMux, store models.Repository, runner *execut
 		}
 		writeJSON(w, http.StatusOK, status)
 	})
-	api.HandleFunc("POST "+route, func(w http.ResponseWriter, r *http.Request) {
+	api.HandleFunc("POST "+executionPath, func(w http.ResponseWriter, r *http.Request) {
 		if runner == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "执行机尚未配置"})
 			return
@@ -73,7 +119,7 @@ func executionRoutes(api *http.ServeMux, store models.Repository, runner *execut
 		w.Header().Set("Location", r.URL.Path)
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "running"})
 	})
-	api.HandleFunc("GET "+route+"/log", func(w http.ResponseWriter, r *http.Request) {
+	api.HandleFunc("GET "+executionPath+"/log", func(w http.ResponseWriter, r *http.Request) {
 		if runner == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "执行机尚未配置"})
 			return
