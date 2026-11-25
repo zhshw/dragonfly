@@ -2,11 +2,22 @@
 
 v15 在 `cluster_mode=raft` 的 ApplyLane 上合并相邻、同 shard 的 SET。上一轮选用 v14b，沿用累计基线 `v3:current` 和原 cluster 参照 `v10:cluster`。 [实验平台](http://172.31.23.2:8787/#/v15/overview) · [v14b 计划](v14b-batch-progress.md#下一步批次传递到-shard)
 
-首次在宿主机测得的 SET 批次 P95 中位数为 **34.70 ms**，用相同二进制、负载和执行方式复测为 **33.59 ms**。宿主机复测含 `WAIT 1` 的吞吐中位数为 **515.03 MiB/s**，达到原 cluster **605.47 MiB/s** 的 **85.1%**。标准负载逐笔交替访问两个 shard，实测均为单笔段，对多笔合批的验证见下文补充诊断。 [8 MiB 复测](#8-mib-复测)
+标准负载逐笔交替访问两个 shard，实测均为单笔段。宿主机复测及多笔合批诊断见对应小节。 [8 MiB 复测](#8-mib-复测) · [shard 诊断](#shard-诊断与收益边界)
 
 ## 为什么从 shard 开始
 
-v14b 的一次独立诊断有 1024 笔 SET、257 个 WAL 批和 379 个 ApplyLane 批。GroupLoop 每批只向 ApplyLane 交接一次，但 ApplyLane 收到批次后仍循环调用 `ExecuteSetEffect → JournalExecutor::ExecuteSet → DispatchCommand(ONLY_SYNC)`。当 key 属于另一引擎线程，每一笔都可能等待一次远端事务调度。Leader 的 ApplyLane 执行区间为 **86.53 ms**，其中 **85.85 ms** 落在 `journal.apply`，包含锁等待、跨线程调度和实际写入。v15 从这里切入，沿用 32 笔 / 1 MiB 编码字节预算以及 v14b 的 WAL、Fetch 和 WAIT 实现。 [v14b 诊断](v14b-batch-progress.md#独立诊断)
+v5 将连续 effect 批量投递给 owner，v14b 再将普通缓存前缀交给独立 ApplyLane。v14b 的一次独立诊断有 1024 笔 SET、257 个 WAL 批和 379 个 ApplyLane 批。GroupLoop 每批只向 ApplyLane 交接一次，但 ApplyLane 收到批次后仍循环调用 `ExecuteSetEffect → JournalExecutor::ExecuteSet → DispatchCommand(ONLY_SYNC)`。当 key 属于另一引擎线程，每一笔都可能等待一次远端事务调度。Leader 的 ApplyLane 执行区间为 **86.53 ms**，其中 **85.85 ms** 落在 `journal.apply`，包含锁等待、跨线程调度和实际写入。v15 从这里切入，沿用 32 笔 / 1 MiB 编码字节预算以及 v14b 的 WAL、Fetch 和 WAIT 实现。 [v5 批量应用](v5-batched-apply.md#实现范围与后续边界) · [v13 瓶颈复核](v13-fetch-borrow.md#trace-复核) · [v14b 诊断](v14b-batch-progress.md#独立诊断)
+
+## 与原 cluster 的复制路径对照
+
+| 阶段 | 原 cluster | v15 raft.memory |
+| --- | --- | --- |
+| 接收 | 解析 RESP 参数并执行 SET | 解析 RESP 参数，为普通异步 SET 预留额度并入队 |
+| 复制准备 | shard 写入 journal，按 flow 推送 | 将 SET effect 编入 Kafka 日志批，聚合到 WAL 缓冲，供 Follower Fetch |
+| 应用与重放 | 副本 flow 逐条执行 journal | GroupLoop 将已提交的普通 SET 批交给 ApplyLane，按相邻同 shard 段执行。缓存复用不可变日志缓冲，缺口从 WAL 重放 |
+| 确认 | 本地 SET 完成后回复，`WAIT` 追踪副本应用 | 依据本地 WAL 写入、Follower 接收形成的 HW 和本地连续应用进度回复 SET，`WAIT` 追踪副本应用 |
+
+两种模式的 SET 回复条件不同。正式吞吐都计到原连接的 `WAIT 1` 完成。Raft 由各数据组维护任期、日志顺序、HW 和恢复切点。 [复制协议对照](../raft-replication-design.md) · [Raft 回复水位](../raft-batch-event-loop.md#2-数据单位与水位)
 
 ## 原 cluster 的哪些实现用于 v15
 
@@ -49,6 +60,15 @@ Raft memory、1 连接、pipeline 64、256 MiB、256 KiB/value。与 v14b 使用
 | 1 | 473.82 | 19.98 | 518.43 | 33.12 |
 | 2 | 523.62 | 0.14 | 488.77 | 61.55 |
 | 3 | 496.87 | 0.19 | 515.03 | 33.59 |
+
+下表列出四个归档的三轮中位数。v15 宿主机复测较 v3 首版吞吐提高 **203.7%**，达到原 cluster 参照的 **85.1%**，相差 **90.44 MiB/s**。v3、v14b 和原 cluster 使用各自的历史归档，表中差值包含跨轮变化。 [v3 基线](v3-baseline.md) · [v14b 实验](v14b-batch-progress.md#实验结果) · [原 cluster 参照](http://172.31.23.2:8787/#/v10/overview)
+
+| 归档 | 含 `WAIT 1` 吞吐（MiB/s） | SET 批次 P95（ms） |
+| --- | ---: | ---: |
+| v3 首版 `v3:current` | 169.56 | 113.75 |
+| v14b | 499.85 | 38.21 |
+| v15 宿主机复测（8 MiB 准入） | **515.03** | **33.59** |
+| 原 cluster `v10:cluster` | 605.47 | 34.63 |
 
 第二轮最慢批次为 **61.55 ms**，另两轮都在 **34 ms** 内。首次和这次宿主机复测的 P95 中位数相差 **1.11 ms**，逐轮波动更大。后续候选使用同宿主机交替 A/B 判断收益。 [平台宿主机复测](http://172.31.23.2:8787/#/v15/runs)
 
@@ -115,7 +135,7 @@ KRaft 的 `MetadataLoader` 也只为一个 reader 投递一个事件，逐批调
 
 17 MiB 的准入额度试验已回退。平台继续采集准入拒绝与等待。最新宿主机 Trace 的批尾对齐显示，从发送到最后一笔 Leader WAL 写完的中位数为 **31.07 ms**，随后到客户端收齐 SET 回复为 **0.95 ms**。v16 先验证保持现有批形时，下一批编码能否与前一批 WAL 写入重叠。 [v16 Trace 核对与验证计划](v16-wal-encode-overlap.md)
 
-v15 宿主机复测与原 cluster 的吞吐中位数相差 **90.44 MiB/s**（515.03 对 605.47 MiB/s）。以各自吞吐居中的一轮计，256 MiB 的端到端耗时为 **497.05 对 422.81 ms**，相当于 16 个 pipeline 平均每批要省 **约 4.6 ms**。其中 SET 阶段为 **496.87 对 322.26 ms**，末尾 `WAIT 1` 为 **0.19 对 100.55 ms**。优先追 SET 阶段的积压。 [v15 复测结果](http://172.31.23.2:8787/#/v15/overview) · [原 cluster 参照](http://172.31.23.2:8787/#/v10/overview)
+v15 宿主机复测与原 cluster 各自吞吐居中的一轮，256 MiB 的端到端耗时为 **497.05 对 422.81 ms**，相当于 16 个 pipeline 平均每批要省 **约 4.6 ms**。其中 SET 阶段为 **496.87 对 322.26 ms**，末尾 `WAIT 1` 为 **0.19 对 100.55 ms**。优先追 SET 阶段的积压。 [v15 复测结果](http://172.31.23.2:8787/#/v15/overview) · [原 cluster 参照](http://172.31.23.2:8787/#/v10/overview)
 
 用原 cluster 参照的归档二进制（SHA-256 `b8a53a9fcbfa…`）确认了三层限制。RESP 队列的内存阈值是 **每 I/O 线程 128 MiB**，命令数阈值是**每连接 10,000 笔**。`MultiCommandSquasher` 每个 shard 一次最多合 **100 笔**。用同一二进制和标准负载补测一轮，SET 窗口的 `pipeline_throttle_total` 增量为 **0**。1024 笔 SET 中有 **988 笔进入 18 个 squash 批次**，每次平均约 **55 笔**。这些限制管的是待处理命令和本地执行批，原 cluster 的 SET 在本地执行后回复，副本确认由 `WAIT` 完成。 [RESP 队列限制](../../../src/facade/dragonfly_connection.cc#L73) · [每 shard 合批限制](../../../src/server/server_state.cc#L43) · [原 cluster 分发入口](../../../src/server/main_service.cc#L1926)
 

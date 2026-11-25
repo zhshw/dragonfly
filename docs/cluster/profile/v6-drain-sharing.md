@@ -1,6 +1,6 @@
 # v6：直接聚合编码与 effect/WAL 共享
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 ## P0-1 实验：编码与 CPU 下降，吞吐增益有限，RSS 上升（v6）
 
@@ -113,6 +113,8 @@ RSS 包含 KV、运行时及 allocator 保留内存；峰值覆盖启动、预�
 每 MiB 复制/分配字节尚未完整采集，进程峰值 RSS 未下降，内存优化目标尚未达成。
 
 ### drain 合批缓冲预分配
+
+P0-1a 的预分配随直接聚合落地。后续 v11 试过复用编码结果中的 CRC，三轮吞吐近似持平、批次 P95 上升，已回退该快路径。 [v11 回退记录](v11-leader-wal-append.md)
 
 - **原问题：** `records.append` 聚合已编码 batch 时反复扩容；v5 扩容搬运旧内容有 **24 个样本，约 48 ms CPU**，
   占 leader CPU 样本的 **5.4%**，不足以支持较大吞吐收益的预期。

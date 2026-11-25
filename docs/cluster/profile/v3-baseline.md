@@ -1,6 +1,6 @@
 # v3：初始基线与诊断
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 以下采用 2026-11-23 的 `memory-c1-p64-v3` / `cluster-c1-p64-v3` 初始采样，作为选择优化项的依据。
 同机、同一插桩二进制（SHA-256 前缀 `72f222abed27`）、1 连接、pipeline 64、256 MiB、256 KiB/value；

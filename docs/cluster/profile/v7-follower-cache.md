@@ -1,6 +1,6 @@
 # v7：follower 复用接收批次
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 ## P1-4 实验：follower 复用接收批次，确认吞吐提高，RSS 未下降（v7）
 

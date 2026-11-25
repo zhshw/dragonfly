@@ -1,6 +1,6 @@
 # v5：批量应用与借用参数
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 <a id="diagnostic-results"></a>
 
@@ -179,6 +179,8 @@ owner 每完成一笔检查 1 ms 预算，超时返回已完成前缀；单笔�
 仍由组 worker 更新；执行失败只推进成功前缀。`JournalExecutor::ExecuteSet` 同步借用 key/value，
 省去 `BackedArguments` 的大块复制和清零，继续执行原有 SET 事务。新增 owner 排队、批次、WAL 读取及解码 trace。
 相对已优化的上一轮 `encoded-bin`，1 连接 / pipeline 64 三轮确认吞吐增量提高 8.8%。
+
+v14b 将普通缓存前缀交给独立 ApplyLane，v15 再将相邻同 shard 的普通 SET 合并为一次投递，按实际成功前缀发布应用进度。 [v14b ApplyLane](v14b-batch-progress.md) · [v15 shard 合批](v15-shard-apply.md)
 
 **优化前的代码路径：** `DataNodeImpl::OpenPartition` 每条 effect 调用一次 `owner_->Await`；
 [set_executor.cc](../../../src/server/cluster/raft/data/set_executor.cc) 的 `ExecuteSetEffect` 构造 `CmdData`，

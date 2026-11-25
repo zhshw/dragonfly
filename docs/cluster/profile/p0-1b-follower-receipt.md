@@ -1,10 +1,12 @@
 # 未保留试验：follower 接收确认快路径（无收益，已回退）
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 原采集使用 `v10` 试验代号；本次代码未保留。保留版本 v10 的 P1-6 实验见[后台同步与普通追加并行](v10-memory-flush-overlap.md)。
 
 **结论：未证明端到端收益，实验代码已回退到 v9（`29565323`）。** 保留实验补丁、原始数据、指标和火焰图/trace，不扩展到 2、8 连接。
+
+后续的 v14b 在批次事件循环中使用独立 ApplyLane 推进应用，并分别报告接收与应用水位。 [v14b 实现与验证](v14b-batch-progress.md)
 
 P0-1b 本次尝试在同 leader、同任期的普通 SET 响应后准备下一笔 Fetch，先报告已发布接收位置，
 再由原 worker 串行 apply；每个 peer 仍只有一笔 RPC 在途。控制记录、换主、截断和快照保留应用屏障，

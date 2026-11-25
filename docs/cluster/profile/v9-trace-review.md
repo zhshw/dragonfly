@@ -1,6 +1,6 @@
 # v9 trace 复核：优先 P1-6，解除后台同步对追加的阻塞
 
-[返回优化项](../profile.md#memory-flush-separation) · [v9 实验](v9-input-ownership.md)
+[Profile 索引](../profile.md#memory-flush-separation) · [v9 实验](v9-input-ownership.md)
 
 **下一优先项是 P1-6：拆开 memory 后台同步与普通追加的占用状态。**
 第二项再看 P0-2 的串行应用；P1-3 票据通知保留为备选。本次只分析已有数据，没有修改运行代码或新增性能测试。

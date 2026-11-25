@@ -1,12 +1,20 @@
-# P1-3 复核：保留为备选实验
+# P1-3 按 applied offset 批量完成票据
 
-[返回优化项](../profile.md#ticket-completion-review) · [v9 实验](v9-input-ownership.md)
+[Profile 索引](../profile.md#ticket-completion-review) · [v9 实验](v9-input-ownership.md)
 
-**结论：批量完成票据可作为备选，暂不作为下一优先项。** 更大范围的阻塞及 P1-6 优先依据见 [v9 trace 复核](v9-trace-review.md)。
-本项目标是消除已应用写的回查等待，不能预期大幅降低 CPU。
-本次只分析已保存的两份 v9 实现诊断，未修改运行代码、未新增 benchmark，也不是新的优化版本。
+## v14 / v14b 落地
 
-## 证据：不能只看 16 个批尾
+Folly io_uring 批次事件循环首版移除了普通异步 SET 的逐笔 `raft-set-confirm` fiber、applied 回查和逐笔定时器。追加成功后，票据绑定到当前组实例的 `(epoch, end_offset)`。组发布共享回复水位 `R = min(本地确认位置, HW, applied)`，以连续成功应用的前缀完成同任期、已绑定且受水位覆盖的票据。连接只订阅队首，按 FIFO 回复并归还准入额度。组内用一个定时器跟踪最早的截止时间，超时、换主、存储失败和关闭沿用各自的收尾路径，每笔只完成一次。
+
+组 I/O 和节点 RPC 用 Folly io_uring，测试 RESP 后端也从 epoll 切到 io_uring。宿主引擎的连接唤醒沿用原有通知接口。平台结果衡量这批组合改动。 [v14 首版](v14-batch-event-loop.md) · [v14b 修正](v14b-batch-progress.md) · [回复流程与屏障](../raft-batch-event-loop.md#3-从提交到回复)
+
+## v9 与 v13 历史复核
+
+v9 时这项优化列为备选，优先处理后台同步阻塞。以下 v9 数据来自两份已保存的诊断。 [P1-6 优先依据](v9-trace-review.md)
+
+v13 仍逐笔启动确认 fiber。1024 笔写匹配到 124 次 apply，应用后确认 P95 为 **0.744 ms**。16 个 pipeline 批尾额外等待最大 **95.3 µs**、合计 **0.604 ms**。这些数据给出了当时逐笔回查的等待规模，尚无 P1-3 单项吞吐对照。 [v13 Trace 复核](v13-fetch-borrow.md#trace-复核)
+
+### v9 的批尾与逐笔等待
 
 `WaitApplied → VisitUntil → Visit → RunOnWorker` 即使只查询 applied，也先经过 `AppendPending()` 屏障。
 因此本笔已应用后，回查仍可能排在后续追加或 memory 后台 fsync 后面。
@@ -33,7 +41,7 @@ v9 原诊断的 16 个批尾几乎立即完成，因此先前的“批尾没有�
 额度占用按输入/票据生命周期与单连接 FIFO offset 顺序关联，已核对笔数和时间边界；
 “额度满”不等于当时一定有已解析请求等待准入。上述区间还与其他必要工作重叠，**不能当作可兑现的吞吐提升**。
 
-## 火焰图：回查不是最大 CPU 热点
+### v9 火焰图中的回查开销
 
 v9 leader 共 **253 个样本 / 506 ms**；可识别的 `WaitApplied` 调用侧为 **5 个 / 10 ms（2.0%）**，
 复测为 **3/282（1.1%）**。原诊断确认 fiber 结束时的 `CheckStackMargin` 另有 5 个样本；
@@ -43,7 +51,7 @@ worker 的 **93 个**样本中 **70 个**属于 `AppendSetBatch`；不能把整�
 每轮源码确实创建 1024 个确认 fiber；当前负载最多 31 个票据，每个 fiber 默认栈 64 KiB，
 对应约 **1.94 MiB** 的栈容量上限量级，不能称为实测 RSS 节省。输入释放和日志/应用工作仍必须保留。
 
-## 建议实验边界
+### v9 阶段的试验设想
 
 - 先将票据按 `(epoch, end_offset)` 登记，在连续 applied 前缀推进时批量完成，避免完成通知再过 I/O 屏障。
   只改变完成通知；SET 仍等多数确认和本地应用，WAIT 仍确认副本 applied。

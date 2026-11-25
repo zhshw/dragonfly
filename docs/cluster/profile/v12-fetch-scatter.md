@@ -20,7 +20,7 @@ Raft memory、1 连接、pipeline 64、256 MiB、256 KiB/value，吞吐包含原
 
 Leader CPU **510 → 470 ms（−7.8%）**，memcpy 叶子样本 **87 → 72**；Follower CPU **256 → 266 ms**。同样 1024 笔写的 WAL 提交 **153 → 176 次**，worker 排队区间并集 **211.95 → 265.10 ms**。各区间会重叠，单次采样不能证明因果。 [火焰图](http://127.0.0.1:8787/#/v12/flamegraphs) · [Trace](http://127.0.0.1:8787/#/v12/trace)
 
-**收益与慢轮原因待确认，代码暂回退至 v10。** 保留候选补丁和二进制，后续先核实慢轮与合批节奏，不将 CPU 热点下降直接等同于吞吐提升。Follower 借用解码方案尚未测试。
+**收益与慢轮原因待确认，代码暂回退至 v10。** 保留候选补丁和二进制，复试时优先核实慢轮与合批节奏。Follower 借用解码随后在 v13 单独测试并保留。 [v13 Follower 借用解码](v13-fetch-borrow.md)
 
 Debug、Release、ASAN+UBSAN 各 25 项协议/网络单测通过，覆盖 Java golden、null/empty、大 records、多分片及超限回退、输出不变、8 MiB 发送与断连重连；flush/memory 两项 pipeline 回归通过。平台另完成 29 项单测、一项集成回归、三轮正确性验证和独立诊断。首次平台构建发现 v11 回退遗留的测试目标文件，核对源码并重编译后续跑成功，没有追加 benchmark 轮次。
 

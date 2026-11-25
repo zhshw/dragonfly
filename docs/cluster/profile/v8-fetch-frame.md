@@ -1,6 +1,6 @@
 # v8：Fetch 直接封帧
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 ## P1-7 实验：Fetch 直接封帧，减少 leader 复制（v8）
 
@@ -89,7 +89,7 @@ records 写入最终帧的 22 个样本仍对应必要复制，不能把全部 1
 - 已使用同一 schema 预计算长度，一次 reserve 后将长度、header 和 body 写进最终帧。
   本轮合并验证“避免扩容”和“去掉 body → frame 副本”，未分别量化；编码失败时保留原输出。
 - 后续可与 P1-4 配合，让 parked Fetch 引用在途 WAL 的不可变范围，避免发布和填充 response 时再各复制一次。
-  进一步采用分散缓冲发送时，再处理 buffer 所有权、部分发送和背压；先完成单缓冲版本。
+  分散缓冲发送涉及 buffer 所有权、部分发送和背压。v12 在 Leader 试验分散发送，收益待确认，代码暂回退。v13 独立验证并保留了 Follower 借用解码。 [v12 实验](v12-fetch-scatter.md) · [v13 实验](v13-fetch-borrow.md)
 
 **验收：** Fetch 各协议版本逐字节一致，frame 长度、tag、空/null records、截断输入和错误返回正确；
 发送前复制字节、分配和 leader CPU 下降，原连接 WAIT 与恢复检查通过。

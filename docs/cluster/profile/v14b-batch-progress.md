@@ -1,8 +1,8 @@
 # v14b Folly io_uring 批次事件循环（首版修正）
 
-**延续 v14 的 Folly io_uring 新架构，保留实现，上一轮选择 v13。** 普通 SET 使用有界准入、固定编码执行器、独立 ApplyLane 和共享回复水位，移除逐笔确认 fiber、applied 回查及逐笔定时器。节点 RPC 使用 Folly io_uring；测试已关闭强制 epoll，并断言 RESP 实际后端为 `iouring`。
+**延续 v14 的 Folly io_uring 新架构，保留实现，上一轮选择 v13。** 普通 SET 使用有界准入、固定编码执行器、独立 ApplyLane 和共享回复水位，移除逐笔确认 fiber、applied 回查及逐笔定时器。节点 RPC 使用 Folly io_uring；测试已关闭强制 epoll，并断言 RESP 实际后端为 `iouring`。 [P1-3 票据完成](p1-3-review.md#v14--v14b-落地)
 
-v14b 仅修复首版的 applied 上报和 WAIT 唤醒 bug：Follower 应用在途时先报告接收位置，空响应等待本地批次完成事件，再报告 applied；Leader WAIT 订阅副本进度变化。连接关闭、超时和条件写仍保留原有检查与屏障。 [首版 v14 记录](v14-batch-event-loop.md) · [设计与实现边界](../raft-batch-event-loop.md)
+v14b 修复首版的 applied 上报和 WAIT 唤醒。Follower 将普通缓存前缀交给独立、有界的 ApplyLane，完成事件只发布实际成功的前缀。应用在途时先报告接收位置。遇到空响应时等待本地批次完成事件，再报告 applied，避免新的 applied 水位滞留在长轮询期间。Leader WAIT 订阅副本进度变化。连接关闭、超时和条件写仍受原有检查与屏障约束。平台结果同时覆盖共享回复水位、Folly RPC 和此处的进度上报。 [P0-1b 早期尝试（已回退）](p0-1b-follower-receipt.md) · [首版 v14 记录](v14-batch-event-loop.md) · [设计与实现边界](../raft-batch-event-loop.md)
 
 ## 实验结果
 

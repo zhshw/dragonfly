@@ -1,6 +1,6 @@
 # v9：SET 输入所有权转交
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 <a id="input-ownership"></a>
 
@@ -10,6 +10,8 @@
 准入拒绝不改变原参数，外部参数保留复制回退。drain 完成后释放输入，effect/WAL 独立持有共享缓冲。
 票据销毁时才归还 `reserved_bytes`，保持 **8 MiB / 256 笔**反压；同步修正连接队列字节统计和旧参数视图，
 支持命令提前销毁及断连，确认条件和回复顺序不变。这是 P1-5 的第一步，尚未统一全流程内存预算。
+
+每个数据副本的 effect 缓存另有 **8 MiB / 4096 条**上限。复核在途内存时按唯一缓冲的实际 capacity 统计，并分别观察分配、fiber 栈与进程 RSS。 [effect 缓存计费](../../../src/server/cluster/raft/data/set_effect.cc)
 
 Ubuntu 同机未插桩 Folly Release，Raft 使用 **memory ack**，**1 连接 / pipeline 64**，256 MiB、256 KiB/value，
 64 笔预热、5 秒静置；三版本交错各三轮，计时均包含 **SET + 原写连接 WAIT 1**，表中为中位数。

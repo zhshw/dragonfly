@@ -1,11 +1,13 @@
 # v10：memory 后台同步与普通追加并行
 
-[返回总览与优化项](../profile.md#memory-flush-separation) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#memory-flush-separation) · [benchmark](../replication-benchmark.md)
 
 **P1-6 已保留。** 将追加与后台同步分开管理，同任期、同一段的普通 memory 写可在 fsync 期间继续编码、追加、复制和确认。
 
 - 同步只发布启动时捕获的日志位置，新追加保留自己的字节和时间计数。任一 I/O 失败后持续拒绝写入。
 - 维持 64 MiB / 100 ms 同步条件、队列预算和应用后回复语义。换主、控制记录、换段、截断、快照及关闭保留相应屏障。
+
+拆分后台同步与普通追加前的等待证据见 v9 诊断。 [v9 Trace 复核](v9-trace-review.md)
 
 ## 平台归档
 

@@ -1,6 +1,6 @@
 # v4：共享 WAL 缓冲与直接编码
 
-[返回总览与优化项](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
 
 ## 上轮复采：复制下降，应用与 RSS 尚未改善（v4）
 

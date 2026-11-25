@@ -1,8 +1,6 @@
 # Raft 复制优化与 benchmark
 
-当前 v10（P1-6）支持 memory 后台同步期间继续普通追加。本轮、基线和原 cluster 参照以平台归档为准。 [Profile 总览](profile.md#当前结果)
-
-下文记录历次改动的对照结果。`flush`、`memory` 和确认模式对比分节列出，各项吞吐取当时的三轮中位数，并使用当时的基线。
+下文记录历次改动的对照结果。`flush`、`memory` 和确认模式对比分节列出，各项吞吐取当时的三轮中位数，并使用当时的基线。 [Profile 实验索引](profile.md#experiments)
 
 <a id="本轮同连接-set-已能提前提交"></a>
 
@@ -117,7 +115,7 @@ SET + WAIT 1 口径，新旧版本显式使用 `memory`，各三轮交错运行�
   去掉中间 payload/body/records。日志格式、CRC、提交与应用确认条件保持不变。
 - **正确性**：本轮 9 轮均完成 WAIT 1、离线副本恢复、WAIT 2 和 1088 个值读回；
   Debug/Release 单元回归、57 项 ASAN/UBSAN 检查、11 项集群回归通过。
-- 本轮只测 1 连接；effect 缓存副本、drain 聚合复制和逐笔应用仍保留。代码依据和后续顺序见 [profile](profile.md)。
+- 本轮只测 1 连接；effect 缓存副本、drain 聚合复制和逐笔应用仍保留。 [v4 共享 WAL 缓冲](profile/v4-wal-buffer.md) · [v5 批量应用](profile/v5-batched-apply.md) · [v6 直接聚合](profile/v6-drain-sharing.md)
 
 ```sh
 python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
@@ -172,7 +170,7 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
 
 232.92 是已优化版本的本轮复测，不能改称原始基线；原始 **169.56 MiB/s** 继续保留。
 本轮二进制、源码差异、四版本脚本 `compare_steps.py` 和原始数据在本地及测试机
-`docs/cluster/benchmarks/profile-drain-20261123/`，由 Git 忽略。CPU、内存与 trace 复核见 [profile](profile.md)。
+`docs/cluster/benchmarks/profile-drain-20261123/`，由 Git 忽略。
 
 ## memory 优化：follower 复用接收批次
 

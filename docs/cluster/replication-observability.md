@@ -1,8 +1,6 @@
 # raft.memory 火焰图与 trace
 
-本页保留优化前 v3 诊断。原始 `raft.memory` 基线 **169.56 → 当前 224.69 MiB/s，累计 +32.5%**（同口径跨轮比较）。
-共享 WAL 缓冲、直接编码、批量应用与借用参数已实现；本轮相对已优化上一版 206.56 MiB/s 的增量为 **+8.8%**。
-当前结果和后续优化项见 [profile](profile.md)。
+本页保留优化前 v3 诊断。后续 v5 实现共享 WAL 缓冲与直接编码基础上的批量应用和参数借用，`raft.memory` 从 v3 的 **169.56** 提高到 **224.69 MiB/s（+32.5%，同口径跨轮比较）**，较上一版的 **206.56 MiB/s** 提高 **8.8%**。 [v5 实验](profile/v5-batched-apply.md) · [Profile 实验索引](profile.md#experiments)
 
 **仍有阻塞，优先处理 worker 内的数据复制、编码与应用路径。**
 memory 取消逐轮持久化确认后，未插桩吞吐只提高 4.4%。此次采样将剩余成本定位到具体阶段，
@@ -70,13 +68,11 @@ memory 取消逐轮持久化确认后，未插桩吞吐只提高 4.4%。此次�
 - 两种模式最后 WAIT 都约 **101 ms**；差距已经出现在 SET 回复前，单改最终 WAIT 无法解决主要差距。
 - `raft.memory` 仍写 page cache 并后台刷盘；本轮 FSYNC 及排空等待说明刷盘影响仍在，只是不足以解释全部差距。
 
-## 下一步
+## v3 诊断提出的优化方向
 
-具体代码依据、内存预算及分项验收见 [profile 优化项](profile.md)。
-
-1. 减少 `AppendSetBatch → MakeSetEffectBatch → 日志聚合` 的重复复制，缩短 worker 占用；保持不可变缓冲生命周期和日志字节完全一致。
-2. 拆分应用阶段的日志读取、解码、跨线程等待和实际 KV 写入，评估批量应用能否减少逐笔往返。
-3. 再评估能否缩小在途 I/O 阻塞的操作范围；换主、截断、快照和恢复标记仍须保持顺序。
+1. 减少 `AppendSetBatch → MakeSetEffectBatch → 日志聚合` 的重复复制，缩短 worker 占用；保持不可变缓冲生命周期和日志字节完全一致。 [v6 直接聚合](profile/v6-drain-sharing.md)
+2. 拆分应用阶段的日志读取、解码、跨线程等待和实际 KV 写入，评估批量应用能否减少逐笔往返。 [v5 批量应用](profile/v5-batched-apply.md)
+3. 再评估能否缩小在途 I/O 阻塞的操作范围；换主、截断、快照和恢复标记仍须保持顺序。 [v10 后台同步与普通追加并行](profile/v10-memory-flush-overlap.md)
 
 每次只改一个变量，先复测 1 连接 pipeline 64，不扩展连接数。
 完整 CSV、CPU profile、Perfetto JSON 保存在隔离仓库 `docs/cluster/benchmarks/observability-20261123/`，
