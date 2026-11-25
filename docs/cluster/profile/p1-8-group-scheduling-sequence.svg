@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="780" viewBox="0 0 1080 780" role="img" aria-labelledby="title desc" lang="zh-CN">
+  <title id="title">P1-8 候选时序：SET 的完成和协议到期</title>
+  <desc id="desc">三 voter、memory 模式，Follower 通过连续两次 Fetch 先获取数据再报告位置。Leader 结合多数确认和本地 apply 发布有序回复。另一种独立唤醒来自已经登记的协议期限。</desc>
+  <style>
+    text { font-family: -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #183743; }
+    .title { font-weight: 650; font-size: 22px; }
+    .head { font-weight: 650; font-size: 17px; }
+    .body { font-size: 16px; }
+    .sub { font-size: 14px; fill: #425f6c; }
+    .ink { fill: none; stroke: #366b86; stroke-width: 1.7; stroke-linejoin: round; }
+    .timer { fill: none; stroke: #926a2d; stroke-width: 1.7; stroke-linejoin: round; }
+    .life { fill: none; stroke: #adc1ca; stroke-width: 1.2; stroke-dasharray: 4 5; }
+  </style>
+  <rect width="1080" height="780" fill="#fff"/>
+  <text x="22" y="33" class="title" text-anchor="start">候选时序 · 一批普通 SET 的完成路径</text>
+  <text x="22" y="59" class="sub" text-anchor="start">同一任期，三 voter，批尾位置为 e。箭头表示逻辑交接，RPC 经过网络和 fiber 的路径见架构图。</text>
+  <rect x="12" y="79" width="156" height="39" rx="8" fill="#edf5f8" stroke="#9ab6c2"/>
+  <text x="90" y="105" class="head" text-anchor="middle">写连接</text>
+  <path class="life" d="M90 119 V594"/>
+  <rect x="247" y="79" width="156" height="39" rx="8" fill="#edf5f8" stroke="#9ab6c2"/>
+  <text x="325" y="105" class="head" text-anchor="middle">Leader GroupLoop</text>
+  <path class="life" d="M325 119 V594"/>
+  <rect x="482" y="79" width="156" height="39" rx="8" fill="#edf5f8" stroke="#9ab6c2"/>
+  <text x="560" y="105" class="head" text-anchor="middle">Leader WAL</text>
+  <path class="life" d="M560 119 V594"/>
+  <rect x="707" y="79" width="156" height="39" rx="8" fill="#edf5f8" stroke="#9ab6c2"/>
+  <text x="785" y="105" class="head" text-anchor="middle">Follower</text>
+  <path class="life" d="M785 119 V594"/>
+  <rect x="914" y="79" width="156" height="39" rx="8" fill="#edf5f8" stroke="#9ab6c2"/>
+  <text x="992" y="105" class="head" text-anchor="middle">Leader ApplyLane</text>
+  <path class="life" d="M992 119 V594"/>
+  <text x="555.0" y="146" class="body" text-anchor="middle">Fetch 上报旧位置，请求等待新记录</text>
+  <path class="ink" d="M785 154 H325 m7 -4 l-7 4 l7 4"/>
+  <text x="207.5" y="185" class="body" text-anchor="middle">SET 准入并入队</text>
+  <path class="ink" d="M90 193 H325 m-7 -4 l7 4 l-7 4"/>
+  <text x="442.5" y="224" class="body" text-anchor="middle">提交已编码的 WAL 批次</text>
+  <path class="ink" d="M325 232 H560 m-7 -4 l7 4 l-7 4"/>
+  <text x="442.5" y="263" class="body" text-anchor="middle">写入完成 CQE，发布本地位置 e</text>
+  <path class="ink" d="M560 271 H325 m7 -4 l-7 4 l7 4"/>
+  <text x="555.0" y="302" class="body" text-anchor="middle">唤醒已挂起的 Fetch，返回记录</text>
+  <path class="ink" d="M325 310 H785 m-7 -4 l7 4 l-7 4"/>
+  <path class="ink" d="M785 332 h28 v15 h-28 m7 -4 l-7 4 l7 4"/>
+  <text x="824" y="346" class="body" text-anchor="start">本地 WAL 追加至 e</text>
+  <text x="555.0" y="376" class="body" text-anchor="middle">下一次 Fetch 回报接收位置 e</text>
+  <path class="ink" d="M785 384 H325 m7 -4 l-7 4 l7 4"/>
+  <path class="ink" d="M325 402 h28 v15 h-28 m7 -4 l-7 4 l7 4"/>
+  <text x="364" y="416" class="body" text-anchor="start">多数 voter 已覆盖 e，推进 HW</text>
+  <text x="658.5" y="449" class="body" text-anchor="middle">投递 HW 覆盖的连续批次</text>
+  <path class="ink" d="M325 457 H992 m-7 -4 l7 4 l-7 4"/>
+  <text x="658.5" y="488" class="body" text-anchor="middle">返回成功前缀，本地 applied 推进至 e</text>
+  <path class="ink" d="M992 496 H325 m7 -4 l-7 4 l7 4"/>
+  <path class="ink" d="M325 514 h28 v15 h-28 m7 -4 l-7 4 l7 4"/>
+  <text x="364" y="528" class="body" text-anchor="start">发布同任期回复水位 R</text>
+  <text x="207.5" y="571" class="body" text-anchor="middle">R 覆盖 e，连接按 FIFO 回复</text>
+  <path class="ink" d="M325 579 H90 m7 -4 l-7 4 l7 4"/>
+  <rect x="12" y="614" width="1056" height="151" rx="8" fill="#fcf7ef" stroke="#d9c6a3"/>
+  <text x="30" y="644" class="head" text-anchor="start">独立唤醒 · 没有数据就绪时，仍能处理协议期限</text>
+  <text x="30" y="669" class="sub" text-anchor="start">例：Leader 已登记多数派联系期限，此后持续失联。</text>
+  <text x="132" y="722" class="head" text-anchor="middle">GroupLoop</text>
+  <text x="928" y="722" class="head" text-anchor="middle">Folly 组定时器</text>
+  <text x="530" y="695" class="body" text-anchor="middle">已登记的期限到达，唤醒组复核多数派联系时间</text>
+  <path class="timer" d="M850 703 H212 m7 -4 l-7 4 l7 4"/>
+  <text x="530" y="730" class="sub" text-anchor="middle">仍满足退位条件时切换角色，按新角色登记下一有效期限</text>
+  <path class="timer" d="M212 740 H850 m-7 -4 l7 4 l-7 4"/>
+</svg>

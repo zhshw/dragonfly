@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="496" viewBox="0 0 1040 496" role="img" aria-labelledby="title desc" lang="zh-CN">
+  <title id="title">共同的 io_uring 事件循环与两种组内调度方式</title>
+  <desc id="desc">WAL 完成直接进入 GroupLoop，RPC 经网络循环及 fiber 交接，ApplyLane 交回成功前缀。旧入口可以同时检查数据与协议，候选按就绪原因处理，真实到期才调度超时工作。</desc>
+  <style>
+    text { font-family: -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #183743; }
+    .title { font-weight: 650; font-size: 22px; }
+    .head { font-weight: 650; font-size: 17px; }
+    .body { font-size: 16px; }
+    .sub { font-size: 14px; fill: #425f6c; }
+    .ink { fill: none; stroke: #366b86; stroke-width: 1.7; stroke-linejoin: round; }
+    .timer { fill: none; stroke: #926a2d; stroke-width: 1.7; stroke-linejoin: round; }
+    .life { fill: none; stroke: #adc1ca; stroke-width: 1.2; stroke-dasharray: 4 5; }
+  </style>
+  <rect width="1040" height="496" fill="#fff"/>
+  <text x="26" y="36" class="title" text-anchor="start">两版共用 io_uring + poll</text>
+  <text x="26" y="62" class="body" text-anchor="start">Folly EventBase 等待并分发就绪工作。两版的差别在于 GroupLoop 收到工作后检查哪些状态。</text>
+  <rect x="26" y="81" width="289" height="67" rx="8" fill="#edf5f8" stroke="#95b4c1"/>
+  <text x="170.5" y="107" class="head" text-anchor="middle">WAL 完成</text>
+  <text x="170.5" y="133" class="sub" text-anchor="middle">CQE 在组 EventBase 上直接执行</text>
+  <rect x="331" y="81" width="378" height="67" rx="8" fill="#edf5f8" stroke="#95b4c1"/>
+  <text x="520.0" y="107" class="head" text-anchor="middle">节点 RPC</text>
+  <text x="520.0" y="133" class="sub" text-anchor="middle">网络 EventBase ↔ handler / peer fiber ↔ 组</text>
+  <rect x="725" y="81" width="289" height="67" rx="8" fill="#edf5f8" stroke="#95b4c1"/>
+  <text x="869.5" y="107" class="head" text-anchor="middle">ApplyLane 完成</text>
+  <text x="869.5" y="133" class="sub" text-anchor="middle">CompleteApply 将成功前缀交回组</text>
+  <path class="ink" d="M170 148 V168 H870 V148 M520 148 V189 m-4 -7 l4 7 l4 -7"/>
+  <rect x="270" y="191" width="500" height="48" rx="8" fill="#e9f2f5" stroke="#90aeb9"/>
+  <text x="520" y="221" class="head" text-anchor="middle">组内处理本次回调或队列任务</text>
+  <path class="ink" d="M520 239 V259 M270 278 V259 H770 V278 M266 271 l4 7 l4 -7 M766 271 l4 7 l4 -7"/>
+  <rect x="26" y="280" width="488" height="193" rx="8" fill="#fbf6ee" stroke="#d7c29b"/>
+  <rect x="526" y="280" width="488" height="193" rx="8" fill="#edf6f5" stroke="#9abeb8"/>
+  <text x="44" y="312" class="title" text-anchor="start">现有 · 多个入口重入 Tick()</text>
+  <text x="44" y="347" class="body" text-anchor="start">常规路径进入 PollTimers()。</text>
+  <text x="44" y="373" class="body" text-anchor="start">选举与 epoch 检查前后都做 Synchronize()，</text>
+  <text x="44" y="397" class="body" text-anchor="start">每次同步都可能尝试 apply。</text>
+  <text x="44" y="447" class="sub" text-anchor="start">另有 25 ms 的 peer 管理巡检和空闲／退避唤醒。</text>
+  <text x="544" y="312" class="title" text-anchor="start">候选 · 按就绪原因推进</text>
+  <text x="544" y="347" class="body" text-anchor="start">WAL / Fetch 更新复制位置，HW 前进时投递 apply。</text>
+  <text x="544" y="373" class="body" text-anchor="start">ApplyLane 完成后更新回复水位，按需续批。</text>
+  <text x="544" y="397" class="body" text-anchor="start">角色或成员变化时同步对应协议状态。</text>
+  <text x="544" y="447" class="sub" text-anchor="start">登记最早有效期限，到期后才复核相关超时。</text>
+</svg>
