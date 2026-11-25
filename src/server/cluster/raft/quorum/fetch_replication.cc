@@ -442,6 +442,21 @@ optional<OutboundFetch> FetchReplication::PrepareFetch(int32_t peer_id, int16_t 
 
 bool FetchReplication::CanReceiveDuringFlush(int32_t source_id, uint64_t sequence,
                                              const FetchResponse& response) const {
+  return FlushGate(source_id, sequence, response) == trace::Gate::kAllowed;
+}
+
+bool FetchReplication::CanReceiveResponse(int32_t source_id, uint64_t sequence,
+                                          const FetchResponse& response,
+                                          trace::FetchTrace* request_trace) const {
+  const auto gate =
+      log_.FlushPending() ? FlushGate(source_id, sequence, response) : trace::Gate::kAllowed;
+  if (request_trace)
+    request_trace->CheckGate(gate, log_.TraceFlushId());
+  return gate == trace::Gate::kAllowed;
+}
+
+trace::Gate FetchReplication::FlushGate(int32_t source_id, uint64_t sequence,
+                                        const FetchResponse& response) const {
   const auto& state = campaign_.state();
   if (request_peer_ != source_id || sequence != sequence_ || state.storage_error ||
       state.role != QuorumRole::kFollower || state.role != request_role_ ||
@@ -449,21 +464,37 @@ bool FetchReplication::CanReceiveDuringFlush(int32_t source_id, uint64_t sequenc
       response.error_code != 0 || response.responses.size() != 1 ||
       response.responses.front().topic_id != topic_id_ ||
       response.responses.front().partitions.size() != 1)
-    return false;
+    return trace::Gate::kUnmatchedResponse;
   const auto& part = response.responses.front().partitions.front();
   if (part.partition_index != campaign_.target().partition || part.error_code != 0 ||
       part.current_leader.leader_id != source_id ||
       part.current_leader.leader_epoch != request_epoch_ || part.diverging_epoch.epoch >= 0 ||
       part.diverging_epoch.end_offset >= 0 || part.snapshot_id.epoch >= 0 ||
       part.snapshot_id.end_offset >= 0)
-    return false;
+    return trace::Gate::kStructuralResponse;
   auto records = part.records.View();
-  return !records || records->empty() || log_.CanAppendDuringFlush(*records);
+  return !records || records->empty() ? trace::Gate::kAllowed : log_.FlushGate(*records);
 }
 
 absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
                                                     FetchResponse response,
-                                                    bool* reset_fetch_timeout) {
+                                                    bool* reset_fetch_timeout,
+                                                    trace::FetchTrace* request_trace) {
+  if (request_trace)
+    request_trace->ReceiveStarted();
+  string_view outcome = "Ignored";
+  auto status = ReceiveFetchResponseImpl(source_id, sequence, std::move(response),
+                                         reset_fetch_timeout, request_trace, &outcome);
+  if (request_trace)
+    request_trace->Finish(status.ok() ? outcome : "Error");
+  return status;
+}
+
+absl::Status FetchReplication::ReceiveFetchResponseImpl(int32_t source_id, uint64_t sequence,
+                                                        FetchResponse response,
+                                                        bool* reset_fetch_timeout,
+                                                        trace::FetchTrace* request_trace,
+                                                        string_view* outcome) {
   if (reset_fetch_timeout)
     *reset_fetch_timeout = false;
   const auto& state = campaign_.state();
@@ -528,6 +559,7 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
       requested_snapshot_ = cut;
   } else {
     auto records = part.records.View();
+    *outcome = records && !records->empty() ? "No progress" : "Empty";
     if (records && !records->empty()) {
       shared_ptr<const void> buffer;
       size_t capacity = 0;
@@ -546,7 +578,15 @@ absl::Status FetchReplication::ReceiveFetchResponse(int32_t source_id, uint64_t 
       vector<PartitionLog::ValidatedBatch> appended;
 
       // Kafka discards an invalid records payload and retries from the durable LEO.
-      auto status = log_.AppendAsFollower(bytes, epoch, fetched_records_ ? &appended : nullptr);
+      const auto start = request_trace ? request_trace->Now() : 0;
+      const auto first = log_.End().end_offset;
+      size_t appended_bytes = 0;
+      auto status = log_.AppendAsFollower(bytes, epoch, fetched_records_ ? &appended : nullptr,
+                                          request_trace ? &appended_bytes : nullptr);
+      if (request_trace)
+        request_trace->Appended(start, appended_bytes, first, log_.End().end_offset, status.ok());
+      if (status.ok())
+        *outcome = "Data";
       if (!status.ok() && !log_.io_failure().ok())
         return DurableFailure(status);
       if (status.ok()) {

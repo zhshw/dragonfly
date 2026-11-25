@@ -17,6 +17,7 @@
 #include "common/backed_args.h"
 #include "facade/reply_progress.h"
 #include "server/cluster/cluster_defs.h"
+#include "server/cluster/raft/data/admission_budget.h"
 #include "server/cluster/raft/data/write_position.h"
 #include "server/common_types.h"
 #include "util/fibers/synchronization.h"
@@ -81,6 +82,14 @@ class DataCommandHandler {
   // on rejection args is unchanged. The fallback copies through the ordinary owning API.
   virtual std::shared_ptr<PendingDataWrite> TrySetOwned(DbIndex db, cmn::BackedArguments* args) {
     return TrySet(db, (*args)[1], (*args)[2]);
+  }
+
+  virtual std::shared_ptr<trace::Admission> NewAdmissionTrace(uint64_t connection) {
+    return nullptr;
+  }
+  virtual std::shared_ptr<PendingDataWrite> TrySetObserved(DbIndex db, cmn::BackedArguments* args,
+                                                           trace::Admission* admission) {
+    return TrySetOwned(db, args);
   }
 
   virtual absl::Status Set(DbIndex db, std::string_view key, std::string_view value,

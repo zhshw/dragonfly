@@ -25,6 +25,9 @@ namespace dfly::cluster::raft {
 class ElectionCampaign;
 class FetchReplication;
 class PartitionLog;
+namespace trace {
+class Capture;
+}
 
 // All partition state, including application and I/O completion callbacks, runs on its worker.
 class RaftGroup {
@@ -59,6 +62,9 @@ class RaftGroup {
   using DataDriver =
       std::function<std::optional<std::chrono::steady_clock::time_point>(State, bool unavailable)>;
   void SetDataDriver(DataDriver driver);
+
+  // Install before capture traffic; all recording remains on this group's serial owner.
+  void SetTraceCapture(std::shared_ptr<trace::Capture> capture);
   void WakeData();
 
   using ApplyStep = std::function<absl::StatusOr<int64_t>(const PartitionLog&, int64_t)>;

@@ -1,20 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import type { MouseEvent } from 'react';
 import { api, number } from './model';
+import type { StageSpan } from './stage-metrics';
 
 export type TimelinePhase = { key: string; role: string; stage: string };
 
 type CaptureSource = { title: string; url?: string };
-type Span = {
-  name: string;
-  cat: string;
-  pid: string | number;
-  tid: number;
-  ph: string;
-  ts: number;
-  dur: number;
-  args?: { arg0?: number; arg1?: number };
-};
+export type Span = StageSpan;
 type Archive = { end: number; tracks: Map<string, Span[]> };
 type ArchiveState = { url: string; data?: Archive; error?: string };
 type TimeWindow = { start: number; length: number };
@@ -43,7 +35,7 @@ function readArchive(events: Span[]): Archive {
   return { end, tracks };
 }
 
-function useArchive(url?: string) {
+export function useArchive(url?: string) {
   const [state, setState] = useState<ArchiveState>();
   const [request, setRequest] = useState(0);
   useEffect(() => {
@@ -65,7 +57,7 @@ function useArchive(url?: string) {
 
 const milliseconds = (microseconds: number) => number(microseconds / 1000, 3);
 
-function TimelineTrack({ spans, color, range, label, picked, onPick }: {
+export function TimelineTrack({ spans, color, range, label, picked, onPick }: {
   spans: Span[];
   color: string;
   range: TimeWindow;
@@ -204,7 +196,7 @@ export function TraceTimeline({ phases, phase, setPhase, sources }: {
       </>}
       {selected && <div className="timeline-detail" role="status">
         <strong>{selected.span.name}</strong><span>{sources[selected.source].title} · {roleLabels[selected.span.cat] ?? selected.span.cat}</span>
-        <span>节点 {selected.span.pid} / TID {selected.span.tid}</span>
+        <span>节点 {selected.span.pid}{selected.span.tid === undefined ? '' : ` / TID ${selected.span.tid}`}</span>
         <span>{milliseconds(selected.span.ts)}–{milliseconds(selected.span.ts + selected.span.dur)} ms</span>
         <span>耗时 {milliseconds(selected.span.dur)} ms</span>
         {Object.entries(selected.span.args ?? {}).map(([key, value]) => Number.isSafeInteger(value) && <span key={key}>{key} = {number(value, 0)}</span>)}

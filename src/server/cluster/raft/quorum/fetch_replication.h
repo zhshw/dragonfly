@@ -121,11 +121,16 @@ class FetchReplication {
                                                           int32_t max_wait_ms, int32_t max_bytes);
   [[nodiscard]] absl::Status ReceiveFetchResponse(int32_t source_id, uint64_t sequence,
                                                   protocol::FetchResponse response,
-                                                  bool* reset_fetch_timeout = nullptr);
+                                                  bool* reset_fetch_timeout = nullptr,
+                                                  trace::FetchTrace* request_trace = nullptr);
 
   // Admission only. Defer role changes, controls and extent replacement until the flush drains.
   bool CanReceiveDuringFlush(int32_t source_id, uint64_t sequence,
                              const protocol::FetchResponse& response) const;
+  // The runtime and deterministic tests use this same admission decision.
+  bool CanReceiveResponse(int32_t source_id, uint64_t sequence,
+                          const protocol::FetchResponse& response,
+                          trace::FetchTrace* request_trace = nullptr) const;
   std::optional<LogPosition> RequestedSnapshot() const {
     const auto& state = campaign_.state();
     if (state.role != QuorumRole::kFollower || state.election.epoch != request_epoch_ ||
@@ -145,6 +150,12 @@ class FetchReplication {
   [[nodiscard]] absl::Status SnapshotInstalled(LogPosition snapshot_id);
 
  private:
+  trace::Gate FlushGate(int32_t source_id, uint64_t sequence,
+                        const protocol::FetchResponse& response) const;
+  absl::Status ReceiveFetchResponseImpl(int32_t source_id, uint64_t sequence,
+                                        protocol::FetchResponse response, bool* reset_fetch_timeout,
+                                        trace::FetchTrace* request_trace,
+                                        std::string_view* outcome);
   absl::StatusOr<std::vector<CampaignVoter>> ConfiguredVoters(
       const MembershipHistory& history) const;
   void UpdateHighWatermark();

@@ -23,6 +23,10 @@
 #include "base/flags.h"
 #include "facade/dragonfly_listener.h"
 #include "facade/facade_test.h"
+#include "server/cluster/raft/data/admission_budget.h"
+#include "server/cluster/raft/data/write_progress.h"
+#include "server/cluster/raft/log/partition_log.h"
+#include "server/cluster/raft/log/record_batch.h"
 #include "server/conn_context.h"
 #include "server/engine_shard_set.h"
 #include "server/test_utils.h"
@@ -131,8 +135,7 @@ class DragonflyConnectionTest : public BaseFamilyTest {
     absl::SetFlag(&FLAGS_enable_resp_io_loop_v2, true);
     absl::SetFlag(&FLAGS_enable_shared_read_buffer, UseSharedReadBuffer());
     BaseFamilyTest::SetUp();
-    ASSERT_EQ(RunPrivileged({"ACL", "SETUSER", "default", "on", "nopass", "+@all", "~*", "&*"}),
-              "OK");
+    ConfigureDefaultUser();
 
     acceptor_ = std::make_unique<util::AcceptServer>(pp_.get(), /*break_on_int=*/false);
     pp_->at(0)->Await([this] {
@@ -198,6 +201,11 @@ class DragonflyConnectionTest : public BaseFamilyTest {
     });
   }
 
+  virtual void ConfigureDefaultUser() {
+    ASSERT_EQ(RunPrivileged({"ACL", "SETUSER", "default", "on", "nopass", "+@all", "~*", "&*"}),
+              "OK");
+  }
+
   virtual bool UseSharedReadBuffer() const {
     return false;
   }
@@ -207,6 +215,175 @@ class DragonflyConnectionTest : public BaseFamilyTest {
   std::unique_ptr<util::AcceptServer> acceptor_;
   absl::FlagSaver flag_saver_;
 };
+
+namespace raft = cluster::raft;
+
+// Real RESP queue and reply coroutines, real reservation retirement and WAL appends. Only quorum
+// reply progress and the monotonic clock are controlled, so no disk or scheduler delay is assumed.
+class RaftAdmissionConnectionTest : public DragonflyConnectionTest,
+                                    public raft::DataCommandHandler {
+ protected:
+  struct Write : raft::WatermarkWrite {
+    Write(std::shared_ptr<raft::WriteEpoch> epoch, raft::AdmissionBudget::Reservation reservation)
+        : WatermarkWrite(std::move(epoch)), reservation(std::move(reservation)) {
+    }
+    raft::AdmissionBudget::Reservation reservation;
+    cmn::BackedArguments input;
+  };
+
+  void SetUp() override {
+    SetTestFlag("cluster_mode", "raft");
+    absl::SetFlag(&FLAGS_enable_pipeline_squashing_v2, false);
+    std::string path = (std::filesystem::temp_directory_path() / "raft-admission-XXXXXX").string();
+    ASSERT_NE(mkdtemp(path.data()), nullptr);
+    directory_ = path;
+    capture_ = std::make_shared<raft::trace::Capture>("unit-admission", "leader", "10", 1, 1U << 20,
+                                                      [&] { return clock_.load(); });
+    log_ = raft::PartitionLog::Open(directory_, 1U << 20, raft::PartitionLog::AckMode::kMemory)
+               .value();
+    log_->SetTraceCapture(capture_);
+    log_->SetWalCompleteHook(
+        [progress = budget_.progress()](int64_t now) { progress->wal_complete.store(now); });
+    DragonflyConnectionTest::SetUp();
+  }
+
+  void TearDown() override {
+    DragonflyConnectionTest::TearDown();
+    writes_.clear();
+    log_.reset();
+    std::filesystem::remove_all(directory_);
+  }
+
+  void ConfigureDefaultUser() override {
+    // Configure authentication before accepting sockets; ACL is outside the Raft data API.
+    service_->SetRaftDataCommands(nullptr);
+    DragonflyConnectionTest::ConfigureDefaultUser();
+    service_->SetRaftDataCommands(this);
+  }
+
+  std::vector<facade::Listener*> CreateListeners() override {
+    service_->SetRaftDataCommands(this);
+    return {};
+  }
+  bool SupportsAsyncSet() const override {
+    return true;
+  }
+  std::shared_ptr<raft::trace::Admission> NewAdmissionTrace(uint64_t connection) override {
+    owner_ = util::fb2::ProactorBase::me();
+    return std::make_shared<raft::trace::Admission>(capture_, connection, budget_.progress());
+  }
+  std::shared_ptr<raft::PendingDataWrite> TrySetObserved(
+      DbIndex, cmn::BackedArguments* args, raft::trace::Admission* admission) override {
+    const auto bytes = (*args)[1].size() + (*args)[2].size();
+    auto reservation = budget_.TryReserve(bytes);
+    if (!reservation) {
+      admission->Rejected(args, bytes, budget_);
+      rejected_.store(true);
+      return nullptr;
+    }
+    admission->Admitted(args, &*reservation);
+    auto write = std::make_shared<Write>(epoch_, std::move(*reservation));
+    write->input.SwapArgs(*args);
+    writes_.push_back(write);
+    ++submitted_;
+    return write;
+  }
+  absl::Status Set(DbIndex, std::string_view, std::string_view, raft::DataWritePosition*) override {
+    return absl::InternalError("Unexpected synchronous SET");
+  }
+  absl::StatusOr<bool> SetIf(DbIndex, std::string_view, std::string_view, raft::SetCondition,
+                             raft::DataWritePosition*) override {
+    return absl::InternalError("Unexpected conditional SET");
+  }
+  absl::StatusOr<std::optional<std::string>> Get(DbIndex, std::string_view) override {
+    return absl::InternalError("Unexpected GET");
+  }
+
+  void Append(size_t index) {
+    const std::array<std::string, 1> value{std::string(writes_[index]->input[2])};
+    auto bytes = raft::MakeDataBatch(log_->End().end_offset, 1, 0, value).value();
+    ASSERT_TRUE(log_->Append(bytes, 1).ok());
+    writes_[index]->Bind({10, 1, log_->End().end_offset});
+  }
+  void Reply(size_t index) {
+    epoch_->reply_offset.store(writes_[index]->position.end_offset);
+    writes_[index].reset();
+    epoch_->changed.notifyAll();
+  }
+
+  std::atomic<int64_t> clock_{0};
+  std::atomic_bool rejected_{false};
+  util::fb2::ProactorBase* owner_ = nullptr;
+  raft::AdmissionBudget budget_{1024, 16};
+  std::shared_ptr<raft::WriteEpoch> epoch_ = std::make_shared<raft::WriteEpoch>(1);
+  std::shared_ptr<raft::trace::Capture> capture_;
+  std::unique_ptr<raft::PartitionLog> log_;
+  std::vector<std::shared_ptr<Write>> writes_;
+  size_t submitted_ = 0;
+  std::filesystem::path directory_;
+};
+
+TEST_F(RaftAdmissionConnectionTest, NativeTraceExposeRefillBeforeWholeWaveRetires) {
+  using raft::trace::Attribute;
+  constexpr int64_t kMs = 1000000;
+  RawRespClient client{port_};
+  ASSERT_TRUE(client.valid());
+  std::string commands;
+  for (size_t i = 0; i < 17; ++i)
+    commands += "SET key" + std::to_string(i) + " value\r\n";
+  ASSERT_TRUE(client.SendAll(commands));
+  ASSERT_TRUE(
+      pp_->at(0)->Await([&] { return WaitUntilCondition([&] { return rejected_.load(); }, 2s); }));
+  owner_->Await([&] {
+    ASSERT_EQ(submitted_, 16u);
+    ASSERT_EQ(budget_.requests(), 16u);
+    clock_ = 2 * kMs;
+    for (size_t i = 0; i < 8; ++i) {
+      Append(i);
+      Reply(i);
+    }
+  });
+  for (size_t i = 0; i < 8; ++i)
+    ASSERT_EQ(client.ReadLine(), "+OK\r\n");
+  ASSERT_TRUE(
+      owner_->Await([&] { return WaitUntilCondition([&] { return submitted_ == 17; }, 2s); }));
+  owner_->Await([&] {
+    // Eight replies trigger a retry while half of the original wave is still in flight.
+    ASSERT_EQ(budget_.requests(), 9u);
+    const raft::trace::Event* wait = nullptr;
+    size_t retirements = 0;
+    for (const auto& event : capture_->events()) {
+      if (event.name == "raft.set.admission.wait")
+        wait = &event;
+      if (event.name == "raft.set.ticket.retired")
+        ++retirements;
+    }
+    ASSERT_NE(wait, nullptr);
+    EXPECT_EQ(wait->outcome, "Granted");
+    EXPECT_EQ(wait->attributes.at("wave_size"), "16");
+    EXPECT_EQ(wait->attributes.at("scope"), "Connection/group");
+    EXPECT_EQ(wait->attributes.at("first_retirement_ns"), std::to_string(2 * kMs));
+    EXPECT_EQ(wait->attributes.at("last_wal_completion_ns"), std::to_string(2 * kMs));
+    EXPECT_EQ(retirements, 8u);
+    const std::map<Attribute, int64_t> expected{{Attribute::kAdmissionWait, 2 * kMs},
+                                                {Attribute::kRetiredTickets, 8},
+                                                {Attribute::kFullWaveRetired, 0},
+                                                {Attribute::kWalIdle, 0}};
+    ASSERT_EQ(wait->values.size(), expected.size());
+    for (const auto& attribute : wait->values) {
+      EXPECT_EQ(attribute.state, "Observed");
+      EXPECT_EQ(attribute.value, expected.at(attribute.attribute));
+    }
+    clock_ = 5 * kMs;
+    for (size_t i = 8; i < 17; ++i) {
+      Append(i);
+      Reply(i);
+    }
+  });
+  for (size_t i = 8; i < 17; ++i)
+    ASSERT_EQ(client.ReadLine(), "+OK\r\n");
+  EXPECT_EQ(capture_->dropped(), 0u);
+}
 
 // Run V2 connection tests with private and shared read buffers.
 class DragonflyV2ConnectionTest : public DragonflyConnectionTest,

@@ -306,6 +306,135 @@ TEST_F(FetchReplicationTest, MemoryMajorityCommitsBeforeEitherDataLogFlushes) {
   EXPECT_EQ(b.log->DurableEnd(), b.log->End());
 }
 
+// Both Fetch byte budgets append their complete prefix while the background flush is pending.
+TEST_F(FetchReplicationTest, NativeTraceExposePartialPrefixOverlappingFlush) {
+  using trace::Attribute;
+  constexpr int64_t kMs = 1000000;
+  for (bool partial : {false, true}) {
+    SCOPED_TRACE(partial);
+    const int32_t partition = partial ? 11 : 12;
+    Node a(Path(kA.id, partition), kA, kVoters, partition, nullopt, PartitionLog::AckMode::kMemory);
+    Node b(Path(kB.id, partition), kB, kVoters, partition, nullopt, PartitionLog::AckMode::kMemory);
+    Elect(&a, &b);
+    auto initial = b.fetch.PrepareFetch(kA.id, 18, 0, 1024).value();
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, initial.sequence, Handle(&a, initial)).ok());
+    ASSERT_TRUE(a.fetch.Append(Batch(1, 5), 5).ok());
+    auto buffered = b.fetch.PrepareFetch(kA.id, 18, 0, 1024).value();
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, buffered.sequence, Handle(&a, buffered)).ok());
+    ASSERT_EQ(b.log->End().end_offset, 2);
+    ASSERT_EQ(b.log->DurableEnd().end_offset, 1);
+
+    int64_t clock = 0;
+    auto capture = make_shared<trace::Capture>("unit-flush", "follower", to_string(partition),
+                                               kB.id, 1U << 20, [&] { return clock; });
+    b.log->SetTraceCapture(capture);
+    test::ControlledIO io;
+    bool flushed = false;
+    ASSERT_TRUE(b.log
+                    ->TryFlushBufferedAsync(io.Submitter(),
+                                            [&](absl::Status status) {
+                                              EXPECT_TRUE(status.ok());
+                                              flushed = true;
+                                            })
+                    .value());
+    const auto flush_id = b.log->TraceFlushId();
+    ASSERT_NE(flush_id, 0u);
+    ASSERT_EQ(io.requests.size(), 1u);
+    const auto log_io = capture->active_io().begin()->first;
+
+    const auto prefix = Batch(2, 5) + Batch(3, 5);
+    const auto suffix = Batch(4, 5);
+    ASSERT_TRUE(a.fetch.Append(prefix + suffix, 5).ok());
+    auto fetch = b.fetch.PrepareFetch(kA.id, 18, 0, prefix.size() + (partial ? 1 : 0)).value();
+    trace::FetchTrace request_trace(*capture, kA.id, fetch.epoch, fetch.sequence, 2);
+    request_trace.RpcStarted(clock);
+    auto response = Handle(&a, fetch);
+    const auto payload = response.responses[0].partitions[0].records.View()->size();
+    ASSERT_EQ(payload, prefix.size() + (partial ? 1 : 0));
+    clock = 2 * kMs;
+    request_trace.RpcReturned(clock, payload, true);
+    ASSERT_TRUE(b.fetch.CanReceiveResponse(kA.id, fetch.sequence, response, &request_trace));
+    ASSERT_FALSE(flushed);
+    ASSERT_TRUE(b.fetch
+                    .ReceiveFetchResponse(kA.id, fetch.sequence, std::move(response), nullptr,
+                                          &request_trace)
+                    .ok());
+    ASSERT_EQ(b.log->End().end_offset, 4);
+    EXPECT_EQ(b.log->Read(2, 4, SIZE_MAX).value(), prefix);
+    ASSERT_FALSE(flushed);
+    ASSERT_EQ(io.requests.size(), 1u);
+    clock = 12 * kMs;
+    io.Complete();
+    ASSERT_FALSE(flushed);
+    ASSERT_EQ(io.requests.size(), 1u);
+    EXPECT_NE(capture->active_io().begin()->first, log_io);
+    clock = 15 * kMs;
+    io.Complete();
+    ASSERT_TRUE(flushed);
+    ASSERT_TRUE(capture->drained());
+    ASSERT_EQ(capture->dropped(), 0u);
+    const trace::Event* request = nullptr;
+    size_t rejections = 0, fsyncs = 0, dependencies = 0;
+    for (const auto& event : capture->events()) {
+      if (event.name == "raft.fetch")
+        request = &event;
+      if (event.name == "raft.fetch.flush_gate.blocked" && event.outcome == "Rejected") {
+        ++rejections;
+        EXPECT_EQ(event.attributes.at("reason"), "Incomplete suffix");
+        EXPECT_EQ(event.attributes.at("flush_id"), to_string(flush_id));
+      }
+      if (event.name == "raft.fetch.io_dependency") {
+        ++dependencies;
+        EXPECT_FALSE(event.attributes.at("io_id").empty());
+        EXPECT_EQ(event.attributes.at("flush_id"), to_string(flush_id));
+      }
+      if (event.name == "raft.folly.fsync") {
+        ++fsyncs;
+        EXPECT_EQ(event.attributes.at("flush_id"), to_string(flush_id));
+        EXPECT_EQ(event.values.front().value,
+                  event.attributes.at("role") == "Log" ? 12 * kMs : 3 * kMs);
+      }
+    }
+    ASSERT_NE(request, nullptr);
+    EXPECT_EQ(request->outcome, "Data");
+    EXPECT_EQ(request->attributes.at("first_offset"), "2");
+    EXPECT_EQ(request->attributes.at("last_offset"), "3");
+    auto attribute = [&](Attribute attribute) -> optional<int64_t> {
+      for (const auto& value : request->values) {
+        if (value.attribute == attribute) {
+          EXPECT_EQ(value.state, "Observed");
+          return value.value;
+        }
+      }
+      ADD_FAILURE() << "Missing attribute " << trace::Definitions()[size_t(attribute)].name;
+      return nullopt;
+    };
+    const auto wait = 0;
+    EXPECT_EQ(attribute(Attribute::kRpc), 2 * kMs);
+    EXPECT_EQ(attribute(Attribute::kReturnWait), wait);
+    EXPECT_EQ(attribute(Attribute::kReceive), 0);
+    EXPECT_EQ(attribute(Attribute::kElapsed), 2 * kMs + wait);
+    EXPECT_EQ(attribute(Attribute::kGateWait), wait);
+    EXPECT_EQ(attribute(Attribute::kIoWait), wait);
+    EXPECT_EQ(attribute(Attribute::kFsyncOverlap), wait);
+    EXPECT_EQ(attribute(Attribute::kIoFsyncOverlap), wait);
+    EXPECT_EQ(attribute(Attribute::kGateRejections), 0);
+    EXPECT_EQ(attribute(Attribute::kPayloadBytes), payload);
+    EXPECT_EQ(attribute(Attribute::kAppendedBytes), prefix.size());
+    EXPECT_EQ(attribute(Attribute::kAppendedRecords), 2);
+    EXPECT_EQ(attribute(Attribute::kPartial), partial);
+    EXPECT_EQ(rejections, 0u);
+    EXPECT_EQ(dependencies, 0u);
+    EXPECT_EQ(fsyncs, 2u);
+
+    // The partial suffix is delivered by the next real Fetch from the new log end.
+    auto next = b.fetch.PrepareFetch(kA.id, 18, 0, 1024).value();
+    ASSERT_EQ(next.request.topics[0].partitions[0].fetch_offset, 4);
+    ASSERT_TRUE(b.fetch.ReceiveFetchResponse(kA.id, next.sequence, Handle(&a, next)).ok());
+    ASSERT_EQ(b.log->End().end_offset, 5);
+  }
+}
+
 TEST_F(FetchReplicationTest, IndependentTwoVoterPartitionsLoseMajorityIndependently) {
   auto two = vector<CampaignVoter>(kVoters.begin(), kVoters.begin() + 2);
   auto a10 = Make(kA, 10, two), b10 = Make(kB, 10, two);

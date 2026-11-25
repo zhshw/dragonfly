@@ -176,6 +176,13 @@ class RaftGroup::Impl {
     return epoch < 0 || stopping_ ? nullopt : optional<int32_t>{epoch};
   }
 
+  void SetTraceCapture(shared_ptr<trace::Capture> capture) {
+    RunOnWorker([&] {
+      capture_ = std::move(capture);
+      log_->SetTraceCapture(capture_);
+    });
+  }
+
   void SetDataDriver(DataDriver driver) {
     RunOnWorker([&] { data_driver_ = std::move(driver); });
   }
@@ -274,7 +281,8 @@ class RaftGroup::Impl {
   template <typename F>
   auto RunOnWorker(
       F&& operation, IoAccess access = IoAccess::kIdle,
-      absl::FunctionRef<bool()> ready = [] { return true; }) -> decltype(operation()) {
+      absl::FunctionRef<bool()> ready = [] { return true; },
+      trace::FetchTrace* request_trace = nullptr) -> decltype(operation()) {
     util::detail::ResultMover<decltype(operation())> result;
     while (true) {
       auto key = io_changed_.prepareWait();
@@ -295,11 +303,24 @@ class RaftGroup::Impl {
       });
       if (ran)
         return std::move(result).get();
+      if (request_trace)
+        worker_.Await([&] { request_trace->BeginIoWait(request_trace->Now()); });
       io_changed_.wait(key.epoch());
+      if (request_trace)
+        worker_.Await([&] { request_trace->EndIoWait(request_trace->Now()); });
     }
   }
 
   template <typename Commit> void NotifyProgress(const Commit& before, LogPosition end) {
+    const auto hw = replication_.HighWatermark();
+    if (capture_ && hw && hw != get<2>(before)) {
+      const auto now = capture_->Now();
+      auto event = capture_->MakeEvent("raft.hw.advance", now, now);
+      event.attributes["epoch"] = to_string(campaign_.state().election.epoch);
+      event.attributes["previous_offset"] = to_string(get<2>(before).value_or(-1));
+      event.attributes["end_offset"] = to_string(*hw);
+      capture_->Emit(std::move(event));
+    }
     auto next_deadline = data_driver_
                              ? data_driver_({campaign_, replication_, *log_}, failed_ || stopping_)
                              : nullopt;
@@ -644,17 +665,45 @@ class RaftGroup::Impl {
         IoAccess::kData);
     if (!fetch)
       return false;
+    unique_ptr<trace::FetchTrace> request_trace;
+    if (capture_) {
+      request_trace = worker_.Await([&] {
+        return make_unique<trace::FetchTrace>(*capture_, leader, fetch->epoch, fetch->sequence,
+                                              fetch->request.topics[0].partitions[0].fetch_offset);
+      });
+    }
+    absl::Cleanup finish_trace = [&] {
+      if (request_trace)
+        worker_.Await([&] { request_trace.reset(); });
+    };
+    const auto rpc_start = request_trace ? trace::Capture::MonotonicNow() : 0;
     FetchResponse response;
     const auto start = steady_clock::now();
-    if (peer.Call(fetch->request, version, &response))
+    const auto error = peer.Call(fetch->request, version, &response);
+    const auto rpc_end = request_trace ? trace::Capture::MonotonicNow() : 0;
+    if (request_trace) {
+      size_t payload = 0;
+      if (response.responses.size() == 1 && response.responses[0].partitions.size() == 1) {
+        auto records = response.responses[0].partitions[0].records.View();
+        payload = records ? records->size() : 0;
+      }
+      worker_.Await([&] {
+        request_trace->RpcStarted(rpc_start);
+        request_trace->RpcReturned(rpc_end, payload, !error);
+      });
+    }
+    if (error)
       return false;
     const bool waited = steady_clock::now() - start >= milliseconds(fetch->request.max_wait_ms);
     auto applied = commit_changed_.prepareWait();
     bool await_apply = false;
     const bool progressed = RunOnWorker(
         [&] {
-          if (!active)
+          if (!active) {
+            if (request_trace)
+              request_trace->Finish("Cancelled");
             return false;
+          }
           const auto end = log_->End();
           const auto hw = replication_.HighWatermark();
           bool idle_response = false;
@@ -666,7 +715,7 @@ class RaftGroup::Impl {
           }
           bool reset = false;
           auto s = replication_.ReceiveFetchResponse(leader, fetch->sequence, std::move(response),
-                                                     &reset);
+                                                     &reset, request_trace.get());
           if (!s.ok()) {
             VLOG(1) << "Fetch from node " << leader << ": " << s;
             return false;
@@ -685,9 +734,10 @@ class RaftGroup::Impl {
         },
         IoAccess::kData,
         [&] {
-          return !log_->FlushPending() ||
-                 replication_.CanReceiveDuringFlush(leader, fetch->sequence, response);
-        });
+          return replication_.CanReceiveResponse(leader, fetch->sequence, response,
+                                                 request_trace.get());
+        },
+        request_trace.get());
     if (await_apply) {
       commit_changed_.wait_until(applied.epoch(),
                                  steady_clock::now() + milliseconds(kRequestTimeoutMs));
@@ -754,6 +804,7 @@ class RaftGroup::Impl {
   template <typename Request, typename Response>
   error_code ChangeVoters(const Request& req, Response* res);
 
+  shared_ptr<trace::Capture> capture_;
   unique_ptr<PartitionLog> log_;
   FileQuorumStateStore store_;
   const vector<CampaignVoter> bootstrap_;
@@ -1003,6 +1054,10 @@ absl::Status RaftGroup::Visit(Operation operation) {
 
 optional<int32_t> RaftGroup::LeaderEpoch() const {
   return impl_->LeaderEpoch();
+}
+
+void RaftGroup::SetTraceCapture(shared_ptr<trace::Capture> capture) {
+  impl_->SetTraceCapture(std::move(capture));
 }
 
 void RaftGroup::SetDataDriver(DataDriver driver) {

@@ -31,6 +31,10 @@
 #include "util/fibers/pool.h"
 #include "util/fibers/synchronization.h"
 
+#ifdef DFLY_RAFT_OTEL
+#include "server/cluster/raft/otel/trace_session.h"
+#endif
+
 ABSL_FLAG(bool, raft_drain_writes, true,
           "Drain ready ordinary SETs with bounded queue backpressure");
 ABSL_DECLARE_FLAG(int64_t, raft_data_snapshot_bytes);
@@ -89,6 +93,7 @@ struct SetBatch {
 };
 
 struct LocalPartition {
+  shared_ptr<trace::Capture> trace;
   LocalPartition(int32_t group, const string& cluster_id, Service& service,
                  fb2::ProactorBase* owner)
       : id(group),
@@ -110,8 +115,7 @@ struct LocalPartition {
   base::mpmc_bounded_queue<shared_ptr<AsyncPendingSet>> admissions{256};
 
   // Reservations include completed writes until their ordered replies release the ticket.
-  atomic_size_t async_bytes{0};
-  atomic_size_t async_requests{0};
+  AdmissionBudget budget{8U << 20, 256};
   fb2::EventCount queue_changed;
   int32_t id;
   CommittedEffects effects;
@@ -134,10 +138,11 @@ struct LocalPartition {
 
 struct AsyncPendingSet final : WatermarkWrite {
   AsyncPendingSet(shared_ptr<LocalPartition> local, DbIndex db, string_view key, string_view value,
-                  shared_ptr<WriteEpoch> epoch, cmn::BackedArguments* owned_args)
+                  shared_ptr<WriteEpoch> epoch, cmn::BackedArguments* owned_args,
+                  AdmissionBudget::Reservation reservation)
       : WatermarkWrite(epoch),
         local(std::move(local)),
-        reserved_bytes(key.size() + value.size()),
+        reservation(std::move(reservation)),
         proposal{db, KeySlot(key), {}, {}, nullopt, epoch->epoch} {
     proposal.async = this;
     if (owned_args) {
@@ -153,8 +158,7 @@ struct AsyncPendingSet final : WatermarkWrite {
   }
 
   ~AsyncPendingSet() override {
-    local->async_bytes.fetch_sub(reserved_bytes);
-    local->async_requests.fetch_sub(1);
+    reservation.Release();
     local->queue_changed.notifyAll();
   }
 
@@ -169,7 +173,7 @@ struct AsyncPendingSet final : WatermarkWrite {
   }
 
   shared_ptr<LocalPartition> local;
-  const size_t reserved_bytes;
+  AdmissionBudget::Reservation reservation;
   cmn::BackedArguments input;
   string key;
   string value;
@@ -197,6 +201,14 @@ class DataNodeImpl final : public DataNode {
   }
 
   absl::Status Init(util::AcceptServer* acceptor) {
+#ifdef DFLY_RAFT_OTEL
+    auto trace = otel::TraceSession::FromEnvironment(identity_.node_id, owner_);
+    if (!trace.ok())
+      return trace.status();
+    trace_session_ = *std::move(trace);
+    if (trace_session_)
+      trace_factory_ = [this](string group) { return trace_session_->Create(std::move(group)); };
+#endif
     auto group = RaftGroup::Open(dir_, identity_, RaftGroup::Kind::kMetadata, 0, controllers_, true,
                                  [this](const PartitionLog& log, int64_t hw) {
                                    auto status = loader_.Advance(log, hw);
@@ -253,6 +265,30 @@ class DataNodeImpl final : public DataNode {
         group->apply_fiber.Join();
     }
     observer_->Join();
+#ifdef DFLY_RAFT_OTEL
+    if (trace_session_) {
+      auto status = trace_session_->Export();
+      LOG_IF(ERROR, !status.ok()) << "Raft trace export: " << status;
+      LOG_IF(INFO, status.ok())
+          << "Raft trace export accepted; verify stored capture before publishing";
+    }
+#endif
+  }
+  void SetTraceFactory(TraceFactory factory) override {
+    trace_factory_ = std::move(factory);
+  }
+  shared_ptr<trace::Admission> NewAdmissionTrace(uint64_t connection) override {
+    auto local = partition_.load();
+    if (!local || !trace_factory_)
+      return nullptr;
+    auto capture = trace_factory_(to_string(local->id));
+    return capture ? make_shared<trace::Admission>(std::move(capture), connection,
+                                                   local->budget.progress())
+                   : nullptr;
+  }
+  shared_ptr<PendingDataWrite> TrySetObserved(DbIndex db, cmn::BackedArguments* args,
+                                              trace::Admission* admission) override {
+    return TrySetImpl(db, (*args)[1], (*args)[2], args, admission);
   }
   bool SupportsAsyncSet() const override {
     return absl::GetFlag(FLAGS_raft_drain_writes);
@@ -290,7 +326,8 @@ class DataNodeImpl final : public DataNode {
   absl::StatusOr<bool> ProposeSet(DbIndex db, string_view key, string_view value,
                                   optional<SetCondition> condition, DataWritePosition* position);
   shared_ptr<PendingDataWrite> TrySetImpl(DbIndex db, string_view key, string_view value,
-                                          cmn::BackedArguments* owned_args);
+                                          cmn::BackedArguments* owned_args,
+                                          trace::Admission* admission = nullptr);
   absl::Status QueueSet(shared_ptr<LocalPartition> local, PendingSet* request);
   optional<steady_clock::time_point> PumpSets(LocalPartition& local, RaftGroup::State state,
                                               bool unavailable);
@@ -310,6 +347,10 @@ class DataNodeImpl final : public DataNode {
   VoterConnections controllers_;
   QuorumEndpoint listen_;
   uint16_t resp_port_;
+  TraceFactory trace_factory_;
+#ifdef DFLY_RAFT_OTEL
+  unique_ptr<otel::TraceSession> trace_session_;
+#endif
   Service* service_;
   fb2::ProactorBase* owner_;
   fb2::FiberQueueThreadPool opener_{1};
@@ -385,6 +426,14 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
     if (!opened.ok())
       return opened.status();
     local->raft = *std::move(opened);
+#ifdef DFLY_RAFT_OTEL
+    if (trace_session_)
+      trace_session_->SetExpectedNodes(group.members);
+#endif
+    if (trace_factory_) {
+      local->trace = trace_factory_(to_string(local->id));
+      local->raft->SetTraceCapture(local->trace);
+    }
     local->raft->SetApplyLane(
         [this, replica = local.get(), apply](const PartitionLog& log,
                                              int64_t hw) -> absl::StatusOr<int64_t> {
@@ -419,6 +468,9 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
         },
         [replica = local.get()] { return bool(replica->applying); });
     if (auto s = local->raft->Visit([replica = local.get()](RaftGroup::State state) {
+          state.log.SetWalCompleteHook([progress = replica->budget.progress()](int64_t now) {
+            progress->wal_complete.store(now, memory_order_release);
+          });
           state.replication.SetDataApplyHooks(
               [replica](auto* p) {
                 DataApplyProgress::Advertise(replica->effects.applied_offset(), p);
@@ -634,33 +686,24 @@ shared_ptr<PendingDataWrite> DataNodeImpl::TrySetOwned(DbIndex db, cmn::BackedAr
 
 shared_ptr<PendingDataWrite> DataNodeImpl::TrySetImpl(DbIndex db, string_view key,
                                                       string_view value,
-                                                      cmn::BackedArguments* owned_args) {
+                                                      cmn::BackedArguments* owned_args,
+                                                      trace::Admission* admission) {
   auto local = partition_.load();
   if (!local || stopping_ || !SupportsAsyncSet())
     return nullptr;
-  constexpr size_t kQueueBytes = 8U << 20;
-  constexpr size_t kQueueRequests = 256;
   const size_t bytes = key.size() + value.size();
   auto epoch = local->raft->LeaderEpoch();
   if (!epoch)
     return nullptr;
-  const auto count = local->async_requests.fetch_add(1);
-  if (count >= kQueueRequests) {
-    local->async_requests.fetch_sub(1);
+  auto reservation = local->budget.TryReserve(bytes);
+  if (!reservation) {
+    if (admission)
+      admission->Rejected(owned_args, bytes, local->budget);
     return nullptr;
   }
-  auto reserved = local->async_bytes.load();
-  do {
-    if ((reserved || count) && bytes > kQueueBytes - min(kQueueBytes, reserved)) {
-      local->async_requests.fetch_sub(1);
-      return nullptr;
-    }
-  } while (!local->async_bytes.compare_exchange_weak(reserved, reserved + bytes));
   auto progress = local->reply_epoch.load();
   while (!progress || progress->epoch != *epoch) {
     if (progress && progress->epoch > *epoch) {
-      local->async_bytes.fetch_sub(bytes);
-      local->async_requests.fetch_sub(1);
       return nullptr;
     }
     auto next = make_shared<WriteEpoch>(*epoch);
@@ -669,7 +712,10 @@ shared_ptr<PendingDataWrite> DataNodeImpl::TrySetImpl(DbIndex db, string_view ke
       break;
     }
   }
-  auto request = make_shared<AsyncPendingSet>(local, db, key, value, progress, owned_args);
+  if (admission)
+    admission->Admitted(owned_args, &*reservation);
+  auto request = make_shared<AsyncPendingSet>(local, db, key, value, progress, owned_args,
+                                              std::move(*reservation));
 
   // The reservation covers every outstanding record, so the admission ring always has a slot.
   // Input ownership changes only after capacity is reserved, never on a rejected TrySetOwned.
@@ -852,7 +898,7 @@ optional<steady_clock::time_point> DataNodeImpl::PumpSets(LocalPartition& local,
     shared_ptr<AsyncPendingSet> accepted;
     while (local.admissions.try_dequeue(accepted)) {
       local.ready_sets.push_back(&accepted->proposal);
-      local.queued_bytes += accepted->reserved_bytes;
+      local.queued_bytes += accepted->reservation.bytes();
       ++local.queued_requests;
       local.pending_writes.push_back(std::move(accepted));
     }
@@ -863,6 +909,14 @@ optional<steady_clock::time_point> DataNodeImpl::PumpSets(LocalPartition& local,
           min({state.log.End().end_offset, state.replication.HighWatermark().value_or(-1),
                local.effects.applied_offset()});
       if (r > reply_epoch->reply_offset.load(memory_order_relaxed)) {
+        if (local.trace) {
+          const auto stamp = local.trace->Now();
+          auto event = local.trace->MakeEvent("raft.reply.advance", stamp, stamp);
+          event.attributes["epoch"] = to_string(reply_epoch->epoch);
+          event.attributes["previous_offset"] = to_string(reply_epoch->reply_offset.load());
+          event.attributes["end_offset"] = to_string(r);
+          local.trace->Emit(std::move(event));
+        }
         reply_epoch->reply_offset.store(r, memory_order_release);
         remember(reply_epoch);
       }

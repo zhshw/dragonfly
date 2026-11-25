@@ -18,6 +18,10 @@
 #include "server/tx_base.h"
 #include "server/version.h"
 
+namespace dfly::cluster::raft::trace {
+class Admission;
+}
+
 namespace dfly {
 
 class EngineShardSet;
@@ -341,6 +345,7 @@ struct ConnectionState {
  public:
   DbIndex db_index = 0;
   std::optional<cluster::raft::DataWritePosition> raft_last_write;
+  std::shared_ptr<cluster::raft::trace::Admission> raft_admission;
 
   ExecInfo exec_info;
   ReplicationInfo replication_info;

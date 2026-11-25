@@ -1542,8 +1542,14 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
           auto stored = (*cmd)[i + 1];
           return stored.data() == args[i].data() && stored.size() == args[i].size();
         };
+        if (!cntx->conn_state.raft_admission && cmd->conn())
+          cntx->conn_state.raft_admission =
+              raft_data_commands_->NewAdmissionTrace(cmd->conn()->GetClientId());
+        auto* admission = cntx->conn_state.raft_admission.get();
+        if (admission)
+          admission->Attempt(static_cast<cmn::BackedArguments*>(cmd));
         auto write = cmd->size() == 3 && owns_arg(0) && owns_arg(1)
-                         ? raft_data_commands_->TrySetOwned(cntx->db_index(), cmd)
+                         ? raft_data_commands_->TrySetObserved(cntx->db_index(), cmd, admission)
                          : raft_data_commands_->TrySet(cntx->db_index(), args[0], args[1]);
         if (write) {
           const size_t after = cmd->UsedMemory();

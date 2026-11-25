@@ -89,7 +89,9 @@ func (c client) request(ctx context.Context, method, path string, body, result a
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("Langfuse %s %s returned %s", method, request.URL.Path, response.Status)
 	}
-	err = json.NewDecoder(io.LimitReader(response.Body, 8<<20)).Decode(result)
+	decoder := json.NewDecoder(io.LimitReader(response.Body, 8<<20))
+	decoder.UseNumber()
+	err = decoder.Decode(result)
 	if method == http.MethodPost && errors.Is(err, io.EOF) {
 		return nil
 	}

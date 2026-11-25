@@ -208,6 +208,9 @@ services:
     user: "${PROFILE_UID:-1000}:${PROFILE_GID:-1000}"
     ports: ["${PROFILE_LISTEN:-0.0.0.0:8787}:8787"]
     entrypoint: ["/opt/profile-web"]
+    environment:
+      LANGFUSE_URL: http://web:3000
+      LANGFUSE_ENV_FILE: /run/secrets/langfuse.env
     command:
       - -listen
       - 0.0.0.0:8787
@@ -229,6 +232,9 @@ services:
         source: ${WEB_DIST:-./web/dist}
         target: /opt/profile-ui
       - profile-runtime:/data/dragonfly-observability/config:ro
+      - <<: *readonly-bind
+        source: ${PROFILE_ROOT:-/data/dragonfly-observability}/config/langfuse.env
+        target: /run/secrets/langfuse.env
       - ${LANGFUSE_STORAGE_ROOT}/raft-workflow:${LANGFUSE_STORAGE_ROOT}/raft-workflow:ro
       - <<: *readonly-bind
         source: ${PROFILE_EXECUTOR_DIR:-${PROFILE_ROOT:-/data/dragonfly-observability}/config/executor}

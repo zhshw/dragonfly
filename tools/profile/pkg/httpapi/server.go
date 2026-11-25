@@ -17,10 +17,16 @@ import (
 	"strings"
 
 	"dragonflydb.io/profile/models"
+	"dragonflydb.io/profile/pkg/langfuse"
 )
 
-func Handler(store models.Repository, web fs.FS, executor http.Handler) http.Handler {
+func Handler(store models.Repository, web fs.FS, executor http.Handler, native ...langfuse.Config) http.Handler {
 	api := http.NewServeMux()
+	var traceConfig langfuse.Config
+	if len(native) > 0 {
+		traceConfig = native[0]
+	}
+	nativeTraceRoutes(api, store, traceConfig)
 	pg, postgres := store.(*models.Postgres)
 	if executor != nil {
 		for _, pattern := range []string{

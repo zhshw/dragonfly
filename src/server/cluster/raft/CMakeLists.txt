@@ -3,6 +3,7 @@ add_library(dfly_raft
             bootstrap/quorum_bootstrap.cc
             bootstrap/raft_directory.cc
             config/quorum_config.cc
+            data/admission_budget.cc
             data/apply_progress.cc
             data/kv_snapshot.cc
             data/set_effect.cc
@@ -19,6 +20,7 @@ add_library(dfly_raft
             metadata/record_serde.cc
             metadata/slot_directory.cc
             metadata/slot_migration.cc
+            trace.cc
             protocol/add_voter.cc
             protocol/api_versions.cc
             protocol/begin_epoch.cc
@@ -72,6 +74,7 @@ helio_cxx_test(metadata/metadata_image_test dfly_raft LABELS DFLY)
 helio_cxx_test(metadata/record_serde_test dfly_raft LABELS DFLY)
 helio_cxx_test(metadata/slot_directory_test dfly_raft LABELS DFLY)
 helio_cxx_test(metadata/slot_migration_test dfly_raft LABELS DFLY)
+helio_cxx_test(trace_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/fetch_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/rpc_frame_test dfly_raft LABELS DFLY)
 helio_cxx_test(protocol/vote_test dfly_raft LABELS DFLY)
@@ -116,3 +119,9 @@ if (DF_USE_SSL)
 endif()
 helio_cxx_test(transport/raft_listener_test dfly_raft_transport LABELS DFLY)
 target_include_directories(raft_listener_test PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
+if(WITH_RAFT_OTEL)
+  add_subdirectory(otel)
+  cxx_link(dfly_raft_transport dfly_raft_otel)
+  target_compile_definitions(dfly_raft_transport PUBLIC DFLY_RAFT_OTEL=1)
+endif()

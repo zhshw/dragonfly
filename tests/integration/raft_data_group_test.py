@@ -189,7 +189,7 @@ class RaftDataGroupFixture(unittest.TestCase):
         else:
             proc.terminate()
         try:
-            status = proc.wait(8)
+            status = proc.wait(float(os.getenv("RAFT_TEST_STOP_TIMEOUT", "8")))
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()

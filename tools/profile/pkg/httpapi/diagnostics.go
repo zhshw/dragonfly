@@ -5,14 +5,74 @@ package httpapi
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 
 	"dragonflydb.io/profile/models"
+	"dragonflydb.io/profile/pkg/trace"
 )
 
 func diagnosticRoutes(api *http.ServeMux, store models.Repository) {
+	api.HandleFunc("GET /api/v1/experiments/{id}/artifacts/{artifact}/request-path", func(w http.ResponseWriter, r *http.Request) {
+		batch, err := diagnosticInt(r.URL.Query(), "batch", 0)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		if batch == 0 {
+			respondError(w, fmt.Errorf("%w: batch 需要为正整数", models.ErrInvalid))
+			return
+		}
+		serveTimelineAnalysis(w, r, store, func(timeline io.Reader) (trace.RequestPath, error) {
+			return trace.AnalyzeRequestPath(timeline, batch)
+		})
+	})
+	api.HandleFunc("GET /api/v1/experiments/{id}/artifacts/{artifact}/reply-gap-stats", func(w http.ResponseWriter, r *http.Request) {
+		serveTimelineAnalysis(w, r, store, trace.AnalyzeReplyGapStats)
+	})
+	api.HandleFunc("GET /api/v1/experiments/{id}/artifacts/{artifact}/fetch-requests", func(w http.ResponseWriter, r *http.Request) {
+		serveTimelineAnalysis(w, r, store, trace.AnalyzeFetchRequests)
+	})
+	api.HandleFunc("GET /api/v1/experiments/{id}/artifacts/{artifact}/fetch-delay", func(w http.ResponseWriter, r *http.Request) {
+		params := r.URL.Query()
+		batch, err := diagnosticInt(params, "batch", 0)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		limit, err := diagnosticInt(params, "limit", models.DefaultTraceLimit)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		scope := params.Get("scope")
+		if (scope != "" && scope != "batch" && scope != "round") || (scope == "round" && batch != 0) {
+			respondError(w, fmt.Errorf("%w: scope 应为 batch 或 round，整轮不能指定批次", models.ErrInvalid))
+			return
+		}
+		serveTimelineAnalysis(w, r, store, func(timeline io.Reader) (trace.FetchDelayReport, error) {
+			if scope == "round" {
+				return trace.AnalyzeRoundFetchDelay(timeline, limit)
+			}
+			return trace.AnalyzeFetchDelay(timeline, batch, limit)
+		})
+	})
+	api.HandleFunc("GET /api/v1/experiments/{id}/artifacts/{artifact}/fetch-waits", func(w http.ResponseWriter, r *http.Request) {
+		params := r.URL.Query()
+		scope, order := params.Get("scope"), params.Get("sort")
+		if scope == "" {
+			scope = "slowest"
+		}
+		if order == "" {
+			order = "gap"
+		}
+		serveTimelineAnalysis(w, r, store, func(timeline io.Reader) (trace.FetchWaitReport, error) {
+			return trace.AnalyzeFetchWaits(timeline, scope, order)
+		})
+	})
 	api.HandleFunc("GET /api/v1/experiments/{id}/trace", func(w http.ResponseWriter, r *http.Request) {
 		params := r.URL.Query()
 		limit, err := diagnosticInt(params, "limit", models.DefaultTraceLimit)
@@ -66,6 +126,26 @@ func diagnosticRoutes(api *http.ServeMux, store models.Repository) {
 		}
 		writeJSON(w, http.StatusOK, report)
 	})
+}
+
+func serveTimelineAnalysis[T any](w http.ResponseWriter, r *http.Request, store models.Repository, analyze func(io.Reader) (T, error)) {
+	path, err := store.ArtifactFor(r.PathValue("id"), r.PathValue("artifact"))
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	timeline, err := os.Open(path)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
+	defer timeline.Close()
+	report, err := analyze(timeline)
+	if err != nil {
+		respondError(w, fmt.Errorf("%w: %v", models.ErrInvalid, err))
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 func diagnosticInt(params url.Values, name string, defaultValue int) (int, error) {

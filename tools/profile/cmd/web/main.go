@@ -19,6 +19,7 @@ import (
 
 	"dragonflydb.io/profile/models"
 	"dragonflydb.io/profile/pkg/httpapi"
+	"dragonflydb.io/profile/pkg/langfuse"
 )
 
 func main() {
@@ -84,7 +85,8 @@ func serve(ctx context.Context, address, data, web, dsn, socket string) error {
 	if err != nil {
 		return err
 	}
-	s := &http.Server{Handler: httpapi.Handler(repo, os.DirFS(web), executor), ReadHeaderTimeout: 5 * time.Second}
+	native := langfuse.Config{URL: os.Getenv("LANGFUSE_URL"), EnvFile: os.Getenv("LANGFUSE_ENV_FILE")}
+	s := &http.Server{Handler: httpapi.Handler(repo, os.DirFS(web), executor, native), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		deadline, cancel := context.WithTimeout(context.Background(), 5*time.Second)

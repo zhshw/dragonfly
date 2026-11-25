@@ -1,11 +1,10 @@
 // Copyright 2026, DragonflyDB authors. All rights reserved.
 // See LICENSE for licensing terms.
 
-package workflow
+package trace
 
 import (
 	"cmp"
-	"encoding/json"
 	"errors"
 	"io"
 	"math"
@@ -46,21 +45,19 @@ type offsetInterval struct {
 
 // AnalyzeApplyConfirmation joins leader confirmations to the apply range covering each offset.
 func AnalyzeApplyConfirmation(timeline io.Reader) (ApplyConfirmation, error) {
-	var data struct {
-		Events []timelineEvent `json:"traceEvents"`
-	}
-	if err := json.NewDecoder(timeline).Decode(&data); err != nil {
+	events, err := readTraceEvents(timeline)
+	if err != nil {
 		return ApplyConfirmation{}, err
 	}
 	var applies, confirmations, pipeline []offsetInterval
 	var applyTimes, workerQueue, tickets []langfuse.Interval
-	for _, event := range data.Events {
+	for _, event := range events {
 		if event.Kind != "X" || (event.Cat != "leader" && event.Cat != "client") {
 			continue
 		}
 		timing := langfuse.Interval{
-			Begin: int64(math.Round(event.Time * 1000)),
-			End:   int64(math.Round((event.Time + event.Dur) * 1000)),
+			Begin: traceNS(event.Time),
+			End:   traceEnd(event),
 		}
 		if timing.Begin < 0 || timing.End < timing.Begin {
 			return ApplyConfirmation{}, errors.New("invalid timeline interval")

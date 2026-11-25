@@ -20,6 +20,7 @@
 #include "server/cluster/raft/log/record_batch.h"
 #include "server/cluster/raft/log/snapshot_file.h"
 #include "server/cluster/raft/quorum/election.h"
+#include "server/cluster/raft/trace.h"
 
 namespace dfly::cluster::raft {
 
@@ -106,6 +107,16 @@ class PartitionLog {
   // Admission check only: same-term data in the active segment may overlap a buffered flush.
   // Append still validates the complete batch, including its CRC and record boundaries.
   bool CanAppendDuringFlush(std::string_view bytes) const;
+  trace::Gate FlushGate(std::string_view bytes) const;
+  void SetWalCompleteHook(std::function<void(int64_t)> hook) {
+    wal_complete_ = std::move(hook);
+  }
+  void SetTraceCapture(std::shared_ptr<trace::Capture> capture) {
+    capture_ = std::move(capture);
+  }
+  uint64_t TraceFlushId() const {
+    return flushing_ ? flushing_->event.id : 0;
+  }
   std::optional<std::string_view> WrittenRecords(int64_t offset, size_t max_bytes) const;
   bool PendingContains(int64_t offset, int32_t epoch) const;
 
@@ -119,7 +130,8 @@ class PartitionLog {
   // Record views borrow batches; output is replaced only on success. No second CRC pass is needed
   // while the caller retains the same immutable bytes. Partial/future-epoch suffixes are excluded.
   absl::Status AppendAsFollower(std::string_view batches, int32_t fetch_epoch,
-                                std::vector<ValidatedBatch>* appended = nullptr);
+                                std::vector<ValidatedBatch>* appended = nullptr,
+                                size_t* appended_bytes = nullptr);
 
   absl::Status AppendLeaderChange(int32_t epoch, int64_t timestamp_ms, int32_t leader_id,
                                   std::span<const int32_t> voters,
@@ -162,17 +174,20 @@ class PartitionLog {
     bool memory = false;
   };
   struct PendingFlush {
+    trace::Event event;
     log_files::RecoveryMarker::AppendPublication publication;
     LogPosition end;
     size_t bytes;
     AsyncIO submit;
     AppendDone done;
   };
+  void SubmitFlushSync(int fd, std::string_view role, IoCallback callback);
   void WritePending();
   void SyncPending();
   void FinishPending(absl::Status status);
   void FinishFlush(absl::Status status);
   void RecordBuffered(size_t bytes);
+  void ObserveWalComplete(LogPosition end);
 
   PartitionLog(std::filesystem::path dir, size_t segment_bytes, AckMode ack_mode)
       : dir_(std::move(dir)), segment_bytes_(segment_bytes), ack_mode_(ack_mode) {
@@ -186,9 +201,12 @@ class PartitionLog {
   absl::Status RemoveSuffixSegments();
   absl::Status AppendBatches(std::string_view batches, int32_t epoch, bool follower,
                              std::optional<DataWritten> written,
-                             std::vector<ValidatedBatch>* appended = nullptr);
+                             std::vector<ValidatedBatch>* appended = nullptr,
+                             size_t* appended_bytes = nullptr);
   absl::Status PublishEnd(int64_t file_end, int64_t end_offset, bool append = false);
 
+  std::shared_ptr<trace::Capture> capture_;
+  std::function<void(int64_t)> wal_complete_;
   std::filesystem::path dir_;
   int dir_fd_ = -1;
   int log_fd_ = -1;

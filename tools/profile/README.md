@@ -2,6 +2,8 @@
 
 `profile` 提供 benchmark 归档、Trace 查询和 CPU 火焰图分析。当前内置测量流程为 Dragonfly Raft benchmark。
 
+请求分析采用 [Raft OTEL traces](../../docs/cluster/profile/trace.md)：C++ 记录事件并计算请求属性，直接上报 Langfuse，CLI/Web 共用查询。分析示例见 [v16](../../docs/cluster/profile/v16-wal-encode-overlap.md#1-分析查询)。OTEL Metrics 延后。
+
 实验、对照选择、benchmark 轮次、验证结果和诊断指标保存在 PostgreSQL。
 火焰图、时间线和验证日志通过产物表关联到实验，文件存放在数据盘。
 
@@ -13,8 +15,8 @@
 
 创建实验时选定上一轮，可沿用该实验的基线与对比参照。每项选择会保存测试口径、版本和指标快照。
 v10 的上一轮使用 v9 的历史数据。旧实验按原有版本关系关联上一轮归档。总览的耗时卡片突出批次 P95 较上一轮的变化百分比，下方显示两轮各自的 P95 三轮中位数。
-总览、运行记录、火焰图和 Trace 都使用选定版本的数据。首个版本没有上一轮时，火焰图和 Trace 展示本轮与所选对比参照。
-Trace 的「Diff」用完整时间线归档对比两次独立采集。时间从各自的测量起点计起，使用相同的毫秒刻度。可缩放、移动时间窗，点击阶段筛选或点击事件查看时间、线程与参数。阶段表按本轮减对照计算并集耗时、P95 和事件数差值。
+总览、运行记录、火焰图、阶段分析和 Trace 都使用选定版本的数据。首个版本没有上一轮时，火焰图和 Trace 展示本轮与所选对比参照。
+「阶段分析」的「指标分析」按原始埋点名和上一轮对比，逐条查看指标事件的 Slow Path。「请求分析」按客户端总耗时排序请求，默认打开最慢请求并列出最长回复间隔。其余回复间隔按耗时排序，可关联的 Fetch 等待与原始事件显示在同一时间轴。 [v15 阶段分析](http://172.31.23.2:8787/#/v15/stages)
 运行记录的 Diff 表按指标展示 `baseline`、上一轮、本轮的三轮算术平均值，以及本轮与上一轮的均值差。表底每组有一个入口，可读取合并后的三轮原始日志。本轮的正确性验证和独立诊断放在同一张卡片。
 总览的「查看基准诊断」打开所选参照的独立页面，展示 CPU 火焰图、Trace 和阶段耗时。
 
@@ -84,9 +86,24 @@ profile backfill -data "$experiment_data" -archive docs/cluster/benchmarks
 
 `cmd/cli` 构建 `profile`，`cmd/web` 构建 `profile-web`。`models` 包含实验数据模型和 GORM 持久化，沿用 PostgreSQL 的显式 SQL 迁移。`pkg` 提供测量、执行、HTTP 路由和 Langfuse Trace 处理。
 
+## 原生 Trace 查询
+
+Web 从 `LANGFUSE_URL` 和 `LANGFUSE_ENV_FILE` 读取查询配置，Compose 已配置内部 traces 服务与只读凭据文件。CLI 和页面都使用 `pkg/httpapi` → `pkg/langfuse.QueryNative`，没有单独的 CLI 分析算法。
+
+```sh
+profile captures -id v15
+profile fetch-delay -id v15 -min-return-wait-ms 10
+profile slow-path -id v15
+profile slow-path -id v15 -name raft.set.admission.wal_idle
+```
+
+默认最近一轮 capture、降序 Top 10。耗时属性与输出统一为 ms，沿用原 `raft.*` trace 名称。`slow-path -min-duration-ms 10` 筛选事件耗时；`fetch-delay -min-return-wait-ms 10` 筛选 RPC 返回后的等待。Fetch 的其他字段可用 `-min-rpc-ms`、`-min-io-wait-ms`、`-min-appended-bytes` 等参数，一次选择一个阈值并按该字段排序；无阈值时可用 `-attribute` 选择排序字段。`-capture` 固定轮次，`-selected TRACE_ID:SPAN_ID` 查看指定请求，`-start-ns/-end-ns` 用原始单调时钟筛选请求起点，`-json` 输出 Web 使用的同一 DTO。`complete=false` 表示记录缺失或未排空，不能当作完整排名。此处 JSON 是 HTTP 查询响应，不是导入文件。
+
+页面的 `Event Slow Path` 和 `Fetch delay` 使用相同轮次 tabs。前者默认对全部事件按 duration 排序，不需要选择 attribute；Node 和 Event name 使用整轮采样生成下拉选项，不受当前筛选或 Top 10 限制。列表标题为 `Slow path`，左侧为编号列，点击编号或事件名打开时序。节点显示角色和编号；同一轮换主时，下拉列出该节点出现过的角色。后者默认按 `raft.fetch.return_wait` 排序，页面初始条件为 ≥ 10 ms：RPC 已返回到 Follower 开始处理响应之间的延迟。可修改阈值或切换其他 Fetch 属性。两者先看 Top 10，再看关联时序；事件详情不按特定事件名定制。`Event order` 支持开始时间或耗时排序。`Legacy overview` 仅显示历史文件归档。
+
 ## CLI
 
-CLI 和页面使用同一份实验记录。默认连接 `http://127.0.0.1:8787`，可用 `-url` 或 `PROFILE_URL` 指定平台地址。
+CLI 和页面使用同一份实验记录。CLI 自动读取系统环境变量 `PROFILE_URL`；未配置时连接 `http://127.0.0.1:8787`，`-url` 可临时覆盖。
 
 ```sh
 profile create -id v11 -title '本轮优化' -previous v10
@@ -110,6 +127,23 @@ profile flamegraph -id v10 -role leader -symbol 'CRC32::Extend' -caller-depth 8
 ```
 
 `apply-to-confirm` 按日志 offset 关联 Leader 上的 apply 批次和写入确认，统计匹配数、应用后的延迟、worker 排队与 apply 的重叠，以及票据峰值。只有确认 offset 连续且完整覆盖客户端批次时，才按 `client.pipeline` 的写入序号计算批尾耗时。输出同时列出有效批尾数和批次数。
+
+```sh
+profile trace -id v15 -role client -sort union
+profile trace -id v15 -stage raft. -sort union
+profile trace -id v15 -analysis slow-path
+profile trace -id v15 -analysis admission-wait -tickets 31 -batch 12
+profile trace -id v16 -analysis request-phases -sort count
+profile trace -timeline "$report/timeline.json" -analysis fetch-delay -limit 1 -json
+```
+
+`request-phases` 先给出整轮 SET 和末尾 WAIT 时间，再按各阶段占批次总耗时的比例降序排列。`-sort count` 按受到该阶段等待影响的写入比例排列。同一笔写入可能依次等多个阶段，因此受影响的写入比例可以重叠。耗时按相邻回复水位之间的等待切分，每段时间只归入一个阶段。
+
+`slow-path` 默认展开最慢的客户端批次，`-batch` 可按从 1 开始的批次编号指定。它列出该批阶段占比、最长的回复间隔及各间隔的分段耗时。`-role` 或 `-stage` 可查该批时间窗口内的原始 span，`-limit` 分别限制回复间隔和匹配 span 的输出条数。早期 Raft Trace 只有准入与回复水位时，报告使用较粗的 `group-to-reply` 阶段。
+
+`admission-wait` 统计准入等待内同连接线程的票据退役，以及最近一次 WAL 完成后到恢复准入的空档。`-tickets` 传入本次负载一波能容纳的票据数，`-batch` 可限定一批。早期 Trace 使用 `raft.folly.write` 的结束时间作为 WAL 完成时间。`fetch-delay` 按日志 offset 对齐 Follower 追加和 Fetch RPC，报告返回到开始处理的延迟、实际写入字节数及 `await_io` 与 `fsync` 的重叠。
+
+通过 `-id` 和 `-run` 查询时，CLI 从平台读取已归档的完整观测。未入库的独立诊断可用 `-timeline FILE` 读取归档，或用 `-timeline -` 从 stdin 读取。分析读取单连接 Raft Trace，支持 `-json`。
 
 `-symbol` 对函数名做区分大小写的子串匹配，按调用路径列出样本数及其占该节点总样本的比例。`-caller-depth` 为参与分组的上游帧数，默认使用完整路径。`-view inclusive` 使用靠近叶子的匹配帧，每个样本只计一次。两个查询都支持 `-json`。
 

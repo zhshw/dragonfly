@@ -295,8 +295,10 @@ absl::StatusOr<bool> PartitionLog::TryFlushBufferedAsync(AsyncIO submit, AppendD
   if (!*publication)
     return false;
   flushing_ = make_unique<PendingFlush>(
-      PendingFlush{**publication, End(), buffered_bytes_, std::move(submit), std::move(done)});
-  flushing_->submit(log_fd_, -1, {}, [this](int result) {
+      PendingFlush{{}, **publication, End(), buffered_bytes_, std::move(submit), std::move(done)});
+  if (capture_)
+    flushing_->event = capture_->MakePoint("raft.flush");
+  SubmitFlushSync(log_fd_, "Log", [this](int result) {
     if (result != 0) {
       FinishFlush(absl::ErrnoToStatus(result < 0 ? -result : EIO, "Syncing buffered quorum log"));
       return;
@@ -310,13 +312,22 @@ absl::StatusOr<bool> PartitionLog::TryFlushBufferedAsync(AsyncIO submit, AppendD
       FinishFlush(status);
       return;
     }
-    flushing_->submit(flushing_->publication.fd, -1, {}, [this](int result) {
+    SubmitFlushSync(flushing_->publication.fd, "Recovery marker", [this](int result) {
       FinishFlush(result == 0 ? absl::OkStatus()
                               : absl::ErrnoToStatus(result < 0 ? -result : EIO,
                                                     "Syncing buffered quorum recovery marker"));
     });
   });
   return true;
+}
+
+void PartitionLog::SubmitFlushSync(int fd, string_view role, IoCallback callback) {
+  const auto id = capture_ ? capture_->BeginFsync(TraceFlushId(), role) : 0;
+  flushing_->submit(fd, -1, {}, [this, id, callback = std::move(callback)](int result) {
+    if (capture_)
+      capture_->EndFsync(id, result);
+    callback(result);
+  });
 }
 
 void PartitionLog::FinishFlush(absl::Status status) {
@@ -331,34 +342,56 @@ void PartitionLog::FinishFlush(absl::Status status) {
     else
       buffered_durable_end_ = flush->end;
   }
+  if (capture_) {
+    auto& event = flush->event;
+    event.end = capture_->Now();
+    event.outcome = io_failure_.ok() ? "Success" : "Error";
+    event.values.push_back({trace::Attribute::kFlush, event.end - event.start});
+    capture_->Emit(std::move(event));
+  }
   flush->done(io_failure_);
 }
 
 bool PartitionLog::CanAppendDuringFlush(string_view bytes) const {
-  if (ack_mode_ != AckMode::kMemory || pending_ || !io_failure_.ok())
-    return false;
+  return FlushGate(bytes) == trace::Gate::kAllowed;
+}
+
+trace::Gate PartitionLog::FlushGate(string_view bytes) const {
+  using trace::Gate;
+  if (ack_mode_ != AckMode::kMemory)
+    return Gate::kNotMemory;
+  if (pending_)
+    return Gate::kAppendPending;
+  if (!io_failure_.ok())
+    return Gate::kStorageError;
   auto end = End();
   const size_t length = bytes.size();
   while (bytes.size() >= 12) {
     auto size = RecordBatchSize(bytes);
     if (!size.ok())
-      return false;
+      return Gate::kInvalidBatch;
 
     // Fetch can cut the last batch at its byte limit. The follower appends only whole batches.
     if (*size > bytes.size())
       break;
     const char* header = bytes.data();
     const uint32_t count = absl::big_endian::Load32(header + 57);
-    if (header[16] != 2 || (absl::big_endian::Load16(header + 21) & 0x20) ||
-        absl::big_endian::Load32(header + 12) != uint32_t(end.epoch) ||
-        absl::big_endian::Load64(header) != uint64_t(end.end_offset) || count == 0 ||
-        count > INT32_MAX || end.end_offset > INT64_MAX - count)
-      return false;
+    if (header[16] != 2 || count == 0 || count > INT32_MAX || end.end_offset > INT64_MAX - count)
+      return Gate::kInvalidBatch;
+    if (absl::big_endian::Load16(header + 21) & 0x20)
+      return Gate::kControlRecord;
+    if (absl::big_endian::Load32(header + 12) != uint32_t(end.epoch))
+      return Gate::kEpochChange;
+    if (absl::big_endian::Load64(header) != uint64_t(end.end_offset))
+      return Gate::kOffsetMismatch;
     end.end_offset += count;
     bytes.remove_prefix(*size);
   }
   const size_t complete_bytes = length - bytes.size();
-  return complete_bytes != 0 && FitsActiveSegment(complete_bytes, end.end_offset);
+  if (complete_bytes == 0)
+    return Gate::kIncompleteSuffix;
+  return FitsActiveSegment(complete_bytes, end.end_offset) ? Gate::kAllowed
+                                                           : Gate::kSegmentRollover;
 }
 
 LogPosition PartitionLog::EndForEpoch(int32_t epoch) const {
@@ -381,8 +414,9 @@ absl::Status PartitionLog::Append(string_view batches, int32_t epoch,
 }
 
 absl::Status PartitionLog::AppendAsFollower(string_view batches, int32_t epoch,
-                                            vector<ValidatedBatch>* appended) {
-  return AppendBatches(batches, epoch, true, nullopt, appended);
+                                            vector<ValidatedBatch>* appended,
+                                            size_t* appended_bytes) {
+  return AppendBatches(batches, epoch, true, nullopt, appended, appended_bytes);
 }
 
 bool PartitionLog::FitsActiveSegment(size_t bytes, int64_t end_offset) const {
@@ -393,7 +427,7 @@ bool PartitionLog::FitsActiveSegment(size_t bytes, int64_t end_offset) const {
 
 absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool follower,
                                          optional<DataWritten> written,
-                                         vector<ValidatedBatch>* appended) {
+                                         vector<ValidatedBatch>* appended, size_t* appended_bytes) {
   if (!io_failure_.ok())
     return io_failure_;
   if (pending_)
@@ -460,6 +494,7 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
   io_failure_ = WriteAt(log_fd_, active_bytes_, bytes.substr(0, length));
   if (!io_failure_.ok())
     return io_failure_;
+  ObserveWalComplete(end);
   if (written)
     (*written)(pending.front().file_end - pending.front().file_start);
   if (memory) {
@@ -472,6 +507,8 @@ absl::Status PartitionLog::AppendBatches(string_view bytes, int32_t epoch, bool 
   if (io_failure_.ok()) {
     batches_.insert(batches_.end(), pending.begin(), pending.end());
     active_bytes_ = pos;
+    if (appended_bytes)
+      *appended_bytes = length;
     if (appended)
       *appended = std::move(validated);
   }
@@ -558,6 +595,7 @@ void PartitionLog::WritePending() {
                 WritePending();
                 return;
               }
+              ObserveWalComplete(p->batches.back().end);
               p->readable = true;
               p->written(p->batches.front().file_end - p->batches.front().file_start);
               if (p->memory)
@@ -565,6 +603,21 @@ void PartitionLog::WritePending() {
               else
                 SyncPending();
             });
+}
+
+void PartitionLog::ObserveWalComplete(LogPosition end) {
+  if (!wal_complete_ && !capture_)
+    return;
+  const auto now = capture_ ? capture_->Now() : trace::Capture::MonotonicNow();
+  if (wal_complete_)
+    wal_complete_(now);
+  if (capture_) {
+    auto event = capture_->MakeEvent("raft.wal.append.complete", now, now);
+    event.attributes["epoch"] = std::to_string(end.epoch);
+    event.attributes["previous_offset"] = std::to_string(End().end_offset);
+    event.attributes["end_offset"] = std::to_string(end.end_offset);
+    capture_->Emit(std::move(event));
+  }
 }
 
 void PartitionLog::SyncPending() {

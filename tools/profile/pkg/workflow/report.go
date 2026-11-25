@@ -17,23 +17,13 @@ import (
 	"strconv"
 
 	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/trace"
 )
 
 type ReportOptions struct {
 	Go         string
 	Flamegraph string
 	CPUFrom    string
-}
-
-type timelineEvent struct {
-	Name string           `json:"name"`
-	Cat  string           `json:"cat"`
-	Kind string           `json:"ph"`
-	Node string           `json:"pid"`
-	TID  int64            `json:"tid"`
-	Time float64          `json:"ts"`
-	Dur  float64          `json:"dur"`
-	Args map[string]int64 `json:"args"`
 }
 
 func decodeReport(report langfuse.Report) (langfuse.Metadata, BenchRow, error) {
@@ -92,11 +82,13 @@ func generateReport(ctx context.Context, run, out string, options ReportOptions,
 		return err
 	}
 	defer os.RemoveAll(temp)
-	timeline := make([]timelineEvent, 0, len(events))
+	timeline := make([]trace.Event, 0, len(events))
 	for _, span := range events {
-		timeline = append(timeline, timelineEvent{span.Stage, span.Role, "X", span.Node, span.TID,
-			float64(span.Start-b.Start) / 1000, float64(span.End-span.Start) / 1000,
-			map[string]int64{"arg0": span.Arg0, "arg1": span.Arg1}})
+		timeline = append(timeline, trace.Event{
+			Name: span.Stage, Cat: span.Role, Kind: "X", Node: span.Node, TID: span.TID,
+			Time: float64(span.Start-b.Start) / 1000, Dur: float64(span.End-span.Start) / 1000,
+			Args: map[string]int64{"arg0": span.Arg0, "arg1": span.Arg1},
+		})
 	}
 	for name, value := range map[string]any{"spans.json": events, "summary.json": report, "timeline.json": map[string]any{"traceEvents": timeline}} {
 		if err := writeReportFile(filepath.Join(temp, name), func(w io.Writer) error { return json.NewEncoder(w).Encode(value) }); err != nil {

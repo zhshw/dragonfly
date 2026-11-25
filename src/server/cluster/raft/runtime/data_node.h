@@ -24,6 +24,10 @@ class DataNode : public DataCommandHandler {
       const std::filesystem::path& dir, const std::string& cluster_id, int32_t node_id,
       const std::string& controllers, const std::string& listen, uint16_t resp_port,
       Service* service, util::ProactorPool* pool, util::AcceptServer* acceptor);
+
+  // Configure before Start; each connection receives its own serial-owner capture.
+  using TraceFactory = std::function<std::shared_ptr<trace::Capture>(std::string)>;
+  virtual void SetTraceFactory(TraceFactory factory) = 0;
   virtual void Start() = 0;
   virtual void Stop() = 0;
 };

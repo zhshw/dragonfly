@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"dragonflydb.io/profile/pkg/langfuse"
-	"dragonflydb.io/profile/pkg/workflow"
+	"dragonflydb.io/profile/pkg/trace"
 	"gorm.io/gorm"
 )
 
@@ -27,19 +27,19 @@ type TraceQuery struct {
 }
 
 type TracePage struct {
-	ExperimentID   string                      `json:"experiment_id"`
-	Run            string                      `json:"run"`
-	Variant        string                      `json:"variant"`
-	TraceURL       string                      `json:"trace_url,omitempty"`
-	SpanCount      int                         `json:"span_count"`
-	Verified       int                         `json:"verified_observations"`
-	Sort           string                      `json:"sort"`
-	Order          string                      `json:"order"`
-	Total          int64                       `json:"total"`
-	Limit          int                         `json:"limit"`
-	Offset         int                         `json:"offset"`
-	Stages         []langfuse.Stage            `json:"stages"`
-	ApplyToConfirm *workflow.ApplyConfirmation `json:"apply_to_confirm,omitempty"`
+	ExperimentID   string                   `json:"experiment_id"`
+	Run            string                   `json:"run"`
+	Variant        string                   `json:"variant"`
+	TraceURL       string                   `json:"trace_url,omitempty"`
+	SpanCount      int                      `json:"span_count"`
+	Verified       int                      `json:"verified_observations"`
+	Sort           string                   `json:"sort"`
+	Order          string                   `json:"order"`
+	Total          int64                    `json:"total"`
+	Limit          int                      `json:"limit"`
+	Offset         int                      `json:"offset"`
+	Stages         []langfuse.Stage         `json:"stages"`
+	ApplyToConfirm *trace.ApplyConfirmation `json:"apply_to_confirm,omitempty"`
 }
 
 type diagnosticRun struct {
@@ -104,7 +104,7 @@ func (p *TracePage) analyzeApplyConfirmation(run diagnosticRun, artifact func(st
 		return err
 	}
 	defer timeline.Close()
-	analysis, err := workflow.AnalyzeApplyConfirmation(timeline)
+	analysis, err := trace.AnalyzeApplyConfirmation(timeline)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalid, err)
 	}

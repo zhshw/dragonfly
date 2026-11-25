@@ -33,6 +33,15 @@ def instrument(relative):
         indent = receive[1]
         edits = [
             (
+                "    completion(result);\n    const bool flushed",
+                "    const bool observed_append = log_->AppendPending();\n"
+                "    completion(result);\n"
+                "    if (observed_append && !log_->AppendPending() && log_->End().end_offset > end.end_offset)\n"
+                '      dfly_observe::Record("raft.wal.append.complete", dfly_observe::Now(),\n'
+                "                           end.end_offset, log_->End().end_offset);\n"
+                "    const bool flushed",
+            ),
+            (
                 "      commit_changed_.wait_until(key.epoch(), deadline);",
                 '      dfly_observe::Scope observed_commit("raft.await_commit");\n'
                 "      commit_changed_.wait_until(key.epoch(), deadline);",
@@ -63,18 +72,25 @@ def instrument(relative):
             (
                 "    const auto start = steady_clock::now();\n    if (peer.Call(fetch->request, version, &response))\n      return false;",
                 "    const auto start = steady_clock::now();\n"
-                '    dfly_observe::Scope observed_rpc("raft.fetch.rpc", leader);\n'
+                '    dfly_observe::Record("raft.fetch.report", dfly_observe::Now(),\n'
+                "                         fetch->request.topics.front().partitions.front().fetch_offset, leader);\n"
+                '    dfly_observe::Scope observed_rpc("raft.fetch.rpc", leader, fetch->sequence);\n'
                 "    if (peer.Call(fetch->request, version, &response))\n      return false;\n"
                 "    observed_rpc.Finish();",
             ),
             (
                 receive[0],
                 indent
-                + 'dfly_observe::Scope observed_response("raft.fetch.receive", end.end_offset);\n'
+                + 'dfly_observe::Scope observed_response("raft.fetch.receive", end.end_offset, fetch->sequence);\n'
                 + receive[0]
                 + "\n"
                 + indent
-                + "observed_response.Finish();",
+                + "observed_response.Finish();\n"
+                + indent
+                + "if (log_->End().end_offset > end.end_offset)\n"
+                + indent
+                + '  dfly_observe::Record("raft.fetch.appended", dfly_observe::Now(), '
+                "end.end_offset, log_->End().end_offset);",
             ),
             (
                 "    if (await_apply) {",
@@ -211,10 +227,35 @@ def instrument(relative):
                 '                  dfly_observe::Record("raft.apply.complete_queue", observed_complete, completed);',
             ),
             (
+                "                  auto finish = replica->effects.FinishApply(*batch, completed);",
+                "                  const auto observed_before = replica->effects.applied_offset();\n"
+                "                  auto finish = replica->effects.FinishApply(*batch, completed);\n"
+                "                  if (replica->effects.applied_offset() > observed_before)\n"
+                '                    dfly_observe::Record("raft.apply.advance", dfly_observe::Now(),\n'
+                "                                         observed_before, replica->effects.applied_offset());",
+            ),
+            (
                 "  return absl::OkStatus();\n}\n\nabsl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState()",
                 '  dfly_observe::Record("raft.set.cache_bytes", dfly_observe::Now(),\n'
                 "                       local.effects.cached_bytes(), buffer->capacity());\n"
                 "  return absl::OkStatus();\n}\n\nabsl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState()",
+            ),
+        ]
+    elif relative == RAFT + "quorum/fetch_replication.cc":
+        edits = [
+            (
+                "  if (leader_hw_->Update(voter_ends_))\n"
+                "    committed_ = max(committed_.value_or(0), leader_hw_->value()->offset);",
+                "  const auto observed_before = leader_hw_->value() ? leader_hw_->value()->offset : -1;\n"
+                "  if (leader_hw_->Update(voter_ends_)) {\n"
+                "    committed_ = max(committed_.value_or(0), leader_hw_->value()->offset);\n"
+                "    const auto observed_after = leader_hw_->value()->offset;\n"
+                "    if (observed_after > observed_before) {\n"
+                '      const char* stage = campaign_.target().topic == kDataTopic ? "raft.hw.advance"\n'
+                '                                                                 : "metadata.hw.advance";\n'
+                "      dfly_observe::Record(stage, dfly_observe::Now(), observed_before, observed_after);\n"
+                "    }\n"
+                "  }",
             ),
         ]
     elif relative == RAFT + "data/set_executor.cc":
@@ -373,6 +414,7 @@ def prepare(build, output, skip_build=False):
         RAFT + "data/set_effect.cc",
         RAFT + "data/set_executor.cc",
         RAFT + "log/partition_log.cc",
+        RAFT + "quorum/fetch_replication.cc",
         RAFT + "storage/folly_io.cc",
         "src/facade/dragonfly_connection.cc",
         "src/server/journal/streamer.cc",

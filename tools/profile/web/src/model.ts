@@ -1,6 +1,6 @@
 export type Variant = 'baseline' | 'current' | 'cluster';
 export type Role = 'leader' | 'follower';
-export type View = 'overview' | 'runs' | 'flamegraphs' | 'trace';
+export type View = 'overview' | 'runs' | 'flamegraphs' | 'stages' | 'trace';
 
 export const decisionNames = { retained: '已保留', reverted: '已回退', pending: '待评估' } as const;
 
@@ -119,7 +119,7 @@ export interface Stage {
 }
 
 export interface Observation {
-  variant: Variant;
+  variant: Variant | 'candidate';
   flamegraphs: Partial<Record<Role, string>>;
   timeline?: string;
   stages: Stage[];

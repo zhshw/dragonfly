@@ -3,13 +3,14 @@ import './style.css';
 import { createRoot } from 'react-dom/client';
 import { useCallback, useEffect, useState } from 'react';
 import {
-  Activity, ArrowRight, ChartNoAxesCombined, Check, ChevronRight,
+  Activity, ArrowRight, ChartBar, ChartNoAxesCombined, Check, ChevronRight,
   Clipboard, FlaskConical, Flame, GitCommitHorizontal, ListOrdered, Plus, Search, Trash2, Workflow,
 } from 'lucide-react';
 import { api, decisionNames, endpoint, number, percent, referenceHref, targetTitle } from './model';
 import type { Detail, ExperimentLabel, Metrics, Summary, View } from './model';
 import { RunsView } from './evidence';
 import { DiagnosticsView, ReferenceView } from './diagnostics';
+import { StageAnalysis } from './stages';
 import { CreateExperiment, TargetDetails } from './create';
 import { ExecutionPanel } from './execution';
 import { DeleteExperiment } from './delete';
@@ -18,10 +19,11 @@ const views = [
   { id: 'overview', label: '总览', icon: ChartNoAxesCombined },
   { id: 'runs', label: '运行记录', icon: ListOrdered },
   { id: 'flamegraphs', label: '火焰图', icon: Flame },
+  { id: 'stages', label: '阶段分析', icon: ChartBar },
   { id: 'trace', label: 'Trace', icon: Workflow },
 ] as const;
 
-function route(): { id?: string; view: View; reference?: string } {
+function route(): { id?: string; view: View; reference?: string; requestAnalysis?: boolean } {
   const [id, tab, section] = location.hash.slice(2).split('/');
   if (id === 'reference' && tab && section === 'diagnostics') {
     try {
@@ -30,7 +32,8 @@ function route(): { id?: string; view: View; reference?: string } {
       return { view: 'overview' };
     }
   }
-  return { id, view: views.find(({ id }) => id === tab)?.id || 'overview' };
+  return { id, view: views.find(({ id }) => id === tab)?.id || 'overview',
+    requestAnalysis: tab === 'stages' && section === 'requests' };
 }
 
 function href(id: string, view: View) {
@@ -288,6 +291,7 @@ function App() {
           </nav>
           {page.view === 'overview' && <Overview summary={active.summary} />}
           {page.view === 'runs' && <RunsView key={experiment.id} id={experiment.id} />}
+          {page.view === 'stages' && <StageAnalysis key={experiment.id} detail={active} requests={page.requestAnalysis} />}
           {(page.view === 'flamegraphs' || page.view === 'trace') && <DiagnosticsView key={experiment.id} id={experiment.id} view={page.view}
             referenceID={!active.summary.comparisons.previous ? active.summary.comparisons.reference?.target.id : undefined} />}
           </>}

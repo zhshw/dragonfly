@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 
 	"dragonflydb.io/profile/models"
 	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/trace"
 	"dragonflydb.io/profile/pkg/workflow"
 )
 
@@ -28,9 +30,9 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 	run := f.String("run", "", "archived diagnostic run ID (default current diagnostic)")
 	limit := f.Int("limit", models.DefaultTraceLimit, "maximum rows (0 shows only the summary)")
 	asJSON := f.Bool("json", false, "write only the selected results as JSON")
-	var role, stage, order, metric, view, verifyRun, analysis, symbol string
+	var role, stage, order, metric, view, verifyRun, analysis, symbol, timeline, scope string
 	var minUnion float64
-	var offset, callerDepth int
+	var offset, callerDepth, batch, fullWaveTickets int
 	if command == "trace" {
 		f.StringVar(&role, "role", "", "filter by leader, follower or client")
 		f.StringVar(&stage, "stage", "", "literal stage prefix, e.g. raft.fetch")
@@ -39,7 +41,11 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 		f.IntVar(&offset, "offset", 0, "skip this many matching stages")
 		f.Float64Var(&minUnion, "min-union-ms", 0, "minimum union time in milliseconds")
 		f.StringVar(&verifyRun, "verify-run", "", "check a completed workflow's observations directly in Langfuse")
-		f.StringVar(&analysis, "analysis", "", "correlate leader events by offset (apply-to-confirm)")
+		f.StringVar(&analysis, "analysis", "", "apply-to-confirm, request-phases, slow-path, admission-wait or fetch-delay")
+		f.StringVar(&scope, "scope", "", "fetch-delay: batch (default) or round. admission-wait: thread (default) or leader")
+		f.StringVar(&timeline, "timeline", "", "read a local timeline.json or - for stdin (request analyses)")
+		f.IntVar(&batch, "batch", 0, "batch number (default slowest, or all for admission-wait)")
+		f.IntVar(&fullWaveTickets, "tickets", 0, "number of tickets in a full admission wave")
 	} else {
 		f.StringVar(&role, "role", "leader", "profiled node (leader or follower)")
 		f.StringVar(&view, "view", "leaf", "CPU hotspot view (leaf or inclusive)")
@@ -51,6 +57,54 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 	}
 	if f.NArg() != 0 {
 		return errors.New("expected flags only")
+	}
+	if scope != "" {
+		switch analysis {
+		case "fetch-delay":
+			if (scope != "batch" && scope != "round") || (scope == "round" && batch != 0) {
+				return errors.New("fetch-delay requires batch or round scope, and round excludes -batch")
+			}
+		case "admission-wait":
+			if scope != "thread" && scope != "leader" {
+				return errors.New("admission-wait scope must be thread or leader")
+			}
+		default:
+			return errors.New("-scope requires fetch-delay or admission-wait")
+		}
+	}
+	switch analysis {
+	case "request-phases", "slow-path", "admission-wait", "fetch-delay":
+		if verifyRun != "" || (timeline != "" && (*id != "" || *run != "")) {
+			return errors.New("choose -id ID or -timeline FILE for request analysis")
+		}
+		if *limit < 0 || batch < 0 {
+			return errors.New("limit and batch must be nonnegative")
+		}
+		if (analysis != "slow-path" && (role != "" || stage != "")) || (analysis == "request-phases" && batch != 0) {
+			return errors.New("-role and -stage select slow-path spans; -batch requires a batch analysis")
+		}
+		if analysis == "admission-wait" && fullWaveTickets <= 0 {
+			return errors.New("admission-wait requires -tickets N")
+		}
+		if analysis != "admission-wait" && fullWaveTickets != 0 {
+			return errors.New("-tickets requires admission-wait")
+		}
+		if metric != "union" && metric != "count" {
+			return errors.New("request analysis supports -sort count or the default time-share order")
+		}
+		if role != "" && role != "leader" && role != "follower" && role != "client" {
+			return errors.New("role must be leader, follower or client")
+		}
+		query := trace.RequestTraceQuery{
+			FetchPhases: true, Slow: analysis == "slow-path", ByWrites: metric == "count", Batch: batch, Limit: *limit, Role: role, Stage: stage,
+		}
+		return requestTraceCLI(ctx, *base, *id, *run, timeline, analysis, scope, query, fullWaveTickets, *asJSON)
+	}
+	if timeline != "" || batch != 0 || fullWaveTickets != 0 {
+		return errors.New("choose a request-phases, slow-path, admission-wait or fetch-delay analysis")
+	}
+	if analysis != "" && (analysis != models.ApplyToConfirmAnalysis || (role != "" && role != "leader")) {
+		return fmt.Errorf("analysis %q is unavailable for role %q", analysis, role)
 	}
 	if verifyRun != "" {
 		if *id != "" || *run != "" || analysis != "" {
@@ -103,13 +157,20 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 	params.Set("order", order)
 	params.Set("offset", strconv.Itoa(offset))
 	params.Set("min_union_ms", strconv.FormatFloat(minUnion, 'g', -1, 64))
-	params.Set("analysis", analysis)
 	var page models.TracePage
 	if err := client.request(ctx, http.MethodGet, path+"/trace?"+params.Encode(), nil, &page); err != nil {
 		return err
 	}
-	if analysis != "" && page.ApplyToConfirm == nil {
-		return errors.New("profile server does not support trace analysis")
+	if analysis == models.ApplyToConfirmAnalysis {
+		data, err := platformTimelineForPage(ctx, client, path, page)
+		if err != nil {
+			return err
+		}
+		report, err := trace.AnalyzeApplyConfirmation(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		page.ApplyToConfirm = &report
 	}
 	if *asJSON {
 		return json.NewEncoder(os.Stdout).Encode(page)

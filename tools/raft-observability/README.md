@@ -31,6 +31,8 @@ make -C tools/profile langfuse
 
 ## 采集
 
+新方案见 [Raft 原生 OTEL traces](../../docs/cluster/profile/trace.md)：C++ 现场记录并延后定稿，数值作为 span attributes，经标准 OTEL traces 直接上报 Langfuse。原生记录、两个确定性场景测试、直传和 CLI/Web 共用查询已实现；真实磁盘负载验收见该文档。OTEL Metrics 延后。以下保留现有文件工具说明，不是新方案的实施步骤。
+
 生产源码和原 Release 二进制不加入 trace。`prepare.py` 复制参与采集的源文件，在副本插桩并重新链接。
 `group.cc` 分别标记数据组和元数据组，避免把元数据的空闲 Fetch 长轮询误当成数据复制等待。
 所有 span 在线程内存中缓冲，正常退出时写 CSV；达到容量会计数，报告生成器拒绝有丢失的采集。
@@ -55,6 +57,17 @@ follower 对应 `raft.fetch.cache_bytes`，字段口径相同；`raft.fetch.cach
 `raft.apply.shard_queue` 只记录跨线程投递，从提交 L2 到回调开始，含队列反压；
 次数即投递次数，`arg0` 为笔数，`arg1` 为目标 shard ID。
 恢复路径达到时间预算后可能只完成前缀，剩余项的下一次投递会重复计入 `arg0`；完成笔数应核对 `journal.apply` 次数。
+
+按 SET 的确认 offset 关联请求时，Leader 的 `raft.wal.append.complete`、Follower 的
+`raft.fetch.appended`、Leader 的 `raft.hw.advance`、`raft.apply.advance` 和
+`raft.reply.advance` 分别记录 WAL 追加完成、Fetch 追加、提交、应用和可回复水位。
+取事件的 `start_ns` 作为推进时刻，`arg0 < offset <= arg1` 表示这次推进覆盖该请求。
+Follower 在发起 Fetch 前用 `raft.fetch.report.arg0` 记录它向 Leader 报告的日志末端，`arg1` 为 Leader ID。
+同一 Follower、同一复制组的 `raft.fetch.rpc` 与 `raft.fetch.receive` 通过 `arg1` 中的 Fetch 序号配对；
+二者的 `arg0` 分别为 Leader ID 和接收前的日志末端。元数据组使用 `metadata.*`。
+用 `receive.start_ns - rpc.end_ns` 量 RPC 返回到开始处理响应的等待。要核对 flush 阻塞，
+在这个窗口查 RPC 所在线程的 `raft.await_io` 和 Follower 的 `raft.folly.fsync`，
+并比较该次接收中 `raft.log.append.arg0` 的载荷字节数与 `raft.log.pwrite.arg0` 的实际写入字节数。
 
 ```sh
 python3 tools/raft-observability/prepare.py --build-dir build-opt \
@@ -82,6 +95,16 @@ Go pprof 读取 CPU profile，GNU `addr2line` 解析 ELF 映射，Brendan Gregg 
 采集器另在计时前后读取 leader/follower 的 RSS、匿名 RSS 和峰值 RSS，写入 metadata 并显示在报告中。
 峰值覆盖进程启动、预热和测量，包含实际 KV 数据；不代表临时缓冲分配字节，也不包含内核 page cache。
 正式吞吐仍使用不带这些诊断的 benchmark。
+
+## 按请求复查 v15
+
+使用平台的 Profile CLI。脚本先统计有序回复各阶段的耗时和准入等待，再展开最慢批次的最长回复间隔，最后按 RPC 返回后的等待对整轮 Fetch 排序。8 MiB 准入预算和 256 KiB/value 对应每波 31 张票据。
+
+```sh
+tools/raft-observability/analyze-v15.sh v15
+```
+
+新 `v15` 归档使用 `profile/v15-replication-trace` 的探针。整轮 135 笔数据 Fetch 中有 3 笔部分写入，RPC 返回到开始处理最长 **11.850 µs**。最慢批次 #1 的 offset 75 回复间隔为 10.124 ms，其中 RPC 返回到开始处理占 6.974 µs。按原脚本跨线程统计 Leader 票据，34 次准入等待中有 32 次退役了完整的 31 张。历史上用于定位并发 flush 的三次长等待来自首版补发候选。 [v15 请求分析](http://172.31.23.2:8787/#/v15/stages/requests)
 
 ## 生成报告并导入 Langfuse
 
