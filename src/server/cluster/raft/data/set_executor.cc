@@ -5,8 +5,8 @@
 #include "server/cluster/raft/data/set_executor.h"
 
 #include "facade/reply_capture.h"
-#include "server/cluster/raft/data/set_effect.h"
 #include "server/cluster_support.h"
+#include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
 
 namespace dfly::cluster::raft {
@@ -26,6 +26,46 @@ absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffectView& ef
   auto* reply = std::get_if<facade::payload::SimpleString>(&payload);
   if (result != facade::DispatchResult::OK || !reply || *reply != "OK")
     return absl::FailedPreconditionError("Committed SET did not return OK");
+  return absl::OkStatus();
+}
+
+absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::ApplyBatch& batch,
+                             size_t* completed) {
+  *completed = 0;
+  const auto shard_count = shard_set->size();
+  while (*completed < batch.size()) {
+    const size_t begin = *completed;
+    const auto sid = Shard(batch.View(begin).key, shard_count);
+    size_t end = begin + 1;
+    while (end < batch.size() && Shard(batch.View(end).key, shard_count) == sid)
+      ++end;
+
+    // The owning ApplyLane waits before starting the next run, even if it targets another shard.
+    auto apply_run = [&] {
+      auto apply = [&] {
+        for (; *completed < end; ++*completed) {
+          if (auto status = ExecuteSetEffect(executor, batch.View(*completed)); !status.ok())
+            return status;
+        }
+        return absl::OkStatus();
+      };
+      return end - begin == 1 ? apply() : executor.WithShardLocalTransaction(apply);
+    };
+    absl::Status status;
+    if (auto* local = EngineShard::tlocal(); local && local->shard_id() == sid) {
+      status = apply_run();
+    } else {
+      // A contended transaction may itself wait on the primary shard queue.
+      util::fb2::FiberBlockingCounter done(1);
+      shard_set->AddL2(sid, [&, done]() mutable {
+        status = apply_run();
+        std::move(done).Release();
+      });
+      done.Wait();
+    }
+    if (!status.ok())
+      return status;
+  }
   return absl::OkStatus();
 }
 

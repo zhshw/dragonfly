@@ -9,11 +9,11 @@
 | 平台记录 | 吞吐（MiB/s） | 批次 P95（ms） |
 | --- | ---: | ---: |
 | 基线 v3 | 169.56 | 113.75 |
-| 上一轮 v13（P1-7） | 486.54 | 45.25 |
-| 本轮 v14b（Folly io_uring 首版修正） | **499.85** | **38.21** |
+| 上一轮 v14b（Folly io_uring 首版修正） | 499.85 | 38.21 |
+| 本轮 v15（连续同 shard 的 SET 合批） | **493.28** | **34.70** |
 | 对比参照 `v10:cluster` | 605.47 | 34.63 |
 
-v14b 较 v3 累计吞吐 **+194.8%**，达到原 cluster 参照的 **82.6%**。较 v13 吞吐中位数 **+2.7%**、算术均值 **+6.6%**，批次 P95 中位数 **−15.6%**。v14b 延续 v14 的 Folly io_uring 批次事件循环架构，仅修复首版的 applied 上报和 WAIT 唤醒 bug；上一轮明确选择 **v13**，v14 保留首版记录。相较 v13，测试网络后端同时从 epoll 改为 io_uring，不能拆分归因。**Leader 峰值 RSS 从 424.54 升至 668.01 MiB，内存仍需优化。** [v14b 平台](http://127.0.0.1:8787/#/v14b/overview) · [实验结论](profile/v14b-batch-progress.md)
+v15 的 **SET 批次 P95 已基本对齐原 cluster**。三轮中位数为 **34.70 ms**，与同负载参照 **34.63 ms** 相差 **0.07 ms（+0.2%）**，较 v14b 下降 **9.2%**。含 `WAIT 1` 的吞吐中位数为原 cluster 的 **81.5%**，较 v14b 下降 **1.3%**。三轮均完成副本确认与全量读回。 [v15 平台](http://172.31.23.2:8787/#/v15/overview) · [实验与 shard 投递计数](profile/v15-shard-apply.md)
 
 ## 使用 profile
 
@@ -23,10 +23,10 @@ v14b 较 v3 累计吞吐 **+194.8%**，达到原 cluster 参照的 **82.6%**。�
 
 ### 用 CLI 运行 benchmark
 
-创建新实验 `v15`，选 v14b 为上一轮，并沿用其基线与对比参照。
+v15 创建时选用 v14b 作为上一轮，并沿用其基线与对比参照。
 
 ```sh
-profile create -id v15 -title '本轮优化' -previous v14b
+profile create -id v15 -title 'Raft 已提交 SET 的 shard 合批' -previous v14b
 profile run -id v15
 profile show -id v15
 ```
@@ -60,16 +60,16 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 | 接收 | RESP 参数 → SET 执行 | RESP 参数 → 异步票据 → 排队 |
 | 复制准备 | shard journal 编码并流式发送 | effect → Kafka batch → drain 聚合 → WAL 缓冲 |
 | 确认 | 本地 SET 回复，WAIT 追踪副本应用 | WAL 接收 → follower Fetch → HW → 本地应用 → SET 回复 |
-| 应用 | replica flow 消费 journal 并执行 | GroupLoop → 独立 ApplyLane → 命令分发 → shard |
+| 应用 | replica flow 消费 journal 并执行 | GroupLoop → 独立 ApplyLane → 连续同 shard 的 SET 段 → shard |
 | 重放数据 | 接收的 journal 数据 | 普通 effect 复用不可变 WAL 缓冲，缺口从 WAL 重放 |
 
 两套集群设计独立。Raft 的任期、日志顺序、HW 和恢复边界仍由 Raft 负责。
 
 ## 下一轮优先项
 
-1. **先做 shard 合批，减少逐笔跨线程投递与等待。** v14b ApplyLane 内仍逐笔同步分发 SET；参考原 cluster 按 shard 分组、一次投递并复用本地事务的方式，补充 shard 排队、执行和投递次数。当前 **86.53 ms** 应用区间包含实际写入及等待，不能全部当作可节省时间。 [v14b 源码对照与计划](profile/v14b-batch-progress.md#下一步批次传递到-shard)
-2. **配合调整应用批次预算，再查 WAL batch。** 1 MiB 上限使当前 256 KiB/value 的应用批次最多装 3 条；WAL 提交也从 **176 增到 257 批**。记录批次笔数、字节数、就绪数量与截断原因。历史失败结论继续保留，避免重复试验。 [v11 复用编码](profile/v11-leader-wal-append.md)
-3. **同步约束内存增量。** v14b Leader 峰值 RSS 较 v13 增加 **243.47 MiB**。检查编码/WAL 缓冲跨线程释放、分配器保留页及 Folly 每 peer loop/接收缓冲，用分配证据区分来源。当前吞吐有收益，尚未兑现内存优化。 [v14b 诊断](profile/v14b-batch-progress.md)
+1. **验证交替 shard 的执行方案。** v15 已实现连续同 shard 合批。标准负载的 1024 笔写逐笔交替，远端仍有 512 次 L2 投递；每 4 笔切换 shard 的补充诊断将同量远端写合成 257 次投递。下一步要检验前项失败、重复应用与快照切点，决定能否安全地扩大分组范围。 [执行图与计数](profile/v15-shard-apply.md)
+2. **单独调整应用预算，再查 WAL 取批。** 256 KiB/value 加上编码开销后，1 MiB 上限每个 ApplyBatch 最多装 3 笔。v15 Leader 的 1024 笔写形成 381 个应用批、253 个 WAL 提交批。对照不同 key 排列的段长，再记录就绪数量与截断原因。 [v14b 计划](profile/v14b-batch-progress.md#下一步批次传递到-shard)
+3. **继续观测内存。** v15 Leader 峰值 RSS 为 668.68 MiB，v14b 为 668.01 MiB；Follower 分别为 421.43 和 420.39 MiB。缓冲跨线程释放、分配器保留页及 Folly 每 peer loop 的占用仍需单独测量。 [v15 诊断](profile/v15-shard-apply.md#shard-诊断与收益边界)
 
 ## 优化项与当前状态
 
@@ -90,7 +90,7 @@ profile flamegraph -id v10 -run diagnostic-current -role leader \
 
 ### P0-2 批量应用与借用 SET 参数
 
-v5 实现最多 32 笔 / 1 MiB 的 owner 批量投递和借用 key/value；v14b 将普通缓存前缀交给独立 ApplyLane，完成事件只发布实际成功前缀。下一步评估 shard 内合批，减少逐笔分发和跨线程等待。验证需覆盖 DbSlice 与事务行为、同 key 顺序、控制记录、迁移与快照边界及部分失败。 [v5](profile/v5-batched-apply.md) · [v14b](profile/v14b-batch-progress.md)
+v5 实现最多 32 笔 / 1 MiB 的 owner 批量投递和借用 key/value；v14b 将普通缓存前缀交给独立 ApplyLane，完成事件只发布实际成功前缀。v15 将相邻同 shard 的普通 SET 合并到一次投递，逐条校验回复并在首个失败处停止。 [v5](profile/v5-batched-apply.md) · [v14b](profile/v14b-batch-progress.md) · [v15](profile/v15-shard-apply.md)
 
 v13 的 owner 排队仅 **10.41 ms**；owner 批内执行 **138.23 ms**，其中逐笔 `journal.apply` 为 **137.53 ms**。进一步合批应针对 SET 内的 shard 投递与等待，先区分其与实际写入的耗时，不能把整个 apply 或 worker 排队作为可节省预算。 [v13 复核](profile/v13-fetch-borrow.md#trace-复核)
 
@@ -158,3 +158,4 @@ v13 的普通异步 SET 每笔创建一个 `raft-set-confirm` fiber，醒来后�
 - [v13 Follower Fetch records 借用解码](profile/v13-fetch-borrow.md)
 - [v14 Folly io_uring 批次事件循环首版](profile/v14-batch-event-loop.md)
 - [v14b Folly io_uring 批次事件循环（首版修正）](profile/v14b-batch-progress.md)
+- [v15 已提交 SET 的 shard 合批](profile/v15-shard-apply.md)

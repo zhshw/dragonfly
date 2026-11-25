@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <absl/functional/function_ref.h>
+#include <absl/status/status.h>
 #include <absl/types/span.h>
 
 #include "facade/service_interface.h"
@@ -38,6 +40,10 @@ class JournalExecutor {
   // The views must remain valid until this synchronous call returns, including fiber yields.
   facade::DispatchResult ExecuteSet(DbIndex dbid, std::string_view key, std::string_view value,
                                     facade::SinkReplyBuilder& reply);
+
+  // Run synchronous single-shard commands with one reusable transaction. The caller runs on
+  // the target shard and must wait for the callback before using this executor again.
+  absl::Status WithShardLocalTransaction(absl::FunctionRef<absl::Status()> run);
 
   void FlushAll();  // Execute FLUSHALL.
   void FlushSlots(const cluster::SlotRange& slot_range);

@@ -4,6 +4,7 @@
 
 #include "server/journal/executor.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
 
@@ -19,6 +20,7 @@
 #include "server/engine_shard_set.h"
 #include "server/main_service.h"
 #include "server/namespaces.h"
+#include "server/transaction.h"
 
 ABSL_DECLARE_FLAG(uint32_t, dbnum);
 
@@ -70,9 +72,28 @@ facade::DispatchResult JournalExecutor::ExecuteSet(DbIndex dbid, string_view key
                                                    facade::SinkReplyBuilder& reply) {
   if (!SelectDb(dbid))
     return facade::DispatchResult::ERROR;
+  if (conn_context_.transaction)
+    conn_context_.transaction->InitTxTime();
   array<string_view, 3> parts{"SET", key, value};
   CommandContext cmd(&reply, &conn_context_);
   return Execute(facade::ArgSlice{parts}, &cmd);
+}
+
+absl::Status JournalExecutor::WithShardLocalTransaction(absl::FunctionRef<absl::Status()> run) {
+  DCHECK(EngineShard::tlocal());
+  DCHECK(!conn_context_.transaction);
+  const auto* exec = service_->FindCmd("EXEC");
+  if (!exec)
+    return run();
+
+  boost::intrusive_ptr<Transaction> tx(new Transaction(exec));
+  tx->StartMultiNonAtomic(Transaction::SHARD_LOCAL);
+  conn_context_.transaction = tx.get();
+  absl::Cleanup cleanup = [&] {
+    tx->UnlockMulti();
+    conn_context_.transaction = nullptr;
+  };
+  return run();
 }
 
 void JournalExecutor::FlushAll() {

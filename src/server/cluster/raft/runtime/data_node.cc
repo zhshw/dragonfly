@@ -401,12 +401,7 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
               replica->applying = *batch;
               CHECK(replica->apply_queue.TryAdd([replica, batch = *batch] {
                 size_t completed = 0;
-                absl::Status status;
-                for (; completed < batch->size(); ++completed) {
-                  status = ExecuteSetEffect(replica->apply_executor, batch->View(completed));
-                  if (!status.ok())
-                    break;
-                }
+                auto status = ExecuteSetBatch(replica->apply_executor, *batch, &completed);
                 replica->raft->CompleteApply([replica, batch, completed, status] {
                   auto finish = replica->effects.FinishApply(*batch, completed);
                   replica->apply_status = finish.ok() ? status : finish;

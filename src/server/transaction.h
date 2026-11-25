@@ -367,6 +367,9 @@ class Transaction {
     return global_;
   }
 
+  // Refresh the operation time when replay reuses a transaction for an independent command.
+  void InitTxTime();
+
   DbContext GetDbContext() const {
     return DbContext{namespace_, db_index_, time_now_ms_};
   }
@@ -564,9 +567,6 @@ class Transaction {
 
   // Run callback inline as part of multi stub.
   OpStatus RunSquashedMultiCb(RunnableType cb);
-
-  // Set time_now_ms_
-  void InitTxTime();
 
   void UnlockMultiShardCb(absl::Span<const LockFp> fps, EngineShard* shard);
 

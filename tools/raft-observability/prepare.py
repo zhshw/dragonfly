@@ -201,6 +201,25 @@ def instrument(relative):
                 "  return absl::OkStatus();\n}\n\nabsl::StatusOr<DataReplicationState> DataNodeImpl::ReplicationState()",
             ),
         ]
+    elif relative == RAFT + "data/set_executor.cc":
+        edits = [
+            (
+                "    auto apply_run = [&] {",
+                "    auto apply_run = [&] {\n"
+                "      size_t observed_bytes = 0;\n"
+                "      for (size_t i = begin; i < end; ++i) {\n"
+                "        auto view = batch.View(i);\n"
+                "        observed_bytes += view.key.size() + view.value.size();\n"
+                "      }\n"
+                '      dfly_observe::Scope observed_run("raft.apply.shard_run", end - begin, observed_bytes);',
+            ),
+            (
+                "      shard_set->AddL2(sid, [&, done]() mutable {",
+                "      const auto observed_queue = dfly_observe::Now();\n"
+                "      shard_set->AddL2(sid, [&, done, observed_queue]() mutable {\n"
+                '        dfly_observe::Record("raft.apply.shard_queue", observed_queue, end - begin, sid);',
+            ),
+        ]
     elif relative == RAFT + "data/set_effect.cc":
         edits = [
             (
@@ -328,6 +347,7 @@ def prepare(build, output, skip_build=False):
         RAFT + "runtime/group.cc",
         RAFT + "runtime/data_node.cc",
         RAFT + "data/set_effect.cc",
+        RAFT + "data/set_executor.cc",
         RAFT + "log/partition_log.cc",
         RAFT + "storage/folly_io.cc",
         "src/server/journal/streamer.cc",

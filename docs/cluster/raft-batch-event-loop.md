@@ -1,18 +1,18 @@
 # Raft 批次事件驱动写入架构
 
-**状态：Folly io_uring 批次事件循环首版已实现并测量，当前为 v14b 修正版。** v14b 延续同一架构，仅修复首版的 applied 上报和 WAIT 唤醒 bug。适用于 `cluster_mode=raft`，上一轮性能参照选择 v13。原 cluster 保持独立。 [v14 首版](profile/v14-batch-event-loop.md) · [v14b 结果](profile/v14b-batch-progress.md)
+**当前实现为 v15。** Folly io_uring 事件循环负责 Raft 写入与复制，ApplyLane 将相邻同 shard 的已提交 SET 交给所属引擎线程。v15 的性能上一轮为 v14b。 [v14 首版](profile/v14-batch-event-loop.md) · [v14b 进度修正](profile/v14b-batch-progress.md) · [v15 实验](profile/v15-shard-apply.md)
 
 **实验约定：本提案按重大架构改造持续迭代，不因首版或后续某轮性能不佳自动回退代码。** 先形成可运行的第一版并测试，再沿当前实验实现分析和优化，详见[实验推进约定](#9-实验推进约定)。
 
 核心结构是：**有界提交队列 → 批量编码与 WAL → 复制水位 → 批量应用 → 可回复水位 → 连接连续回复。** 每条命令保存必要的输入、序号和日志位置；等待、调度和完成通知以组、批次及连接为单位，不设置逐笔确认 fiber、逐笔完成回调或逐笔定时器。
 
-首版落地范围：
+当前实现范围
 
 - 普通 SET 使用有界准入、固定编码执行器、共享任期回复水位和组级截止时间；没有逐笔确认 fiber 或 `WaitApplied` 回查。连接沿用 FIFO 回复，条件写保留串行屏障。
 - Folly EventBase 持有组状态，WAL 完成直接回到组内；独立 ApplyLane 每批一次交接，应用在途时继续处理普通 Fetch。
 - Follower 应用在途时避免携带旧 applied 进入长轮询，空响应等待本地批次事件；Leader WAIT 由副本进度唤醒，100 ms 检查上限仅用于关闭等兜底。
 - 节点间收发使用 `AsyncIoUringSocket` / `IoUringBackend`，测试的外部 RESP 连接也使用 io_uring。同步 RPC handler 目前仍由有界、常驻的引擎 fiber 槽执行；它不承载网络 I/O。
-- 尚未合并批内相邻 SET 的 shard 任务，ApplyLane 内仍使用既有事务分发；控制、恢复、快照的冷路径仍有同步屏障。跨 peer 共享 Folly 网络 loop 和统一缓冲容量统计继续迭代。以下结构描述包含这些目标，不能视为全部已完成。
+- ApplyLane 对连续同 shard 的 SET 按段执行，本线程直接调用，跨线程每段投递一次 L2。多笔段复用非原子 shard 本地事务，每笔仍走同步 SET 的状态检查、锁和回复校验。控制、恢复和快照保留原有屏障。
 
 ## 1. 执行与所有权
 
@@ -88,7 +88,7 @@ while 队首已经有最终错误，或已绑定位置被有效成功水位覆�
 
 Follower 收到数据后按批校验并追加，达到 `W`/`D` 后即可驱动下一次 Fetch；已提交记录进入独立、有界的 ApplyLane。应用完成再发布本地 `A`，供 `WAIT` 跟踪副本应用进度。应用落后会触发数据反压，控制消息和进度报告仍须能够前进。
 
-**ApplyLane 按连续日志顺序消费。** 一个应用批次可以包含多条普通 SET；取相邻、同 shard 的连续记录作为一个 shard 任务，复用批次上下文，逐条执行必要的数据写入。返回成功前缀长度，随后再执行下一段。这样每批只投递和完成一次，保持组内可见顺序，不按 shard 任意重排日志。
+**ApplyLane 按连续日志顺序消费。** 一个应用批次可以包含多条普通 SET；取相邻、同 shard 的连续记录作为一个 shard 任务，复用批次上下文，逐条执行必要的数据写入。返回成功前缀长度，随后再执行下一段。每个远端 shard 段有一次投递和等待，每个 ApplyBatch 有一次 GroupLoop 完成通知。交错访问 shard 的日志可产生多个单笔段。
 
 shard 内批量执行必须保留逐条 SET 的 DbSlice、事务、watch、过期和内存错误处理等契约。条件求值、控制记录、slot 迁移及快照操作构成屏障，等待所需前缀应用后再执行。屏障等待由状态和完成事件表示，GroupLoop 同时仍可处理 I/O、Fetch 和任期事件。
 

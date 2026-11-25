@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="570" viewBox="0 0 1000 570" role="img" aria-labelledby="title desc" lang="zh-CN">
+  <title id="title">同一组 SET 在原 cluster 与 Raft v15 中如何进入 shard</title>
+  <desc id="desc">命令依次访问 A、A、B、A。原 cluster pipeline 把 A 的三笔与 B 的一笔分别投递，等待两个 shard 完成。Raft v15 在日志提交后切为三个有序段，逐段执行。若 B 的第三笔失败，applied 只覆盖前两笔，最后一段还没有投递。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#506579" stroke-width="1.3"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #142e40; }
+      .title { font-size: 26px; font-weight: 700; }
+      .heading { font-size: 21px; font-weight: 650; }
+      .label { font-size: 16px; font-weight: 600; }
+      .body { font-size: 15px; }
+      .note { font-size: 14px; fill: #42586a; }
+      .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 15px; font-weight: 600; }
+      .a { fill: #e4f0fc; stroke: #5082af; }
+      .b { fill: #fff0ce; stroke: #bd8d3c; }
+      .panel { fill: #f8fafc; stroke: #c6d3dd; }
+      .neutral { fill: #fff; stroke: #b9c8d3; }
+      .edge { fill: none; stroke: #506579; stroke-width: 1.6; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect width="1000" height="570" rx="12" fill="#fff"/>
+  <text x="30" y="42" class="title">四笔 SET，从提交顺序到 shard 执行</text>
+  <text x="30" y="77" class="body">输入顺序</text>
+  <g class="mono" text-anchor="middle">
+    <rect x="105" y="54" width="60" height="34" rx="6" class="a"/><text x="135" y="76">A1</text>
+    <rect x="173" y="54" width="60" height="34" rx="6" class="a"/><text x="203" y="76">A2</text>
+    <rect x="241" y="54" width="60" height="34" rx="6" class="b"/><text x="271" y="76">B3</text>
+    <rect x="309" y="54" width="60" height="34" rx="6" class="a"/><text x="339" y="76">A4</text>
+  </g>
+  <text x="391" y="77" class="note">字母表示引擎 shard，数字表示顺序。示例中的四个小值可装入同一批。</text>
+  <rect x="24" y="110" width="465" height="436" rx="12" class="panel"/>
+  <rect x="511" y="110" width="465" height="436" rx="12" class="panel"/>
+  <text x="46" y="148" class="heading">原 cluster · 主节点客户端 pipeline</text>
+  <text x="533" y="148" class="heading">Raft v15 · Leader 与 Follower 应用</text>
+  <text x="46" y="176" class="note">就绪的普通单 shard 命令，按目标 shard 分组</text>
+  <text x="533" y="176" class="note">HW 已覆盖这一批，按日志顺序切连续段</text>
+  <rect x="48" y="198" width="417" height="49" rx="7" class="neutral"/>
+  <text x="256" y="228" text-anchor="middle" class="mono">MultiCommandSquasher</text>
+  <path d="M256 247 V262 H150 V279" class="edge"/>
+  <path d="M256 262 H362 V279" class="edge"/>
+  <rect x="48" y="282" width="203" height="79" rx="7" class="a"/>
+  <rect x="262" y="282" width="203" height="79" rx="7" class="b"/>
+  <g text-anchor="middle">
+    <text x="149" y="311" class="label">AddL2 → shard A</text>
+    <text x="149" y="338" class="mono">A1 → A2 → A4</text>
+    <text x="363" y="311" class="label">AddL2 → shard B</text>
+    <text x="363" y="338" class="mono">B3</text>
+  </g>
+  <path d="M149 361 V383 H231" fill="none" stroke="#506579" stroke-width="1.6"/>
+  <path d="M363 361 V383 H231" fill="none" stroke="#506579" stroke-width="1.6"/>
+  <path d="M256 383 V399" class="edge"/>
+  <rect x="48" y="401" width="417" height="62" rx="7" class="neutral"/>
+  <text x="256" y="426" text-anchor="middle" class="label">一个 FiberBlockingCounter 等两个 shard</text>
+  <text x="256" y="449" text-anchor="middle" class="note">连接按输入顺序发送各条命令的回复</text>
+  <text x="46" y="505" class="body">每个参与 shard 一次投递，两组可并行。</text>
+  <g text-anchor="middle">
+    <rect x="535" y="198" width="192" height="50" rx="7" class="a"/>
+    <text x="631" y="228" class="mono">A1 → A2</text>
+    <rect x="535" y="277" width="192" height="50" rx="7" class="b"/>
+    <text x="631" y="307" class="mono">B3</text>
+    <rect x="535" y="356" width="192" height="50" rx="7" class="a"/>
+    <text x="631" y="386" class="mono">A4</text>
+  </g>
+  <path d="M631 248 V274" class="edge"/>
+  <path d="M631 327 V353" class="edge"/>
+  <path d="M631 406 V428" class="edge"/>
+  <text x="744" y="217" class="label">一次 L2，复用事务</text>
+  <text x="744" y="240" class="note">两笔都成功才进入下一段</text>
+  <text x="744" y="296" class="label">ApplyLane 就地执行</text>
+  <text x="744" y="319" class="note">示例中 B 位于本线程</text>
+  <text x="744" y="375" class="label">再次投递到 A</text>
+  <text x="744" y="398" class="note">单笔沿用独立 SET 事务</text>
+  <rect x="535" y="431" width="417" height="45" rx="7" class="neutral"/>
+  <text x="744" y="459" text-anchor="middle" class="label">CompleteApply → FinishApply → 更新 applied</text>
+  <text x="533" y="505" class="body">若 B3 失败，只发布前两笔成功，A4 尚未投递。</text>
+</svg>

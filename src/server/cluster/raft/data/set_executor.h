@@ -10,16 +10,20 @@
 #include <string>
 #include <string_view>
 
-#include "server/common_types.h"
+#include "server/cluster/raft/data/set_effect.h"
 
 namespace dfly {
 class JournalExecutor;
 
 namespace cluster::raft {
-struct SetEffectView;
 
 // Apply on a server proactor through the same synchronous transaction used by journal replay.
 absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffectView& effect);
+
+// Apply contiguous same-shard runs in log order. On error, completed excludes the failing
+// record and no later record has executed. The batch owns all borrowed key/value bytes.
+absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::ApplyBatch& batch,
+                             size_t* completed);
 
 // Inspect a committed key through the normal shard transaction while the group's proposals
 // are serialized. EXISTS accepts every Redis value type.
