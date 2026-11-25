@@ -1557,7 +1557,7 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
           return DispatchResult::OK;
         }
         if (async_pref == AsyncPreference::ONLY_ASYNC)
-          return DispatchResult::WOULD_BLOCK;
+          return DispatchResult::ASYNC_BACKPRESSURE;
 
         // The head may wait for capacity using the synchronous API. Followers must never wait.
       }

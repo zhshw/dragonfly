@@ -21,7 +21,7 @@
 - [v14 Folly io_uring 批次事件循环首版](profile/v14-batch-event-loop.md)
 - [v14b Folly io_uring 批次事件循环首版修正](profile/v14b-batch-progress.md)
 - [v15 P0-2 已提交 SET 的 shard 合批](profile/v15-shard-apply.md)
-- [v16 普通 SET 编码与 WAL 追加重叠（设计）](profile/v16-wal-encode-overlap.md)
+- [v16 Raft SET 批量补发与 Follower 并发 flush](profile/v16-wal-encode-overlap.md)
 
 ## 专题索引
 

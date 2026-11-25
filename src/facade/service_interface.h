@@ -33,7 +33,8 @@ enum class DispatchResult : uint8_t {
   OK,
   OOM,
   ERROR,
-  WOULD_BLOCK  // Returned if ONLY_ASYNC was set, but only synchronous execution is possible
+  WOULD_BLOCK,        // ONLY_ASYNC was set, but only synchronous execution is possible.
+  ASYNC_BACKPRESSURE  // The command may run asynchronously when capacity becomes available.
 };
 
 class ServiceInterface {

@@ -133,14 +133,14 @@ KRaft 的 `MetadataLoader` 也只为一个 reader 投递一个事件，逐批调
 
 ## 下一步
 
-17 MiB 的准入额度试验已回退。平台继续采集准入拒绝与等待。最新宿主机 Trace 的批尾对齐显示，从发送到最后一笔 Leader WAL 写完的中位数为 **31.07 ms**，随后到客户端收齐 SET 回复为 **0.95 ms**。v16 先验证保持现有批形时，下一批编码能否与前一批 WAL 写入重叠。 [v16 Trace 核对与验证计划](v16-wal-encode-overlap.md)
+重新按准入、票据退役、Leader WAL 和副本进度对齐 v15 Trace 后，优先解决连接耗尽额度后等待整波回复才补发的问题。宿主机 Trace 的 GroupLoop 在已有额度退役时仍有 **229.66 ms** 因下条命令未重新准入而闲置。保持 8 MiB 的补发诊断把整波排空由 **32 次降为 0**，但后段复制和应用的 P95 增加。 [v16 改动与同机结果](v16-wal-encode-overlap.md)
 
 v15 宿主机复测与原 cluster 各自吞吐居中的一轮，256 MiB 的端到端耗时为 **497.05 对 422.81 ms**，相当于 16 个 pipeline 平均每批要省 **约 4.6 ms**。其中 SET 阶段为 **496.87 对 322.26 ms**，末尾 `WAIT 1` 为 **0.19 对 100.55 ms**。优先追 SET 阶段的积压。 [v15 复测结果](http://172.31.23.2:8787/#/v15/overview) · [原 cluster 参照](http://172.31.23.2:8787/#/v10/overview)
 
 用原 cluster 参照的归档二进制（SHA-256 `b8a53a9fcbfa…`）确认了三层限制。RESP 队列的内存阈值是 **每 I/O 线程 128 MiB**，命令数阈值是**每连接 10,000 笔**。`MultiCommandSquasher` 每个 shard 一次最多合 **100 笔**。用同一二进制和标准负载补测一轮，SET 窗口的 `pipeline_throttle_total` 增量为 **0**。1024 笔 SET 中有 **988 笔进入 18 个 squash 批次**，每次平均约 **55 笔**。这些限制管的是待处理命令和本地执行批，原 cluster 的 SET 在本地执行后回复，副本确认由 `WAIT` 完成。 [RESP 队列限制](../../../src/facade/dragonfly_connection.cc#L73) · [每 shard 合批限制](../../../src/server/server_state.cc#L43) · [原 cluster 分发入口](../../../src/server/main_service.cc#L1926)
 
 1. **固定 8 MiB 准入额度。** 每个 pipeline 的 64 笔写仅 value 就占 16 MiB，加入 key 后，Raft 的 8 MiB 数据组额度最多容纳 31 笔。输入缓冲在追加后释放，准入额度到票据销毁才归还。若后续已解析的 SET 因额度不足返回 `WOULD_BLOCK`，连接会暂停分发。17 MiB 试验的吞吐中位数增加 **2.1%**，SET 批次 P95 同时增加 **16.2%**，因此采用原额度作为后续对照。 [票据生命周期](../../../src/server/cluster/raft/runtime/data_node.cc#L155) · [准入逻辑](../../../src/server/cluster/raft/runtime/data_node.cc#L635) · [连接分发](../../../src/facade/dragonfly_connection.cc#L3398) · [回复水位](../../../src/server/cluster/raft/runtime/data_node.cc#L859)
-2. **用每批最后一个 offset 定位等待。** 对齐准入、Leader WAL 写完、Follower Fetch 和追加、HW 前进、本地 applied 和最后一个 SET 回复。如果等待集中在 HW 前，先量 WAL 在途时的就绪请求数，再验证编码与追加能否重叠。首次 v15 诊断的 **253 个 WAL 提交批中有 221 个只有 1–3 笔**，继续记录批大小与截断原因。 [WAL 取批](../../../src/server/cluster/raft/runtime/data_node.cc#L885) · [WAL 异步追加](../../../src/server/cluster/raft/log/partition_log.cc#L476)
+2. **按逐条 offset 和批尾分别定位补发后的瓶颈。** 连接补发后核对准入、Leader WAL、Follower Fetch 和追加、HW、本地 applied 与回复。如果整体复制水位差扩大，优先测 Follower Fetch 与追加的串行交接。首次 v15 诊断的 **253 个 WAL 提交批中有 221 个只有 1–3 笔**，继续用实际批形解释复制水位差。 [WAL 取批](../../../src/server/cluster/raft/runtime/data_node.cc#L885) · [Follower Fetch](../../../src/server/cluster/raft/runtime/group.cc#L628)
 3. **如果 HW 已推进而 applied 滞后，再测类型化的 SET 回放。** 可借鉴 KRaft 的 `replay(record)`，让解码后的普通 replacement 通过共享的 SET 事务操作直接返回状态。目前 key/value 已按视图传入，每笔仍构造命令上下文、查找 SET、执行并捕获 `OK` 回复。候选需沿用 slot 校验、DB 激活、事务时间与锁、OOM 检查、`SetCmd::Set` 的类型替换与 TTL 清除，以及 WATCH 失效、journal 和 tiered storage 反压。CPU 采样中的 `DispatchCommand` 包含实际写入，现有数据无法单独量出这层开销。 [现有回放入口](../../../src/server/cluster/raft/data/set_executor.cc#L14) · [DB 选择与命令执行](../../../src/server/journal/executor.cc#L72) · [SET 的事务操作与反压](../../../src/server/string_family.cc#L1245)
 
 正式结果看包含末尾 WAIT 的吞吐和批次 P95。正确性沿用锁竞争、非法 DB 首错及重启读回，并检查失败后的同 shard、跨 shard 后缀。若进一步讨论按原 cluster 将不相邻 offset 提前并行执行，需先解决图中 B3 失败时 A4 的读可见性、快照和重放。 [v14b 原始假设](v14b-batch-progress.md#下一步批次传递到-shard) · [现有失败前缀用例](../../../src/server/cluster/raft/data/set_executor_test.cc#L87)

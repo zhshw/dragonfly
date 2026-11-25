@@ -339,10 +339,14 @@ bool PartitionLog::CanAppendDuringFlush(string_view bytes) const {
     return false;
   auto end = End();
   const size_t length = bytes.size();
-  while (!bytes.empty()) {
+  while (bytes.size() >= 12) {
     auto size = RecordBatchSize(bytes);
-    if (!size.ok() || *size > bytes.size())
+    if (!size.ok())
       return false;
+
+    // Fetch can cut the last batch at its byte limit. The follower appends only whole batches.
+    if (*size > bytes.size())
+      break;
     const char* header = bytes.data();
     const uint32_t count = absl::big_endian::Load32(header + 57);
     if (header[16] != 2 || (absl::big_endian::Load16(header + 21) & 0x20) ||
@@ -353,7 +357,8 @@ bool PartitionLog::CanAppendDuringFlush(string_view bytes) const {
     end.end_offset += count;
     bytes.remove_prefix(*size);
   }
-  return FitsActiveSegment(length, end.end_offset);
+  const size_t complete_bytes = length - bytes.size();
+  return complete_bytes != 0 && FitsActiveSegment(complete_bytes, end.end_offset);
 }
 
 LogPosition PartitionLog::EndForEpoch(int32_t epoch) const {

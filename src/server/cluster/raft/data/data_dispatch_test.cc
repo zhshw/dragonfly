@@ -279,11 +279,11 @@ TEST_F(DataDispatchTest, AsyncSetsSubmitBeforeConfirmationAndKeepBarriers) {
     EXPECT_EQ(sets_, 0u);
     EXPECT_EQ(capture.Take().index(), 0u);
 
-    // Saturation must not admit, defer, or send anything; the command retries at the head.
+    // Saturation leaves the command intact and permits retry before it reaches the head.
     auto full = command({"SET", "other", "third"});
     EXPECT_EQ(
         service_->DispatchCommandSimple(full.get(), facade::AsyncPreference::ONLY_ASYNC, nullptr),
-        facade::DispatchResult::WOULD_BLOCK);
+        facade::DispatchResult::ASYNC_BACKPRESSURE);
     EXPECT_FALSE(full->IsDeferredReply());
     EXPECT_EQ(pending_.size(), 2u);
     ASSERT_EQ(full->size(), 3u);

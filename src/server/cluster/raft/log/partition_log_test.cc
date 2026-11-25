@@ -178,6 +178,31 @@ TEST_F(PartitionLogTest, MemoryAppendAcknowledgesWritesBeforeSharedDurabilityBar
   EXPECT_EQ(log_->Read(0, 4, SIZE_MAX).value(), first + second);
 }
 
+TEST_F(PartitionLogTest, FollowerAppendsCompletePrefixDuringMemoryFlush) {
+  const auto first = MakeDataBatch(0, 3, 1, values_).value();
+  const auto second = MakeDataBatch(2, 3, 1, values_).value();
+  const auto third = MakeDataBatch(4, 3, 1, values_).value();
+  const string response = second + third.substr(0, third.size() - 1);
+  log_.reset();
+  Open(first.size() + second.size(), PartitionLog::AckMode::kMemory);
+  ASSERT_TRUE(log_->AppendAsFollower(first, 3).ok());
+  test::ControlledIO flush;
+  ASSERT_TRUE(log_->TryFlushBufferedAsync(flush.Submitter(),
+                                          [](absl::Status status) { EXPECT_TRUE(status.ok()); })
+                  .value());
+  ASSERT_TRUE(log_->FlushPending());
+  EXPECT_FALSE(log_->CanAppendDuringFlush(second.substr(0, second.size() - 1)));
+  EXPECT_FALSE(log_->CanAppendDuringFlush(second + third));
+  EXPECT_TRUE(log_->CanAppendDuringFlush(response));
+  EXPECT_TRUE(log_->CanAppendDuringFlush(second + third.substr(0, 11)));
+  ASSERT_TRUE(log_->AppendAsFollower(response, 3).ok());
+  EXPECT_EQ(log_->End(), (LogPosition{3, 4}));
+  while (!flush.requests.empty())
+    flush.Complete();
+  EXPECT_EQ(log_->DurableEnd(), (LogPosition{3, 2}));
+  EXPECT_EQ(log_->Read(0, 4, SIZE_MAX).value(), first + second);
+}
+
 TEST_F(PartitionLogTest, MemoryTailWithoutPublicationIsDiscardedOnRecovery) {
   const auto first = MakeDataBatch(0, 3, 1, values_).value();
   const auto second = MakeDataBatch(2, 3, 1, values_).value();

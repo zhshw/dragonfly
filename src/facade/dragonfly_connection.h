@@ -789,6 +789,9 @@ class Connection : public util::Connection {
   // commands are still in flight. Always <= parsed_cmd_q_len_.
   size_t dispatch_waiting_count_ = 0;
 
+  // While an async command is blocked on capacity, count down ordered replies before retrying.
+  std::optional<unsigned> async_retry_replies_;
+
   // Total bytes used by commands in parsed command queue
   size_t parsed_cmd_q_bytes_ = 0;
 
@@ -800,6 +803,10 @@ class Connection : public util::Connection {
   // Returns true if the head command is ready to execute (nothing in-flight ahead of it).
   bool HasCommandToExecute() const {
     return parsed_head_ && !HasInFlightCommands();
+  }
+
+  bool HasDispatchWork() const {
+    return HasCommandToExecute() || (parsed_to_execute_ && async_retry_replies_ == 0);
   }
 
   // Returns true if there are any commands pending in the parsed command queue or dispatch queue.

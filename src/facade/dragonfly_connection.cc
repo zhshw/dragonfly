@@ -3287,6 +3287,8 @@ Connection::ExecuteBatchResult Connection::ExecuteBatch() {
   while (parsed_to_execute_ != nullptr) {
     if (reply_builder_->GetError())
       return ExecuteBatchResult::kFailure;
+    if (HasInFlightCommands() && async_retry_replies_.value_or(0) > 0)
+      break;
 
     // The V2 loop may parse a pipeline while older control messages are still queued. Running this
     // command first would let e.g. UNSUBSCRIBE drop those messages, so yield to IoLoopV2, which
@@ -3383,6 +3385,7 @@ Connection::ExecuteBatchResult Connection::ExecuteBatch() {
     const bool log_traffic = ShouldLogTrafficV2();
     auto log_command = [this](ParsedCommand* command) { LogTrafficV2(command); };
     absl::FunctionRef<void(ParsedCommand*)> log_command_ref = log_command;
+    async_retry_replies_.reset();
     auto dispatch_res =
         service_->DispatchCommandSimple(cmd, mode, log_traffic ? &log_command_ref : nullptr);
     if (ioloop_v2_) {
@@ -3395,19 +3398,21 @@ Connection::ExecuteBatchResult Connection::ExecuteBatch() {
     // Enforce the pipeline reply-ordering invariant: replies must reach the socket in parse order.
     // V1 (ONLY_SYNC): all commands run serially, so parsed_to_execute_ always equals parsed_head_
     //    (is_head is always true). The invariant holds trivially.
-    // V2 (async dispatch): the head may be an in-flight async command while later commands are
-    //    dispatched behind it. For those non-head commands the state must satisfy ONE of:
-    //    - dispatch_res != WOULD_BLOCK: ran async, must have buffered the reply locally
-    //      (is_deferred == true) to avoid corrupting the in-order socket stream.
-    //    - dispatch_res == WOULD_BLOCK: requires blocking, must NOT have buffered a reply
-    //      (is_deferred == false) - we break and wait for it to become head first.
-    bool is_deferred = cmd->IsDeferredReply();
-    DCHECK(is_head || (is_deferred == (dispatch_res != DispatchResult::WOULD_BLOCK)))
-        << "Pipeline contract breach! Invalid state for non-head command. "
-        << "DispatchResult: " << static_cast<int>(dispatch_res) << ", IsDeferred: " << is_deferred;
+    // A dispatched non-head command must defer its reply. A blocked command must remain intact.
+    DCHECK(is_head ||
+           cmd->IsDeferredReply() == (dispatch_res != DispatchResult::WOULD_BLOCK &&
+                                      dispatch_res != DispatchResult::ASYNC_BACKPRESSURE));
 
     if (dispatch_res == DispatchResult::WOULD_BLOCK)
       break;  // Sync command. Wait for current async commands to finish
+
+    if (dispatch_res == DispatchResult::ASYNC_BACKPRESSURE) {
+      // Refill in small batches under saturation, amortizing retries across multiple replies.
+      // Once the command reaches the head, it can execute regardless of the countdown.
+      constexpr unsigned kRepliesBeforeRetry = 8;
+      async_retry_replies_ = kRepliesBeforeRetry;
+      break;
+    }
 
     auto& conn_stats = GetLocalConnStats();
     conn_stats.pipelined_wait_latency += CycleClock::ToUsec(dispatch_start - cmd->parsed_cycle);
@@ -3496,6 +3501,8 @@ bool Connection::ReplyBatch() {
     ReleasePipelinedCommand(release_head);
     release_head = next;
   }
+  if (async_retry_replies_)
+    *async_retry_replies_ -= std::min(*async_retry_replies_, replied);
 
   if (ioloop_v2_ && (replied > 0)) {
     ++GetLocalConnStats().pipeline_reply_batches;
@@ -3643,6 +3650,7 @@ ParsedCommand* Connection::AdvanceToExecute() {
   DCHECK_GT(dispatch_waiting_count_, 0u);
 
   --dispatch_waiting_count_;
+  async_retry_replies_.reset();
   parsed_to_execute_ = parsed_to_execute_->next;
   return parsed_to_execute_;
 }
@@ -4188,9 +4196,9 @@ bool Connection::ShouldWakeIdle() const {
   // that is now ready to run.
 
   if (parser_error_draining_)
-    return HasCommandToExecute() || HasControlEvent();
+    return HasDispatchWork() || HasControlEvent();
 
-  return GetUnreadInputLen() > 0 || pending_input_ || HasCommandToExecute() || HasControlEvent();
+  return GetUnreadInputLen() > 0 || pending_input_ || HasDispatchWork() || HasControlEvent();
 }
 
 bool Connection::DrainControlPath(uint32_t quota) {
@@ -4226,7 +4234,9 @@ void Connection::DrainQueuedCommands() {
   size_t mem_before = GetLocalConnStats().pipeline_queue_bytes;
 
   if (parsed_head_) {
-    if (HasCommandToExecute()) {
+    if (async_retry_replies_ && !ReplyBatch())
+      return;
+    if (HasDispatchWork()) {
       ExecuteBatchResult execute_result = ExecuteBatch();
       if (execute_result == ExecuteBatchResult::kFailure)
         return;  // IoLoopV2 observes the reply-builder error.
@@ -4243,7 +4253,7 @@ void Connection::ParkOnBackpressure(util::fb2::detail::Waiter* backpressure_wait
   // Draining may expose a command ready to execute even while the queue remains over the limit.
   // Let already-parsed work free memory, but keep new input subject to parse throttling.
   auto should_wake = [this] {
-    return !IsOverPipelineLimit() || HasCommandToExecute() || HasControlEvent();
+    return !IsOverPipelineLimit() || HasDispatchWork() || HasControlEvent();
   };
   if (should_wake())
     return;
