@@ -80,6 +80,7 @@ function Overview({ summary }: { summary: Summary }) {
   const current = builds.current?.metrics;
   if (!current) return <div className="inline-empty">缺少正式 benchmark 指标</div>;
   const compared = previous?.target.metrics;
+  const p95Change = previous?.result?.p95_pct;
   const sameBinary = previous?.target.sha256 === builds.current?.sha256;
   const base = comparisons.cumulative_baseline;
   const reference = comparisons.reference;
@@ -106,6 +107,14 @@ function Overview({ summary }: { summary: Summary }) {
         <p>达到参照吞吐</p>
         <div className="metric-value">{reference?.result ? `${number(reference.result.target_throughput_pct, 1)}%` : '—'}</div>
         <div className="metric-foot" title={targetTitle(reference?.target)}>{reference ? <><span>{targetTitle(reference.target)} · {number(reference.target.metrics.replication_mib_per_s.median)} MiB/s</span><a className="text-link" href={referenceHref(reference.target.id)}>查看基准诊断 <ArrowRight size={13} /></a></> : '未选对比参照'}</div>
+      </section>
+      <section className="metric-card">
+        <p>{compared ? '批次 P95 耗时较上一轮' : '批次 P95 耗时'}</p>
+        <div className="metric-value">{p95Change === undefined ? '—' : percent(p95Change)}</div>
+        <div className="metric-foot" title="三轮正式测试的批次 P95 中位数">
+          <span>{compared && `${number(compared.batch_p95_ms.median)} → `}{number(current.batch_p95_ms.median)} ms</span>
+          {!compared && <span>暂无上一轮</span>}
+        </div>
       </section>
     </div>
     <div className="overview-grid">

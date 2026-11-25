@@ -1,7 +1,9 @@
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { ArrowDownToLine, ArrowUpRight, Flame, Search, Workflow } from 'lucide-react';
 import { api, artifactURL, endpoint, number, targetTitle } from './model';
 import type { DiagnosticCapture, DiagnosticComparison, DiagnosticSummary, ReferenceDiagnostics, Role, Stage } from './model';
+import { TraceTimeline } from './timeline';
+import type { TimelinePhase } from './timeline';
 
 type Panel = { key: 'current' | 'previous' | 'reference'; title: string; id?: string; capture?: DiagnosticCapture; raft?: boolean };
 
@@ -9,6 +11,7 @@ export function DiagnosticsView({ id, view, referenceID }: { id: string; view: '
   const [comparison, setComparison] = useState<DiagnosticComparison>();
   const [reference, setReference] = useState<ReferenceDiagnostics>();
   const [role, setRole] = useState<Role>('leader');
+  const [traceMode, setTraceMode] = useState<'overview' | 'diff'>('overview');
   const [request, setRequest] = useState(0);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -36,17 +39,22 @@ export function DiagnosticsView({ id, view, referenceID }: { id: string; view: '
     } : { key: 'previous', title: '上一轮', id: comparison?.previous_id, capture: comparison?.previous },
   ];
 
-  return <div className="view-content">
+  return <div className={isCPU ? 'view-content' : 'view-content trace-view'}>
     <div className="section-toolbar">
       <div><h2>{isCPU ? 'CPU 火焰图' : 'Trace'}</h2><p>{isCPU ? '按节点角色查看。火焰图支持点击缩放和搜索。' : '按节点角色与阶段查看耗时，重叠区间合并统计。'}</p></div>
-      {isCPU && <NodeRolePicker role={role} setRole={setRole} />}
+      {isCPU ? <NodeRolePicker role={role} setRole={setRole} /> : <div className="segments" role="group" aria-label="Trace 模式">
+        <button aria-pressed={traceMode === 'overview'} onClick={() => setTraceMode('overview')}>总览</button>
+        <button aria-pressed={traceMode === 'diff'} onClick={() => setTraceMode('diff')}>Diff</button>
+      </div>}
     </div>
     {error ? <div role="alert" className="notice">{error} <button className="text-link" onClick={() => { setError(''); setRequest((n) => n + 1); }}>重试</button></div> :
       !comparison ? <div className="panel inline-empty" role="status">正在读取诊断记录…</div> : <>
-        <div className="diagnostic-columns">
+        {(isCPU || traceMode === 'overview') && <div className="diagnostic-columns">
           {panels.map((panel) => isCPU ? <FlamegraphPanel key={panel.key} panel={panel} role={role} /> : <TracePanel key={panel.key} panel={panel} />)}
-        </div>
-        {!isCPU && panels.some(({ capture }) => capture) && <TraceComparison panels={panels} />}
+        </div>}
+        {!isCPU && (panels.some(({ capture }) => capture) ?
+          <TraceComparison key={traceMode} panels={panels} diff={traceMode === 'diff'} /> :
+          traceMode === 'diff' && <div className="panel inline-empty">暂无 Trace 采集</div>)}
       </>}
   </div>;
 }
@@ -143,26 +151,63 @@ const waitMetrics: { label: string; value: (diagnostic: DiagnosticSummary) => st
   { label: 'fsync 中启动编码 / 追加 (次)', value: (trace) => `${trace.nodes.leader.starts_during_fsync} / ${trace.nodes.follower.starts_during_fsync}` },
 ];
 
-function TraceComparison({ panels }: { panels: Panel[] }) {
+const phaseMetrics = [
+  { id: 'union_ms', label: '并集 ms', places: 3 },
+  { id: 'p95_ms', label: 'P95 ms', places: 3 },
+  { id: 'count', label: '事件数', places: 0 },
+] as const;
+
+type PhaseMetric = typeof phaseMetrics[number]['id'];
+type PhaseRow = TimelinePhase & { values: (Stage | undefined)[] };
+
+function phaseChange([current, reference]: PhaseRow['values'], metric: PhaseMetric) {
+  if (current && reference) return current[metric] - reference[metric];
+}
+
+function PhaseDiffCell({ values, metric, places }: { values: PhaseRow['values']; metric: PhaseMetric; places: number }) {
+  const [current, reference] = values;
+  const delta = phaseChange(values, metric);
+  const rounded = delta === undefined ? undefined : Number(delta.toFixed(places));
+  const signed = rounded === undefined ? '—' : `${rounded > 0 ? '+' : rounded < 0 ? '−' : ''}${number(Math.abs(rounded), places)}`;
+  return <td className="mono phase-diff-value">
+    <strong>{signed}</strong>
+    <small>{current ? number(current[metric], places) : '—'} / {reference ? number(reference[metric], places) : '—'}</small>
+  </td>;
+}
+
+function TraceComparison({ panels, diff = false }: { panels: Panel[]; diff?: boolean }) {
   const [query, setQuery] = useState('');
   const [role, setRole] = useState('all');
   const [showAll, setShowAll] = useState(false);
+  const [sort, setSort] = useState<PhaseMetric>('union_ms');
+  const [selectedPhase, setSelectedPhase] = useState('');
+  const timeline = useRef<HTMLDivElement>(null);
   const raftPanels = panels.filter((panel) => panel.raft !== false);
-  const grouped = new Map<string, { stage: string; role: string; values: (Stage | undefined)[] }>();
+  const grouped = new Map<string, PhaseRow>();
   const search = query.trim().toLowerCase();
   panels.forEach(({ capture }, index) => {
     for (const stage of capture?.observation.stages ?? []) {
-      if ((role !== 'all' && stage.role !== role) || !stage.stage.toLowerCase().includes(search)) continue;
       const key = `${stage.role}:${stage.stage}`;
-      const row = grouped.get(key) ?? { stage: stage.stage, role: stage.role, values: Array<Stage | undefined>(panels.length).fill(undefined) };
+      const row = grouped.get(key) ?? { key, stage: stage.stage, role: stage.role, values: Array<Stage | undefined>(panels.length).fill(undefined) };
       row.values[index] = stage;
       grouped.set(key, row);
     }
   });
-  const longest = (row: { values: (Stage | undefined)[] }) => Math.max(...row.values.map((phase) => phase?.union_ms ?? 0));
-  const phases = [...grouped.values()].sort((a, b) => longest(b) - longest(a));
+  const allPhases = [...grouped.values()];
+  const longest = (row: PhaseRow) => Math.max(...row.values.map((phase) => phase?.union_ms ?? 0));
+  const magnitude = (row: PhaseRow) => Math.abs(phaseChange(row.values, sort) ?? 0);
+  const canCompare = panels.length === 2 && panels.every(({ capture }) => capture);
+  const phases = allPhases.filter((phase) => (role === 'all' || phase.role === role) && phase.stage.toLowerCase().includes(search))
+    .sort((a, b) => (diff && canCompare ? magnitude(b) - magnitude(a) : 0) || longest(b) - longest(a));
   return <>
-    {raftPanels.length > 0 && <section className="panel data-panel">
+    {diff && <div ref={timeline}>
+      <TraceTimeline phases={allPhases} phase={selectedPhase} setPhase={setSelectedPhase} sources={panels.map((panel) => {
+        const capture = panel.capture;
+        const artifact = capture?.observation.timeline;
+        return { title: panelTitle(panel), url: capture && artifact ? artifactURL(capture.experiment_id, artifact) : undefined };
+      })} />
+    </div>}
+    {!diff && raftPanels.length > 0 && <section className="panel data-panel">
       <div className="panel-heading"><h2>Raft 等待指标</h2></div>
       <div className="table-scroll"><table className="data-table diagnostic-table">
         <thead><tr><th>指标</th>{raftPanels.map((panel) => <th key={panel.key}>{panelTitle(panel)}</th>)}</tr></thead>
@@ -171,8 +216,14 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
     </section>}
     <section className="panel data-panel">
       <div className="panel-heading phase-heading">
-        <div><h2>阶段耗时</h2><p>{panels.length === 2 && panels.every(({ capture }) => capture) ? '按两次采集中较长的区间并集排序。' : '按区间并集排序。'}</p></div>
+        <div><h2>{diff ? '阶段 Diff' : '阶段耗时'}</h2><p>{diff ? (
+          canCompare ? `${panelTitle(panels[0])} − ${panelTitle(panels[1])}。每项差值下方列出两轮原值。` : '只有一份 Trace 采集，显示已采集的阶段指标。'
+        ) : canCompare ? '按两次采集中较长的区间并集排序。' : '按区间并集排序。'}</p></div>
         <div className="phase-controls">
+          {diff && canCompare && <select aria-label="按差值排序" value={sort} onChange={(event) => {
+            setSort(event.target.value as PhaseMetric);
+            setShowAll(false);
+          }}>{phaseMetrics.map(({ id, label }) => <option value={id} key={id}>按 {label} 差值幅度</option>)}</select>}
           <select aria-label="按节点角色筛选" value={role} onChange={(event) => { setRole(event.target.value); setShowAll(false); }}>
             <option value="all">全部节点</option><option value="leader">Leader</option><option value="follower">Follower</option><option value="client">客户端</option>
           </select>
@@ -180,13 +231,19 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
         </div>
       </div>
       <div className="table-scroll"><table className="data-table diagnostic-table">
-        <thead>
+        {diff ? <thead><tr><th scope="col">阶段</th><th scope="col">节点</th>
+          {phaseMetrics.map(({ id, label }) => <th scope="col" key={id}>{label}</th>)}
+        </tr></thead> : <thead>
           <tr><th rowSpan={2}>阶段</th><th rowSpan={2}>节点</th>{panels.map((panel) => <th colSpan={3} scope="colgroup" className="phase-start" key={panel.key}>{panelTitle(panel)}</th>)}</tr>
           <tr>{panels.map(({ key }) => <Fragment key={key}><th className="phase-start">事件数</th><th>并集 ms</th><th>P95 ms</th></Fragment>)}</tr>
-        </thead>
-        <tbody>{(showAll ? phases : phases.slice(0, 12)).map((phase) => <tr key={`${phase.role}:${phase.stage}`}>
-          <td className="mono strong">{phase.stage}</td><td>{phase.role}</td>
-          {phase.values.map((value, i) => <Fragment key={panels[i].key}>
+        </thead>}
+        <tbody>{(showAll ? phases : phases.slice(0, 12)).map((phase) => <tr key={phase.key}>
+          <td className="mono strong">{diff ? <button className="text-link phase-link" aria-pressed={selectedPhase === phase.key} onClick={() => {
+            setSelectedPhase(phase.key);
+            timeline.current?.scrollIntoView({ block: 'start' });
+          }}>{phase.stage}</button> : phase.stage}</td><td>{phase.role}</td>
+          {diff ? phaseMetrics.map(({ id, places }) => <PhaseDiffCell key={id} values={phase.values} metric={id} places={places} />) :
+          phase.values.map((value, i) => <Fragment key={panels[i].key}>
             <td className="mono phase-start">{value ? number(value.count, 0) : '—'}</td>
             <td className="mono">{value ? number(value.union_ms, 3) : '—'}</td><td className="mono">{value ? number(value.p95_ms, 3) : '—'}</td>
           </Fragment>)}
