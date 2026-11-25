@@ -37,7 +37,9 @@ class GroupLoop {
   template <typename F> auto Await(F&& operation) -> decltype(operation()) {
     util::fb2::Done done;
     util::detail::ResultMover<decltype(operation())> result;
-    auto task = [&] {
+
+    // The waiter may return after Done publishes readiness but before Notify finishes.
+    auto task = [&operation, &result, done]() mutable {
       result.Apply(operation);
       done.Notify();
     };

@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <string>
 
+#include "server/cluster/raft/runtime/group_loop.h"
+
 namespace dfly::cluster::raft {
 namespace {
 
@@ -95,6 +97,13 @@ TEST(FollyIoTest, EncodingLeavesTheGroupLoopAvailableForIoAndDeadline) {
   release.post();
   encoded.wait();
   io.Drain();
+}
+
+TEST(FollyIoTest, GroupAwaitKeepsCompletionAliveAcrossThreads) {
+  GroupLoop group;
+  for (int i = 0; i < 4096; ++i) {
+    ASSERT_EQ(group.Await([i] { return i; }), i);
+  }
 }
 
 }  // namespace
