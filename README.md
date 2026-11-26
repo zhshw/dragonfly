@@ -167,7 +167,7 @@ There are also some Dragonfly-specific arguments:
  * `admin_port`: To enable admin access to the console on the assigned port (`default: disabled`). Supports both HTTP and RESP protocols.
  * `admin_bind`: To bind the admin console TCP connection to a given address (`default: any`). Supports both HTTP and RESP protocols.
  * `admin_nopass`: To enable open admin access to console on the assigned port, without auth token needed (`default: false`). Supports both HTTP and RESP protocols.
- * `cluster_mode`: Enables cluster mode (`default: ""`). Supports `emulated` and `yes`.
+ * `cluster_mode`: Selects `emulated`, manager-driven `yes`, or `raft` (`default: ""`). [Raft cluster setup and command support](docs/cluster/raft-cluster-design.md)
  * `cluster_announce_ip`: The IP that cluster commands announce to the client.
  * `announce_port`: The port that cluster commands announce to the client, and to replication master.
 

@@ -1,87 +1,69 @@
-# Linux 下用 io_uring 优化 Raft 数据组刷盘
-
-**先验证 leader 等磁盘时能否继续处理 Fetch，让 follower 提前开始落盘。** 这个改动有机会缩短单笔写入从追加到多数提交的时间。并发写入还有另一项收益可测：让同一轮已经就绪的多个批次共享刷盘。两项试验都沿用现有 Kafka 日志批、DFE4 恢复标记和 Fetch 协议。
+# Raft 数据组的 WAL 与 io_uring
 
 ## 当前实现（默认开启）
 
-`raft_async_io`、`raft_drain_writes` 默认均为 `true`；可分别显式设为 `false`。
-Linux 数据组使用异步文件 I/O，Folly / Helio 仍由编译宏选择；非 Linux 保留同步文件追加。
+`--raft_async_io=true` 默认允许 Linux 数据组异步追加和后台刷盘。异步追加适用于 leader 的普通同段数据写，follower 的日志追加在组内同步执行，后台 flush 可以使用异步 I/O。换段、控制批及无法在 DFE4 标记窗口内发布的操作保留持久化屏障或同步路径。数据日志段大小由 `--raft_data_segment_bytes` 控制，默认 1 GiB。[组 I/O 配置](../../src/server/cluster/raft/runtime/group.cc) · [分区日志](../../src/server/cluster/raft/log/partition_log.cc)
 
-`--raft_data_ack_mode=flush|memory` 选择普通数据写的确认条件，默认 `flush`：
+| 确认模式 | 普通 SET 返回条件 | 恢复边界 |
+| --- | --- | --- |
+| `flush`（默认） | 本组 voter 多数已持久化达到写入位置，且 leader 本地已应用。 | 顺序写全 WAL、同步日志段、更新并同步恢复标记，再发布本地确认位置。 |
+| `memory` | 本组 voter 多数已写全 WAL 到 page cache，且 leader 本地已应用。 | 后台 flush 发布开始时捕获的排他末端。崩溃重启可能丢弃未发布的尾部，即便已返回 SET OK 或达到 WAIT。 |
 
-- **flush**：保持现有多数落盘及 leader 应用后回复的行为。
-- **memory**：leader、follower 写完 WAL 到 page cache 后即可参与多数确认，leader 应用后回复；
-  不是纯内存日志。后台按 100 ms 或 64 MiB 未同步数据触发合批刷盘，实际完成受调度和 I/O 影响。
-  `End()` 是接收位置，`DurableEnd()` 是真正完成两次同步的位置；恢复标记只在日志段同步后发布。
-  控制记录、任期/投票状态持久化、换段、快照、截断和正常退出会先排空未同步数据。
+元数据组使用持久确认。一个数据组的所有副本应使用相同的 `--raft_data_ack_mode`，停组后统一变更。模式由各进程启动参数选择，组内协议按相同语义解释 Fetch 的位置回报。[确认模式选择](../../src/server/cluster/raft/runtime/group.cc) · [多数位置与 Fetch](../../src/server/cluster/raft/quorum/fetch_replication.cc)
 
-元数据组继续使用 `flush`。所有数据副本须使用同一模式，并在停止后统一切换；不支持混用模式。
-`memory` 的 OK / WAIT 不保证磁盘持久化，未发布恢复标记的尾部在进程重启时也可能被丢弃。
-该模式先用于实验，不能沿用 `flush` 的故障恢复保证。
+`memory` 的后台 flush 在最老未同步数据达到 100 ms 或积压达到 64 MiB 时具备启动条件，实际同步完成时间取决于调度和 I/O。满足同任期、同段、普通连续数据等条件时，leader 和 follower 在后台 flush 期间可以继续追加。追加在途与刷盘在途分别跟踪。flush 依次同步日志段和恢复标记，只扣除本轮开始时捕获的字节与位置，其后的尾部仍留待下一次刷盘。换段、控制批、选票持久化、截断、快照和关闭需要相应的 drain 或落盘屏障。[刷盘状态机与 flush gate](../../src/server/cluster/raft/log/partition_log.cc) · [leader 重叠](profile/v10-memory-flush-overlap.md) · [follower 重叠](profile/v16-wal-encode-overlap.md)
 
-确认模式验证：Folly 的 Debug、Release、ASAN+UBSAN 各通过 47 项日志、快照和 Fetch 单测。
-真实集群覆盖两种模式的 pipeline、WAIT、关闭排空，以及 `memory` 的空闲后台刷盘和快照恢复。
-`flush` 保留 OK 后立即崩溃的恢复断言；`memory` 的崩溃恢复断言先等标记发布，
-未发布尾部丢失另有回归覆盖。单连接 pipeline 64 的三轮未插桩对照中，
-`raft.memory` 相对 `raft.flush` 确认吞吐仅提高 4.4%，原 cluster 仍快 3.71 倍。
-独立火焰图和 trace 显示 worker 内编码、数据复制、应用及排队仍有明显成本，后台刷盘也仍会阻塞。
-见 [v3 确认模式实测](profile/v3-baseline.md#ack-modes) 和 [性能分析结论](replication-observability.md)。
+已挂起且已校验的 Fetch 可以在普通数据写全后先取得字节。若 follower 的回报超前于 leader 本地确认位置，leader 等待相关位置发布并重新校验请求。SET 成功还需要 HW 与 leader 已应用位置覆盖本次写入。[Fetch 处理](../../src/server/cluster/raft/runtime/group.cc) · [批次与回复水位](raft-batch-event-loop.md#2-数据单位与水位) · [恢复标记格式](raft-replication-design.md#日志恢复标记)
 
-| 开关 | 行为 |
+`--raft_drain_writes=true` 默认开启普通 SET 的队列与合批。组取最多 32 笔，并以 1/4 MiB 编码预算和段边界限制连续前缀。异步普通 SET 的每组准入窗口为 256 笔、8 MiB 键值，并覆盖已接纳尚未回收的票据。[准入、编码和回复](raft-batch-event-loop.md#3-从提交到回复)
+
+### Folly io_uring 优化路径
+
+下图跟踪开启 Folly 和异步 I/O 后，Leader 如何处理普通 SET。组 EventBase 持有任期、日志和 HW，WAL 的 I/O 完成事件直接由同一个 EventBase 消费。内部 RPC socket 由网络 EventBase 持有，RESP 和 ApplyLane 继续在 Dragonfly 的引擎 proactor 上运行。
+
+```mermaid
+flowchart TB
+    client(["Redis 客户端"])
+    follower(["Follower"])
+
+    resp["引擎 proactor · RESP 连接"]
+    subgraph network["Folly 网络 EventBase"]
+        socket["AsyncIoUringSocket"]
+    end
+    handler["宿主 RPC handler fiber"]
+
+    subgraph group["Folly 组 EventBase"]
+        state["GroupLoop · 任期、LEO 与 HW"]
+        wal["IoUringBackend · queueWrite / queueFsync"]
+        state <-->|"提交 WAL / CQE 同线程完成"| wal
+    end
+
+    encoder["编码执行器"]
+    apply["引擎 proactor · ApplyLane"]
+
+    client <-->|"SET pipeline / FIFO 回复"| resp
+    resp <-->|"准入唤醒 / 回复水位"| state
+    follower <-->|"Fetch / 日志与 HW"| socket
+    socket <-->|"RPC 收发帧"| handler
+    handler <-->|"Fetch 校验与进度"| state
+    state <-->|"待编码批次 / WAL 缓冲"| encoder
+    state <-->|"提交前缀 / 已应用位置"| apply
+```
+
+| 优化 | 当前实现 |
 | --- | --- |
-| `--raft_async_io` | 同段普通数据追加使用 io_uring，编译时选择 Helio 或 Folly 实现。`flush` 在 DFE4 窗口内依次执行 WRITE、段 FSYNC、标记 FSYNC；`memory` 写完即可确认，后台同步共用该 I/O 后端。分别检查完成结果，短写补写，两个 FSYNC 均使用 `flags=0`。网络仍可使用 epoll。 |
-| `--raft_drain_writes` | worker 可接受下一轮追加时，从同组同任期就绪 SET 队列取最多 32 笔。按键值积压选择 1/4 MiB 编码字节预算，只追加能装入当前段的连续前缀，不主动等满。条件 SET 单独执行；RESP V2 的普通 SET 可按序提前提交，见下节。队列最多 256 笔、8 MiB 键值，满时让提交 fiber 等待；单笔超过预算的合法请求仅在空队列进入，并单独追加。 |
+| WAL 完成少一次跨线程投递 | 组内 `queueWrite` / `queueFsync` 的 CQE 直接调用 `CompleteIO` 和数据组的就绪事件处理。Helio 路径由独立的磁盘 proactor 收取 CQE，再用 fiber 将完成投给组 worker。Folly 的完成回调也无需占用外部调用者进入 `GroupLoop` 的 128 个待处理任务额度。[组 I/O 完成](../../src/server/cluster/raft/runtime/group.cc) · [有界组队列](../../src/server/cluster/raft/runtime/group_loop.h) |
+| 批次摊销与复制重叠 | 编码执行器把一批 SET 写入同一 WAL 缓冲。写全后可唤醒已校验的挂起 Fetch，让 follower 在 leader 等待两次同步时先取得数据。`flush` 到恢复标记同步完成才发布本地确认位置。`memory` 的后台同步可以与下一轮符合条件的同段追加重叠。[日志状态机](../../src/server/cluster/raft/log/partition_log.cc) · [Fetch 响应与多数计算](../../src/server/cluster/raft/quorum/fetch_replication.cc) |
+| 节点 RPC 原生收发 | Folly 的监听端在网络 EventBase 上接入连接，节点连接用 `AsyncIoUringSocket` 收发，RPC handler 通过有界的常驻 fiber 槽访问组状态。出站 peer 复用连接，一次等待一个 RPC；大 Fetch 响应可把接收缓冲的所有权传给后续解码和 apply。这条网络路径独立于外部 RESP 的 proactor 选择。[Folly RPC](../../src/server/cluster/raft/transport/folly_rpc.cc) · [入站 handler](../../src/server/cluster/raft/transport/raft_listener.cc) · [Fetch 缓冲借用](profile/v13-fetch-borrow.md) |
+| 就绪后直接推进 | WAL 完成、有效 Fetch 和 apply 完成分别推进 LEO、HW 与已应用前缀。v17 在数据组登记最早有效期限，定时器负责选举、写入期限和空闲刷盘等时间条件。连接收到共享回复进度后检查 FIFO 队首。[批次与事件循环](raft-batch-event-loop.md#4-就绪事件与期限) |
 
-每组只有一轮追加或后台刷盘在途。批次字节和文件描述符保留至完成；`flush` 的 `End()` 返回已经完成两次同步的 LEO，`memory` 则返回写全位置。已写全的尾部可响应新到达的合法 Fetch；follower 提前报告未在本地确认的位置时，该 RPC 等本地确认后重新校验。其他 worker 操作先等在途 I/O 排空，因此换主、截断、快照安装和关闭不能复用正在写的文件。完成回调也核对 leader 角色和任期，失败则封锁存储确认。
-
-drain 按实际 Kafka 编码长度和段相对 offset 上限截取前缀，余下请求放回队首，继续占用排队预算。
-若首笔也放不下，单独走同步换段路径，下一轮再继续合批。数据段大小由
-`--raft_data_segment_bytes` 控制，默认 1 GiB；回归使用小段覆盖连续换段与恢复。
-超出 DFE4 窗口的标记发布、控制批及 follower 追加继续走同步调用路径；`memory` 的普通 follower 追加只写全，不逐轮刷盘。队列预算不含已经交给 I/O 的一轮及连接自身的请求缓冲。
-本次未试验 SQE 链接、`fdatasync`、直接 I/O 或预分配。
-
-请求入队前读取非等待的 leader 任期快照，等待容量期间及追加前重新核对；旧任期排队请求
-返回错误，不改挂到新任期。不同任期请求不合成一批。追加完成后按所选模式等待多数确认、leader 应用
-及按序回复。本文下方的历史性能表均使用 `flush` 语义，来自这次段前缀、任期绑定及默认值调整之前，不能作为新版本的性能验收。
-
-本次在 `172.31.23.2` 的 Folly 构建上验证：Debug、Release、ASAN+UBSAN 的日志、Fetch、
-SET 应用、命令分发及 Folly I/O 五组单测通过，sanitizer 开启泄漏检查。段边界回归在三种
-构建下均通过，覆盖小段连续换段、后缀保留 FIFO、同 key 顺序、256 笔 / 8 MiB 窗口饱和、
-5 MiB 合法单笔、9 MiB 拒绝和崩溃读回。该用例将快照阈值设为 64 MiB，保留日志供边界断言。
-Release 的两副本、条件写、WAIT、断连、关闭排空、换主及快照恢复回归通过；Java 协议用例
-因缺少 classpath 跳过。显式关闭两个开关的条件写与 WAIT 回归也通过。
-二进制 `--helpfull` 确认两项默认值为 `true`；随后重跑的 1、2、8 连接 benchmark 见下节链接。
-
-### 同连接 SET 提交与确认解耦
-
-`raft_drain_writes=true` 时，RESP V2 的普通 `SET key value` 使用非等待入队接口，
-后续 SET 无须等前一笔确认。入队顺序决定日志顺序，同 key 也可连续提交。
-每个请求持有自己的 key/value 和完成状态；连接断开只释放回复，不取消已入队写入。
-完成 fiber 继续等待所选模式的多数确认及 leader 应用，连接只按原命令顺序发送回复，
-并在回复时更新本连接的 `raft_last_write`。GET、WAIT、NX/XX、SELECT、RESET、鉴权等
-命令只能在队首执行，保留读己之写和条件求值顺序。
-
-异步票据按数据组限制为 256 笔 / 8 MiB，预算包含等待确认及等待发送回复的票据。
-队列满或入队锁竞争时，非队首命令返回 WOULD_BLOCK 且没有入队副作用；
-成为队首后可使用原来的等待入队路径。连接解析缓冲继续使用 facade 自身的反压。
-V1 及关闭 drain 时保留串行行为；文件 I/O 仍使用原来的 Folly 分支，未改变确认边界。
-
-本轮回归直接暂停 follower，确认同连接 64 笔全部进入 leader 日志且客户端没有 OK，
-再恢复 follower 检查回复；旧二进制不能满足提前提交断言。Debug/Release 分发单测、
-真实集群断连、同 key、条件写、WAIT、DB 切换、窗口饱和、超限请求、崩溃恢复和关机
-回归通过；新增三个集群用例另在 ASAN+UBSAN（开启泄漏检查）下通过。
-
-普通 SET 可按连接顺序提前入队，仍等多数落盘及 leader 应用后回复。历史首次保留的 18 轮未插桩 Release 对照中，单连接 pipeline 64 的确认吞吐中位数由 81.48 增至 163.75 MiB/s（+101.0%），计时包含批末 `WAIT 1`，批次 P95 降低 49.4%。逐笔等回复的吞吐回退 9.5%，原 cluster 相同 pipeline 负载为 613.00 MiB/s。随后使用同样支持 pipeline 的两版做了段边界和入队任期配对。 [1、2、8 连接结果](profile/early-replication-benchmarks.md#flush-段边界与入队任期)
+早期实验单独对照了 Folly 与 Helio 的文件 I/O 适配，v14 同时改了组调度、节点 RPC 和回复方式。v14 的 leader worker 排队区间并集从 263.28 ms 降到 20.32 ms，首版正式吞吐中位数下降 25.0%。v14b 修复 follower applied 回报和 leader WAIT 唤醒后，同负载吞吐中位数较 v13 提高 2.7%，批次 P95 下降 15.6%。这些是各轮架构组合的结果，Folly 的单项对照见本页历史实验。[早期文件 I/O 对照](#同版-liburing-215-的实测对照) · [v14 首版](profile/v14-batch-event-loop.md) · [v14b 进度修正](profile/v14b-batch-progress.md) · [v17 同机结果](profile/v17-group-scheduling.md#同机结果)
 
 ### Folly 编译变体
 
-backend 仍为 io_uring。CMake 的 `WITH_RAFT_FOLLY` 生成 `raft_io_config.h` 中的 `DFLY_RAFT_USE_FOLLY` 宏：`0` 编译原 Helio 分支，`1` 编译 Folly 分支；没有运行时库选择参数。`--raft_async_io` 和 `--raft_drain_writes` 的作用不变。Folly 仅链接到 Raft transport 的文件 I/O 适配库，不替换 Redis/Raft 网络栈。[宏模板](../../src/server/cluster/raft/storage/io_config.h.in) · [Folly 适配](../../src/server/cluster/raft/storage/folly_io.cc)
+`WITH_RAFT_FOLLY` 默认为 `OFF`。Linux 上启用此构建选项后，Raft 的组执行器、异步文件 I/O 和节点间 RPC 使用 Folly，组内 WAL 完成直接回到组 EventBase。关闭该编译选项时使用 Helio worker、内部 socket，以及 Linux 异步文件 I/O 的独立 io_uring proactor。`--raft_async_io=false` 关闭数据组的异步文件操作，节点 RPC 后端仍由构建选择。外部 RESP 使用宿主的 proactor 配置。[构建选项](../../CMakeLists.txt) · [Folly 文件 I/O](../../src/server/cluster/raft/storage/folly_io.cc) · [Folly RPC](../../src/server/cluster/raft/transport/folly_rpc.cc)
 
-Folly 分支使用 `ScopedEventBaseThread` 和 `IoUringBackend::queueWrite/queueFsync`，提交、CQE 回调和重试均在 Folly EventBase 中运行，不经 Helio proactor、fiber 或等待器。完成回调只尝试把结果投递给原 Raft worker；队列满时在后续 Folly 循环重试投递，不重复 I/O。组关闭先等追加及两次同步排空，再停止 Folly 线程，最后销毁 worker。与原实现一样，每组一轮追加在途，短写补写和持久水位发布由同一 `PartitionLog` 状态机处理。
-
-本次使用同级 Folly `b20004566`，liburing 从 2.13 升级到 2.15，两个实现使用相同 liburing 版本。保留 Folly 默认调度选项，CQ capacity 256、maxSubmit 128（默认 SQ 256），不启用 SQPOLL、DEFER_TASKRUN 或请求等待合批。Folly 源码不打兼容补丁。liburing 下载固定 tag 和 SHA-256；升级位于 Helio 子模块的依赖声明中。
-
-首次从源码配置 Folly 前，先构建新版 liburing，供 Folly 的头文件探测使用：
+Folly 需要 liburing 支持。使用已安装的 Folly 时，可用 `CMAKE_PREFIX_PATH` 指定安装前缀。以下示例从同级 Folly 源码构建，先准备 liburing 供 Folly 配置探测。
 
 ```bash
 ./helio/blaze.sh -release -DWITH_GCP=OFF -DWITH_SEARCH=OFF -DWITH_TIERING=OFF \
@@ -97,7 +79,17 @@ ninja -C build-opt dragonfly raft_storage folly_io_test partition_log_test fetch
 ./build-opt/fetch_replication_test
 ```
 
-也可省略 `RAFT_FOLLY_SOURCE_DIR`，通过 `CMAKE_PREFIX_PATH` 指向已经构建并安装的 Folly。关闭 `WITH_RAFT_FOLLY` 后重新构建即可恢复 Helio 实现。分别保留两个构建目录中的 `dragonfly` 和 `raft_storage`，使用[对照脚本](../../tests/integration/raft_commit_benchmark/dragonfly/library_compare.py)在真实磁盘目录轮换测试：
+## 历史 I/O 实验
+
+以下记录早期 Helio 与 Folly 文件 I/O 适配、同连接 SET 提前提交和批次参数的对照。不同小节的负载、二进制和工况以下文各轮说明为准。早期 Folly 实验仍使用 Helio 网络和原组 worker，后续 v14 将组循环和节点 RPC 接入 Folly，v17 更新数据组调度。[早期流水线数据](profile/early-replication-benchmarks.md#flush-段边界与入队任期) · [v14 架构](profile/v14-batch-event-loop.md) · [v17 同机结果](profile/v17-group-scheduling.md#同机结果)
+
+### 同连接 SET 提交与确认解耦
+
+普通 SET 可按连接顺序提前入队，仍等多数落盘及 leader 应用后回复。历史首次保留的 18 轮未插桩 Release 对照中，单连接 pipeline 64 的确认吞吐中位数由 81.48 增至 163.75 MiB/s（+101.0%），计时包含批末 `WAIT 1`，批次 P95 降低 49.4%。逐笔等回复的吞吐回退 9.5%，原 cluster 相同 pipeline 负载为 613.00 MiB/s。随后使用同样支持 pipeline 的两版做了段边界和入队任期配对。 [1、2、8 连接结果](profile/early-replication-benchmarks.md#flush-段边界与入队任期)
+
+### 早期 Folly 文件 I/O 复现
+
+该次对照使用同级 Folly `b20004566`，Helio 和 Folly 统一到 liburing 2.15，保留默认调度选项。用对应历史版本各自构建 `dragonfly` 和 `raft_storage`，再由对照脚本轮换测试。[对照脚本](../../tests/integration/raft_commit_benchmark/dragonfly/library_compare.py)
 
 ```bash
 python3 tests/integration/raft_commit_benchmark/dragonfly/library_compare.py \
@@ -124,9 +116,9 @@ Folly 单连接吞吐中位数提高 8.2%，P95 基本持平（增加 0.5%）；
 
 这是相同持久化协议下两种适配及其调度策略的整体对照，不能单独归因于库本身：例如本机 Helio 启用 DEFER_TASKRUN，而 Folly 保持默认关闭。吞吐以 64 MiB 客户端有效负载除以写入耗时；重启至 WAIT 2 包含进程启动、追赶和客户端轮询，不是纯磁盘恢复耗时。完整日志和二进制保留在远端 `~/workspace/db/dragonfly-io-uring-20261123/results-folly/`。 [后续流水线测试（计至副本应用）](profile/early-replication-benchmarks.md#flush-段边界与入队任期)
 
-### Folly 压测源码审查与后续试验
+### Folly 压测源码审查与筛选
 
-以下审查基于同级 Folly `b20004566`，是源码结论，不是本机新跑出的性能数据。Raft 允许多个日志批共享同步；每组仅一轮追加在途、drain 最多 32 笔和约 1 MiB 都是当前实现的限制，不是协议要求。ring 有 256 个槽位也不意味着业务有 256 个 I/O 在途。
+以下按同级 Folly `b20004566` 记录当时的源码审查。该轮实现每组只允许一轮追加在途，drain 最多 32 笔、约 1 MiB，多个日志批共享同步。Folly ring 容量为 256，业务实际在途深度取决于组的提交限制。
 
 | 例子 | 实际负载和可借鉴之处 | 与当前 WAL 的区别 |
 | --- | --- | --- |
@@ -235,7 +227,7 @@ runner 交替运行三组单笔追加探针、三组单连接客户端，以及�
 
 ## Ubuntu 26.04 NVMe 结果（2026-11-23）
 
-当前原 cluster 与 Folly 异步 Raft 的比较见 [同期确认吞吐比较](profile/early-replication-benchmarks.md#flush-段边界与入队任期)。下面只保留历史 Helio 异步追加的独立插桩数据，用于分析 Fetch、刷盘重叠和 drain 摊销，不与当前客户端对照混算。同步 Raft 样本已删除。
+下面只保留历史 Helio 异步追加的独立插桩数据，用于分析 Fetch、刷盘重叠和 drain 摊销，按该轮历史负载解读。同步 Raft 样本已删除。 [同期 Folly 异步 Raft 与原 cluster 的确认吞吐](profile/early-replication-benchmarks.md#flush-段边界与入队任期)
 
 主机 `172.31.23.2`，i7-13700KF、Linux 7.0.0-43 x86_64、GCC 15.2 Release，WD_BLACK SN770 1TB，日志目录位于 `/dev/nvme0n1p4` 的 ext4。网络固定 epoll、数据节点 2 个网络线程。每项三轮交替运行，下表各列取三轮中位数；逐轮结果仅保存在本地 `docs/cluster/benchmarks/io-uring-ubuntu-20261123.csv`。最初的 `/tmp` 位于 tmpfs，相关调度诊断数字未计入下表。
 
@@ -279,9 +271,9 @@ runner 交替运行三组单笔追加探针、三组单连接客户端，以及�
 | 准备段 FSYNC SQE → CQE 回调 | 529.48 | 703.84 |
 | 准备标记 FSYNC SQE → CQE 回调 | 351.42 | 453.85 |
 
-前两项包含 fiber / worker 排队、跨线程通知，以及 Fetch 发布或标记 `ftruncate`，不能全归为线程切换。后两项包含提交调度、内核等待和完成回收，也不是纯设备耗时。这些间隔表明衔接有优化空间，但尚未隔离 Helio 与 Folly 各自的开销；follower 目前仍走同步追加，换 leader 的 I/O 库不会自动改变该路径。
+前两项包含 fiber / worker 排队、跨线程通知，以及 Fetch 发布或标记 `ftruncate`，不能全归为线程切换。后两项包含提交调度、内核等待和完成回收，也不是纯设备耗时。这些间隔表明衔接有优化空间，但尚未隔离 Helio 与 Folly 各自的开销。这轮 follower 走同步追加。
 
-本次 Folly 变体使用 `IoUringBackend`，不是底层 `folly::IoUring::submitOne` 接口。完成结果直接非阻塞投递给 worker，省掉原分支每次完成后的 Helio fiber；依赖顺序、每组单轮追加、日志批复制和 follower 的同步追加保持一致。节点级共享执行器、连续 I/O 减少 worker 往返以及批次共享内存仍可作为后续独立变量测量，不与本轮替换 I/O 库的结果混为一谈。
+早期 Folly 文件 I/O 变体使用 `IoUringBackend`，不是底层 `folly::IoUring::submitOne` 接口。完成结果直接非阻塞投递给 worker，省掉原分支每次完成后的 Helio fiber；依赖顺序、每组单轮追加、日志批复制和 follower 的同步追加保持一致。节点级共享执行器、连续 I/O 减少 worker 往返以及批次共享内存仍可作为后续独立变量测量，不与本轮替换 I/O 库的结果混为一谈。
 
 ## 先让 Fetch 与本地刷盘并行
 
@@ -321,7 +313,7 @@ sequenceDiagram
 
 Dragonfly 已有组提交。普通 SET 首笔立即派发，同组同任期在 worker 摘取前到达的请求可以合并，当前上限为 32 笔，按键值积压自适应选择 1/4 MiB 编码字节预算。每笔保留自己的 Kafka RecordBatch 和 offset，多批连续追加，共用一轮段同步和标记同步。条件 SET 单独等前序写入应用后再求值。KRaft 的 `maybeAppendBatches` 在一次 `drain()` 中取走就绪批次，逐批追加后统一调用 `log.flush(false)`。[Dragonfly 合批](../../src/server/cluster/raft/runtime/data_node.cc) · [KRaft drain 与 flush](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java#L3092)
 
-当前已实现：上一轮 I/O 在途时收集同组同任期的普通写；上一轮完成后，取走已经就绪、能装进当前段和编码预算的连续批次，写段并把标记发布到该轮末端。未装入的后缀仍在队首等待，首笔放不下时单独换段。用笔数和键值字节数限制排队内存，达到上限时给提交者反压。空闲时立即发出首笔。单连接逐笔等 OK 时没有第二笔可合并，只有并发负载能检验每千笔刷盘次数是否下降；本次实现尚未产生新的每千笔刷盘统计。
+当时实现：上一轮 I/O 在途时收集同组同任期的普通写；上一轮完成后，取走已经就绪、能装进当前段和编码预算的连续批次，写段并把标记发布到该轮末端。未装入的后缀仍在队首等待，首笔放不下时单独换段。用笔数和键值字节数限制排队内存，达到上限时给提交者反压。空闲时立即发出首笔。单连接逐笔等 OK 时没有第二笔可合并，只有并发负载能检验每千笔刷盘次数是否下降；本次实现尚未产生新的每千笔刷盘统计。
 
 任期和投票另存于 `quorum-state`，投票应答前要完成临时文件同步、原子替换和目录同步。第一版仅合并普通数据批；选举持久化、成员变更、条件写及换段继续遵循各自的顺序。[选举状态存储](../../src/server/cluster/raft/storage/file_quorum_state_store.cc) · [DFE4 恢复标记](raft-replication-design.md#日志恢复标记)
 

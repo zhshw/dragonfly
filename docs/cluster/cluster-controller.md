@@ -9,7 +9,7 @@
 | 变更只到了一半节点 | manager 生成完整 JSON，逐个发送 `DFLYCLUSTER CONFIG`。接口简单，已有编排工具可直接使用。漏发、乱序和重试由 manager 处理 | controller 将变更按序提交一次，各节点主动拉取。落后的节点按同一段历史追平，在应用前仍可能返回旧路由。一次变更须等待控制组多数持久化 |
 | 管理进程或数据节点重启 | 数据节点的槽表只在内存。只要 manager 保存了权威配置，就能重新下发。manager 本身的高可用和配置备份取决于部署 | 三个 controller 中失去一个，其余两票可以选主并延续已提交历史。保留持久卷时，全群重启也可恢复。要为各副本配置磁盘和故障域，多数副本永久丢盘仍需灾备 |
 | 控制面暂时不可用 | 已配置且仍运行的主节点可按原拓扑服务。新的归属、故障接管及重启节点重新配置要等 manager | 控制组失去多数时，已有路由及 leader 仍有效、且本组有多数的数据组可继续读写。新归属、重启节点注册和换主后的新路由发布要等控制组恢复 |
-| 数据主节点故障 | 外部 manager 可按业务策略提升副本。默认异步复制允许主节点先答复，接管时可能缺少副本尚未收到的已确认写 | 数据组自行选主，已确认写经过本组多数。原图每个数据组只有两票，掉一台便停写。扩为三票才可容忍一台故障；增加 controller 票数不能改变这个门槛 |
+| 数据主节点故障 | 外部 manager 可按业务策略提升副本。默认异步复制允许主节点先答复，接管时可能缺少副本尚未收到的已确认写 | 数据组自行选主。默认 `flush` 下已确认写经过本组多数持久化并在 leader 应用。原图每个数据组只有两票，掉一台便停写。扩为三票才可容忍一台故障；增加 controller 票数不能改变这个门槛 |
 | 运维工具与部署 | 节点端无需部署 controller quorum。已有平台可继续负责选址、扩容和流量切换，同时承担状态保存与下发失败处理 | 示例部署三个 controller 副本，每个数据节点跟随控制组。首次建群由控制组提交数据组清单，运维脚本通过管理 RESP 端口提交单槽迁移并查询进度 |
 
 `--cluster_mode=yes` 下，manager 可以从自己的高可用存储恢复权威拓扑。`--cluster_mode=raft` 下，控制组日志记录已提交的变更，节点从各自的回放位置继续应用。两种模式下，运维平台都可以制定扩容和迁槽策略。[配置发布与恢复](../cluster-mode.md) · [Raft 重启与失主用例](../../tests/integration/raft_data_group_test.py)
@@ -27,13 +27,13 @@ Kafka 对照同级仓库提交 `5b648ca9`。原生 Redis 先将本地超时标�
 
 ## 控制器与数据组的职责
 
-active controller 校验管理请求，取得控制组多数后提交拓扑变更。原图中的三名 voter 需要两票。数据组自行选主、确认业务写入，并向控制器提供迁移进度。增加 controller 只改变控制组的成员和多数门槛。[集群拓扑与组映射](raft-cluster-design.md#集群拓扑)
+active controller 校验管理请求，取得控制组多数后提交拓扑变更。原图中的三名 voter 需要两票。数据组自行选主、确认业务写入，并向控制器提供迁移进度。Active controller 通过 `DescribeQuorum` 获取数据组的 leader、任期和 HW，核对报告节点是当前 voter 且注册有效后提交 leader 路由。增加 controller 只改变控制组的成员和多数门槛。[集群拓扑与组映射](raft-cluster-design.md#集群拓扑)
 
 **部署建议。** C1、C2、C3 分布在三个故障域，先采用独立 controller 进程，便于单独滚动升级、扩缩容，也能隔离数据节点的内存压力和磁盘负载。代价是额外的进程、持久卷和内部监听端口。若将来支持同一进程兼任 controller 和数据节点，可减少小集群的部署成本，但一次停机会同时拿走两个组的票。部署前应按故障域计算每组剩余的票数。[Kafka 对独立和混合角色的取舍](../../../kafka/docs/operations/kraft.md)
 
 ## 怎样通过 Redis 管理集群
 
-在 `--cluster_mode=raft --raft_role=controller` 的节点上，设置非零 `--admin_port` 开启 RESP 管理端口。例如，`--admin_bind=127.0.0.1 --admin_port=6380` 允许同机脚本用 `redis-cli -p 6380` 连接。管理端口复用 `requirepass` 和管理端口的 TLS 配置。脚本配置各 controller 的管理地址，收到 standby 的 `TRYAGAIN Contact the active controller` 时换一个地址重试。查询返回 active controller 本机已应用的提交视图，目前没有为单次读取另设 quorum 读屏障。[管理监听](../../src/server/cluster/raft/runtime/admin_listener.cc) · [管理命令](../../src/server/cluster/raft/runtime/admin_command.cc)
+在 `--cluster_mode=raft --raft_role=controller` 的节点上，设置非零 `--admin_port` 开启 RESP 管理端口。例如，`--admin_bind=127.0.0.1 --admin_port=6380` 允许同机脚本用 `redis-cli -p 6380` 连接。管理端口复用 `requirepass` 和管理端口的 TLS 配置，`--admin_nopass` 可关闭该端口的密码检查。脚本配置各 controller 的管理地址，收到 standby 的 `TRYAGAIN Contact the active controller` 时换一个地址重试。查询返回 active controller 本机已应用的提交视图，目前没有为单次读取另设 quorum 读屏障。[管理监听](../../src/server/cluster/raft/runtime/admin_listener.cc) · [管理命令](../../src/server/cluster/raft/runtime/admin_command.cc)
 
 以原图中组 10 的业务槽 42 为例。先读取当前 owner 和 generation，将返回的值作为变更前提。下例假设得到 `10` 和 `1`。
 
@@ -60,7 +60,7 @@ Redis 经典逐键迁槽允许 `MIGRATING/IMPORTING` 期间使用 `ASK/ASKING` �
 | 启动配置 | 谁决定拓扑，配置怎样生效 |
 | --- | --- |
 | `--cluster_mode=yes` | 外部 manager 生成完整拓扑，用 `DFLYCLUSTER CONFIG` 下发到每个主节点和副本。重启的节点需再次接收配置。 |
-| `--cluster_mode=raft` | active controller 校验变更并提交给控制组。数据节点主动拉取已提交元数据，拒绝逐节点安装 `DFLYCLUSTER CONFIG`。管理端口接受带当前 owner 和 generation 的单槽迁移请求。 |
+| `--cluster_mode=raft` | active controller 校验变更并提交给控制组。数据节点主动拉取已提交元数据。管理端口接受带当前 owner 和 generation 的单槽迁移请求，节点拓扑随控制组提交而更新。 |
 | `--cluster_mode=emulated` | 单个实例对客户端展示模拟的槽拓扑，无需发布多节点配置。 |
 | 省略 `--cluster_mode` 或取空值 | 以单机模式运行。 |
 

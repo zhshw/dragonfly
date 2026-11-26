@@ -1,9 +1,8 @@
 # Dragonfly 组复制设计
 
-`--cluster_mode=yes` 的主节点按引擎线程推送 journal，副本用 LSN 报告执行进度。`--cluster_mode=raft` 的每个数据复制组拥有独立的分区日志，voter 在组内选主，按多数持久化位置确认写入。下文沿用同一组 A、A-r1 节点对照两套复制协议。Raft 示例另将 A-r2 加入组 10，使多数从 2/2 变为 2/3。slot 42 和 43 共用组 10 的日志。[集群拓扑与 slot 映射](raft-cluster-design.md) · [主从复制原图](../replication.md) · [历次复制实验](profile.md#experiments)
+`--cluster_mode=yes` 的主节点按引擎线程推送 journal，副本用 LSN 报告执行进度。`--cluster_mode=raft` 的每个数据复制组拥有独立的分区日志，voter 在组内选主，按多数确认位置推进提交水位，并在 leader 应用后回复。下文沿用同一组 A、A-r1 节点对照两套复制协议。Raft 示例另将 A-r2 加入组 10，使多数从 2/2 变为 2/3。slot 42 和 43 共用组 10 的日志。[集群拓扑与 slot 映射](raft-cluster-design.md) · [主从复制原图](../replication.md) · [历次复制实验](profile.md#experiments)
 
-本文描述默认 `--raft_data_ack_mode=flush`。实验选项 `memory` 改为多数页缓存确认，
-控制记录和元数据仍需落盘；确认条件及恢复限制见 [io_uring 文档](io_uring.md)。
+复制时序图以默认 `--raft_data_ack_mode=flush` 为例，按多数持久化位置确认。选用 `memory` 时，普通数据按多数 page cache 接收位置确认，后台刷盘推进恢复边界。控制记录、选票和元数据组仍需持久化。[确认模式与恢复边界](io_uring.md) · [数据组批次及 v17 调度](raft-batch-event-loop.md)
 
 ## 1. 复制状态机
 
@@ -62,14 +61,14 @@ sequenceDiagram
       M-->>R: diverging epoch 与 end offset
       R->>R: 对齐共同前缀，截断冲突尾部
     else 所需前缀已清理
-      R->>M: 请求组 10 的 KV 镜像（Dragonfly 扩展）
+      R->>M: FetchSnapshot，按 snapshot ID 和字节位置请求
       M-->>R: 校验信息、镜像数据、cut 的 epoch 与 offset
       R->>R: 完整校验后原子安装
     end
     loop 从对齐后的 offset 继续
-      R->>M: Fetch，携带本地 LEO
+      R->>M: Fetch，携带本地持久 LEO 和独立 applied 位置
       M-->>R: 连续批次与 leader HW
-      R->>R: 持久化批次，仅应用已提交前缀
+      R->>R: 持久化批次，应用已提交前缀
     end
 ```
 
@@ -180,7 +179,7 @@ sequenceDiagram
 
 ## 4. 客户端写入何时确认
 
-![三个 voter 中两个持久化当前任期的写入即可提交](figures/write-ack.svg)
+![flush 时序。两票持久化达到 HW，leader 应用后回复](figures/write-ack.svg)
 
 <details>
 <summary>查看新版 Mermaid 源码</summary>
@@ -206,15 +205,15 @@ sequenceDiagram
 
 </details>
 
-本例假设 voter 配置稳定。组内每个 voter 持久保存本组的任期、选票和日志。leader 用每个不同 voter 的持久化日志末端计算多数位置，过滤旧 term、错误组、错误目录和重复响应。采用 KRaft 的排他 HW：当前 term 的记录到达多数后，才可据此推进提交边界，连带提交此前的前缀。应用到本地 KV 后返回原始 RESP 结果。Fetch 确认复制位置，副本 apply 位置单独用于 `WAIT`。[Kafka LeaderState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/LeaderState.java)
+本例假设 voter 配置稳定。Leader 按当前 voter 集合的有效回报计算多数位置，一名 voter 只贡献一份进度。使用排他 HW，记录的 offset 小于 HW 时已提交。新 leader 先让当前任期的记录达到多数，以建立当前任期的提交边界。默认 `flush` 的有效位置是持久末端，`memory` 的普通数据可使用写全并发布的末端。Leader 在本地应用后回复，异步普通 SET 还要匹配本任期的票据位置。Follower 的 apply 位置单独用于 `WAIT`。[多数派计算](../../src/server/cluster/raft/quorum/fetch_replication.cc) · [回复水位](raft-batch-event-loop.md#2-数据单位与水位)
 
-若 A 只能联系自己，仍可能短暂认为自己是 leader，但无法为新的写入凑齐多数并返回成功。失联期间已追加但未确认的请求结果可能未知。恢复后按共同的 term/offset 截断冲突尾部，已提交前缀受 Raft 选举与日志规则保护。元数据 quorum 不可用时，健康且已配置的数据组仍能在本组选举和提交；新 slot 归属的发布需要元数据 quorum 恢复。
+若 A 只能联系自己，仍可能短暂认为自己是 leader，但无法为新的写入凑齐多数并返回成功。失联期间已追加但未确认的请求结果可能未知。恢复后按共同的 term/offset 截断冲突尾部，已提交前缀受 Raft 选举与日志规则保护。元数据 quorum 不可用时，健康且已配置的数据组仍可在本组选举和提交。对外发布新的 leader 路由与 slot 归属需要元数据 quorum 恢复。
 
 **成员调整。** 按动态 voter 模式格式化的数据组可以独立增删成员。新节点先以 observer 追平，再按上游的 VotersRecord 生效、提交和截断规则一次增删一个 voter。多数门槛基于协议有效的 voter 配置。更换组副本复制整组日志，迁移单个 slot 则在两个组之间切换归属。[跨组所有权切换](raft-cluster-design.md#4-单个-slot-跨组迁移)
 
 ## 5. 失主、选主与重新追赶
 
-现有计划内 takeover 需要旧主配合排空。下图的 A 已不可用，A-r1 和 A-r2 在组 10 内交换选票。候选者的日志必须至少与投票者一样新。投票者在同一 term 只投一个候选，先持久化选票再应答。控制器用 `DescribeQuorum` 向数据组轮询选举结果，确认新 leader 和 epoch 后提交路由变更。[controller 探测数据组](../../src/server/cluster/raft/runtime/controller.cc)
+`cluster_mode=yes` 的计划内 takeover 依赖旧主排空。Raft 时序中的 A 已不可用，A-r1 和 A-r2 在组 10 内交换选票。候选者的日志必须至少与投票者一样新。投票者在同一 term 只投一个候选，先持久化选票再应答。控制器用 `DescribeQuorum` 向数据组轮询选举结果，确认新 leader 和 epoch 后提交路由变更。[controller 探测数据组](../../src/server/cluster/raft/runtime/controller.cc)
 
 ![组三 voter 中剩余两票选出 A-r1，控制面随后更新路由](figures/leader-change.svg)
 
@@ -272,26 +271,27 @@ sequenceDiagram
 
 | 接入点 | 当前数据路径 |
 | --- | --- |
-| 分区日志 | 每个数据组在自己的分区目录保存批次。leader 和 follower 在持久化后推进各自的 LEO，用 epoch 和 offset 查找共同前缀，发现分歧时截断未提交的冲突尾部。[分区日志](../../src/server/cluster/raft/log/partition_log.h) |
+| 分区日志 | 每个数据组在自己的分区目录保存批次。leader 和 follower 按确认模式发布 LEO，以 epoch 和 offset 查找共同前缀，发现分歧时截断未提交的冲突尾部。[分区日志](../../src/server/cluster/raft/log/partition_log.h) |
 | 写入与条件求值 | leader 在追加前检查 slot 归属、generation 和本组角色。普通 SET 产生替换记录。NX/XX 等待此前追加的记录全部应用，再求值并记录替换或空操作。条件不满足时也等这次决定提交和应用后才返回 nil。[写入入口](../../src/server/cluster/raft/runtime/data_node.cc) |
 | 确定性重放 | 数据批次携带 group ID、DB ID、slot、generation、键和值。副本按提交顺序应用相同效果。迁槽也以本组记录保存冻结、分块、安装和完成进度，切主或重启后可继续执行。[效果回放](../../src/server/cluster/raft/data/set_effect.cc) · [迁槽记录](../../src/server/cluster/raft/data/slot_transfer_state.cc) |
-| 读取与 WAIT | GET 由已追上本组 HW 的当前 leader 提供。WAIT 按该连接记录的写入位置，统计本组副本在当前 epoch 报告的已应用位置。[副本应用进度](../../src/server/cluster/raft/data/apply_progress.cc) · [集成测试](../../tests/integration/raft_data_group_test.py) |
+| 读取 | GET 默认走 leader。`READONLY` 允许当前连接在符合条件的同组 follower 上 GET，`READWRITE` 或 `RESET` 恢复默认行为。[路由与读取](../../src/server/cluster/raft/runtime/data_node.cc) · [分发](../../src/server/main_service.cc) |
+| WAIT | 在当前写连接上按 `(group, epoch, end_offset)` 统计该组近期报告已应用到该位置的 follower voter。leader 自身不计入，任期变更返回错误。`memory` 下 WAIT 也可能覆盖尚未持久化的写入。[WAIT](../../src/server/server_family.cc) · [副本应用进度](../../src/server/cluster/raft/data/apply_progress.cc) |
 
-**SET 编码的取舍。** 当前数据组保留 Kafka 日志批内的 `DFKV v0` 载荷，编码器的优化方向是一次预留、直接写入最终批。Raft 已复用旧版的 `JournalExecutor` 来执行提交后的普通 SET。保留现有日志字节就能减少搬运，也能继续用同一解码器回放已有 WAL。[SET 执行](../../src/server/cluster/raft/data/set_executor.cc) · [复制与应用路径分析](profile/v5-batched-apply.md#stack-review)
-
-旧版 journal 先用 `SELECT` 指定 DB，再用 `COMMAND` 记录事务 ID 和已经求值的 SET 命令。独立验证把这些字节装入 Kafka 数据批，取出后用原版 `JournalReader` 正确读回了 DB 0 和 DB 11 的空值及 256 KiB 二进制值。条件未满足时，旧版跳过这条 SET，Raft 则提交一个占用 offset 的空操作。旧 journal 也没有记录数据组、slot 和归属代际，Raft 回放时要用这些信息阻止旧代际的写入。将来扩展到 DEL、带绝对过期时间的 SET 等写入时，共用 journal 命令体可以省去逐条定义参数编码的工作，届时仍需保留 Raft 的归属校验、空操作和旧 WAL 解码。[Journal 编解码](../../src/server/journal/serializer.cc) · [组归属与代际校验](../../src/server/cluster/raft/data/set_effect.cc) · [条件失败后的重启回放](../../src/server/cluster/raft/data/set_effect_test.cc)
+**SET 编码与回放。** 普通 SET 的确定性效果使用 Kafka 日志批中的 `DFKV v0` 载荷。编码执行器将多条记录直接写入最终聚合缓冲。leader 可由该缓冲应用缓存的效果，follower 可借用已验证的 Fetch 接收缓冲，缓存缺失或失效后从 WAL 解码。ApplyLane 按日志顺序组织相邻同 shard 的连续 SET，复用 `JournalExecutor` 进入引擎同步写入路径。NX/XX 条件失败写入占用 offset 的空操作。[效果格式及回放](../../src/server/cluster/raft/data/set_effect.cc) · [执行器](../../src/server/cluster/raft/data/set_executor.cc) · [Fetch 借用](profile/v13-fetch-borrow.md)
 
 **换主后的条件写。** 假设 A 已将一次 `SET k v NX` 复制给 A-r1，客户端收到回复前 A 宕机。A-r1 当选时，继承的日志可能领先于本地 KV。新 leader 在前序记录按新任期的 HW 提交并应用后，才对下一次 NX/XX 求值。失去本组多数时，节点不能确认新的条件写。[条件写实现](../../src/server/cluster/raft/runtime/data_node.cc)
 
-**客户端故障语义。** 追加前被拒的请求尚未写入。追加成功后遇到超时、换主或丢失回复，客户端看到的结果未知。重试 NX 可能返回 nil，此时客户端无法仅凭该回复判断是哪次请求写入了值。GET 检查本地归属、角色及已应用的 HW，尚无逐请求的 quorum 读屏障。[命令分派](../../src/server/main_service.cc) · [数据组读写](../../src/server/cluster/raft/runtime/data_node.cc)
+**客户端故障语义。** 追加前被拒的请求尚未写入。追加成功后遇到超时、换主或丢失回复，客户端看到的结果未知。重试 NX 可能返回 nil，此时客户端无法仅凭该回复判断是哪次请求写入了值。[命令分派](../../src/server/main_service.cc) · [数据组读写](../../src/server/cluster/raft/runtime/data_node.cc)
 
-后续若扩展 TTL、淘汰、事务和脚本，日志还需记录绝对过期时间、已决定的变更和原子批次边界，使副本重放得到相同结果。这些命令不在当前数据组的读写验收范围内。
+**读取条件。** 节点须有当前有效的注册身份、可用的 owner 路由，并通过迁移状态及 generation 检查。执行 READONLY 的连接仍可在 leader 写入。在 follower 上，GET 只接受本组当前成员对应的 slot，要求该副本已从当前 leader 成功 Fetch，并应用到它本地所知的 HW。其他组的键及 follower 上的 SET 仍走 leader 路由，通常返回 MOVED。GET 未设置逐请求的 quorum 读屏障，follower 读取可能落后于 leader。[路由与读取](../../src/server/cluster/raft/runtime/data_node.cc) · [在线及重启副本测试](../../tests/integration/raft_data_group_test.py)
+
+客户端写入范围为默认 namespace 中的多 DB 普通 SET 与 NX/XX。TTL 写、其他键写、事务和脚本当前会被分发层拒绝。
 
 ## 7. 组内调度与日志恢复
 
 ### 组内唤醒与上游实现
 
-有效的空 Fetch 可以在普通数据完整写入后提前返回。其他挂起的 Fetch 在组内日志位置、提交位置（HW）或领导权变化时重新检查。follower 落盘后立即用下一次 Fetch 报告已持久化的日志末端（LEO），取得快照分块后也立即续拉。每个 peer 同时只发一条请求，错误或异常的无进展响应仍会退避。SET 等待本组提交事件，唤醒后先应用已提交前缀，再校验原写入的 epoch 和 offset。并发条件写在前序效果应用后求值，8 个独立连接同时对一个键执行 SET NX，只有一个成功。[组内调度](../../src/server/cluster/raft/runtime/group.cc) · [Fetch](../../src/server/cluster/raft/quorum/fetch_replication.cc) · [条件写回归](../../tests/integration/raft_data_group_test.py)
+有效的挂起 Fetch 可在 WAL 写全后取得新记录。Follower 按确认模式回报 LEO，并在后续 Fetch 回报 apply 位置。每条 peer RPC 交回组状态时重新核对端点、身份和任期。普通 SET 按 WAL、Fetch、ApplyLane 的就绪事件推进，收到足以改变 HW 的回报即可尝试调度 apply，应用完成推进回复水位。数据组的定时器处理协议期限与后台刷盘。元数据组使用独立的轮询路径。[批次与事件循环](raft-batch-event-loop.md) · [组运行时](../../src/server/cluster/raft/runtime/group.cc)
 
 etcd/raft v3.6.0 在落盘后释放 follower 的追加确认。它的 leader 通过有界在途窗口发送后续日志，收到确认才推进副本的 `Match`。[etcd 落盘后确认](https://github.com/etcd-io/raft/blob/f35a02212416d045c574e30aa59d4b07c4b8d732/raft.go#L544-L575) · [在途窗口](https://github.com/etcd-io/raft/blob/f35a02212416d045c574e30aa59d4b07c4b8d732/tracker/inflights.go#L42-L46)
 
@@ -299,7 +299,7 @@ etcd/raft v3.6.0 在落盘后释放 follower 的追加确认。它的 leader 通
 
 数据组和控制器的分区日志都通过 `dragonfly-log-end` 记录本地持久化边界。DFE4 在文件开头的 44 字节内保存带 CRC32C 的基准记录，包含快照起点、日志段编号、已验证的字节末端和对应的排他 offset。同一段内最多可从这个基准向前发布 4095 个 offset。稀疏文件的逻辑长度编码已发布的增量，并带有能发现单比特长度错误的校验。[磁盘格式](../../src/server/cluster/raft/log/log_files.cc)
 
-在这个窗口内，节点先写全并同步日志段，再用 `ftruncate` 更新标记长度并同步标记文件，随后才公布新的本地 LEO。换段、超出窗口、截断或改变快照保留边界时，节点写入并同步新的基准文件，原子替换旧文件，再同步目录。[追加与截断](../../src/server/cluster/raft/log/partition_log.cc) · [快照处理](../../src/server/cluster/raft/log/partition_snapshot.cc)
+在这个窗口内，节点先写全并同步日志段，再用 `ftruncate` 更新标记长度并同步标记文件，随后公布新的持久末端。`flush` 此时才能发布确认 LEO。`memory` 在普通日志写全后先发布 LEO，后台刷盘只将持久末端推进到本轮捕获的位置。换段、超出窗口、截断或改变快照保留边界时，节点写入并同步新的基准文件，原子替换旧文件，再同步目录。[追加与截断](../../src/server/cluster/raft/log/partition_log.cc) · [快照处理](../../src/server/cluster/raft/log/partition_snapshot.cc)
 
 如果进程在更新标记长度后、同步返回前退出，重启进程可能从操作系统缓存中读到新的长度。启动时先同步 DFE3 或 DFE4 的标记文件，再同步目录，确保持久化了用于恢复的文件和选择。随后核对基准字节位置与 offset，逐批校验到所选边界，成功后才向 quorum 报告本地进度。已发布范围出现短写、坏 CRC 或断裂的批次会导致打开失败。选定边界之后的字节会被截掉，即使它们恰好构成有效日志批。新版本可以读取 DFE1、DFE2 和 DFE3，下一次发布边界时原子升级到 DFE4。已升级的分区目录需要支持 DFE4 的二进制才能重新打开。[边界恢复与升级回归](../../src/server/cluster/raft/log/partition_log_test.cc)
 

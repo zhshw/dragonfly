@@ -1,5 +1,8 @@
 # Cluster Mode
 
+This guide covers the manager-driven cluster mode (`--cluster_mode=yes`). The
+Raft mode has its own topology, replication, and administration. [Raft cluster guide](cluster/raft-cluster-design.md)
+
 ## 1. Overview
 
 A Dragonfly cluster is a set of Dragonfly nodes that collectively own the 16384-slot
@@ -618,11 +621,12 @@ mechanism, the state transition each side undergoes, and the recovery action.
 |-------|----------|
 | unset / `""` | No cluster commands; `DFLYCLUSTER` rejected. |
 | `emulated` | Single-node owner of slots `0..16383`. `CLUSTER *` answers from a synthetic topology built from the local replication summary. A replica advertises its master at the address the master announces to clients (learned during the replication handshake, so both sides must run a version that has it), not at the address it replicates from. `DFLYCLUSTER` is not exposed. |
-| `yes` | Full cluster mode. Topology must be installed via `DFLYCLUSTER CONFIG` before the node serves any data-plane traffic. |
+| `yes` | Manager-driven cluster. Topology must be installed via `DFLYCLUSTER CONFIG` before the node serves data-plane traffic. |
+| `raft` | Independent controller and data quorums. Uses the topology and management commands in the [Raft cluster guide](cluster/raft-cluster-design.md). |
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--admin_port` | `0` (off) | Required in real-cluster mode. `DFLYCLUSTER` and `DFLYMIGRATE` only accept connections on this listener; client-facing listeners reject them. |
+| `--admin_port` | `0` (off) | Required with `--cluster_mode=yes`. `DFLYCLUSTER` and `DFLYMIGRATE` only accept connections on this listener; client-facing listeners reject them. |
 | `--cluster_node_id` | `""` (uses the master replication id) | Node identity in the config; must match what the cluster manager embeds in `master.id`, `replicas[].id`, and `migrations[].node_id`. Disallowed in `emulated` mode. |
 | `--cluster_announce_ip` | `""` (uses the local bind) | IP returned to clients in `CLUSTER SLOTS/SHARDS/NODES` and embedded in MOVED replies. Also sent to replicas during the replication handshake, so a runtime change reaches them on their next connection. |
 | `--announce_port` | `0` (uses `--port`) | Port announced to cluster clients and to the replication master; propagated to replicas like `--cluster_announce_ip`. |

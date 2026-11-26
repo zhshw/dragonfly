@@ -1,19 +1,19 @@
 # Dragonfly 集群设计：KRaft 元数据与按复制组运行的 Raft
 
-设计提案。Kafka 基线为同级仓库的 `5b648ca9cbeed3cebe553fba86c516b08bcaeb40`，Dragonfly 基线为 `fbc5370234e38bd983ffdd6238b4512ba47182c6`。文中的 Kafka 行为以这两个 checkout 中可核对的源码和测试为准；当前分支已运行原图的三个 controller 和两个数据组。本期以原图七节点建群、读写、迁槽和重启恢复为通过条件。[验收清单](todos.md)
+本文描述 `raft-cluster` 分支的当前实现。控制组提交拓扑和迁槽状态，各数据组自行选主、复制 WAL 并确认写入。部署示例使用三个 controller 和两个各有两票的数据组。数据面包含 v17 的就绪事件调度和按连接启用的 follower 读取。[控制器与管理接口](cluster-controller.md) · [数据组复制](raft-replication-design.md) · [批次与事件循环](raft-batch-event-loop.md) · [Folly io_uring 架构图](io_uring.md#folly-io_uring-优化路径) · [验收命令](todos.md)
 
 ## 1. 两层 Raft 管什么
 
-在 `--cluster_mode=raft` 的目标设计中，每个逻辑集群将 `group_id = 0` 专用于 controller，数据组使用正整数 ID。公开的 Redis slots 0–16383 全部分配给数据组。业务键沿用现有键名和 hash tag 规则。独立的管理 RESP 入口直达组 0，管理键名无需参与业务选槽。管理员可通过该入口提交单槽迁移并查询进度。[集群控制器设计](cluster-controller.md)
+在 `--cluster_mode=raft` 中，每个逻辑集群将 `group_id = 0` 专用于 controller，数据组使用正整数 ID。公开的 Redis slots 0–16383 全部分配给数据组。业务键沿用现有键名和 hash tag 规则。独立的管理 RESP 入口直达组 0，管理键名无需参与业务选槽。管理员可通过该入口提交单槽迁移并查询进度。[集群控制器设计](cluster-controller.md)
 
 | 问题 | `--cluster_mode=yes` | `--cluster_mode=raft` |
 | --- | --- | --- |
 | 谁管理 slot | 外部 cluster manager 向各节点推送配置 | 元数据 Raft 组提交 slot → group、节点身份和迁移状态 |
-| 谁成为数据 leader | 副本跟随指定 master，由外部管理或接管流程提升 | 每个数据组的 voter 在本组 term 内选举 leader，向控制面报告结果供客户端发现 |
+| 谁成为数据 leader | 副本跟随指定 master，由外部管理或接管流程提升 | 每个数据组的 voter 在本组 term 内选举 leader，控制面探测并发布结果 |
 | 哪些业务写入成功 | 普通写由 master 执行并回复，journal 异步流向 replica | 数据组 leader 追加写入，按本组 voter 多数推进提交边界（HW），本地应用后回复 |
 | 客户端访问谁 | 根据 slot 访问 master，处理 MOVED | 按 slot 访问该 Raft 集群通告的 RESP 地址，对外的 master 是数据组当前可服务的 leader |
 
-**与 Kafka 的对应范围。** Kafka 上游的 KRaft 用于元数据，普通 topic 分区由 controller 选主并按 ISR 推进 HW。本提案取 KRaft 的选举、持久选票、voter 配置、Fetch、任期提交规则和快照作为协议基线，再为每个 Dragonfly 数据复制组运行独立实例。多组分发、KV 状态机和 Redis 路由属于 Dragonfly 扩展。按固定 Kafka 提交对照单个 quorum 的协议和测试。[KRaft 入口](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java) · [Kafka 普通分区的 ISR 实现](../../../kafka/core/src/main/scala/kafka/cluster/Partition.scala)
+**与 Kafka 的对应范围。** Kafka 上游的 KRaft 用于元数据，普通 topic 分区由 controller 选主并按 ISR 推进 HW。Dragonfly 以同级 Kafka 仓库提交 `5b648ca9cbeed3cebe553fba86c516b08bcaeb40` 为协议对照，各数据组独立运行基于 KRaft 的选举、持久选票、voter 配置、Fetch、任期提交和快照协议。多组分发、KV 状态机和 Redis 路由属于 Dragonfly 扩展。[KRaft 入口](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java) · [Kafka 普通分区的 ISR 实现](../../../kafka/core/src/main/scala/kafka/cluster/Partition.scala)
 
 ### 集群拓扑
 
@@ -21,11 +21,11 @@
 
 ![现有两主两副本、slot 区间与客户端路由](../cluster-topology.svg)
 
-**当前 Raft 分支的拓扑。** 在同样的数据节点和 slot 布局上画出三个独立 quorum。蓝线传递路由信息，绿线是组内协议，橙线是客户端请求。选举时由候选者向本组其他 voter 请求投票。稳定期由 follower 发起 Fetch，leader 返回日志和 HW，follower 持久化后通过下一次 Fetch 报告进度。
+**当前 Raft 分支的拓扑。** 在同样的数据节点和 slot 布局上画出三个独立 quorum。蓝线传递路由信息，绿线是组内协议，橙线是客户端请求。选举时由候选者向本组其他 voter 请求投票。稳定期由 follower 发起 Fetch，leader 返回日志和 HW。Follower 在下一次 Fetch 回报确认位置，默认取持久化的日志末端，另行回报本地 KV 应用进度。
 
 ![保留两个 slot 区间，新增独立的元数据 Raft 组与两个数据 Raft 组](raft-cluster-topology.svg)
 
-**按原图节点数，数据组各有两个 voter。** 组 10 的票来自 A、A-r1，组 20 的票来自 B、B-r1。多数派均为 2/2；A 故障时 A-r1 单独一票无法接任。若组 10 需要容忍一个节点故障，须先使第三个 voter A-r2 追平并完成成员变更，此时多数派为 2/3。元数据组的三个 voter 是控制面部署示例，其票不能算入数据组。loading 是 KV 服务状态；节点能否参与本次提交取决于它在当前 voter 配置中的身份及其持久日志进度。
+**按原图节点数，数据组各有两个 voter。** 组 10 的票来自 A、A-r1，组 20 的票来自 B、B-r1。多数派均为 2/2；A 故障时 A-r1 单独一票无法接任。若组 10 需要容忍一个节点故障，须先使第三个 voter A-r2 追平并完成成员变更，此时多数派为 2/3。元数据组的三个 voter 是控制面部署示例，其票不能算入数据组。loading 是 KV 服务状态；节点能否参与本次提交取决于它在当前 voter 配置中的身份及其在当前确认模式下的日志进度。
 
 [可编辑拓扑图](raft-cluster-topology.excalidraw) · [原集群设计](../cluster-mode.md) · [组复制、选举和故障时序](raft-replication-design.md)
 
@@ -38,7 +38,7 @@
 | key → slot | 按现有规则提取 hash tag，有有效 tag 时对 tag 计算 CRC16，否则使用完整 key，再对 16,384 取模。所有逻辑 DB 使用同一映射 | Redis slot 算法 |
 | slot → 复制组 | 每个已分配 slot 恰有一个 owner `group_id`，一组可拥有多个不连续的 slot 范围 | 新增 Dragonfly 元数据记录 `SlotAssignmentRecord`，提交到集群的 KRaft 元数据日志 |
 | 数据组 → Raft 实例 | 内部数据 topic T 的 partition ID 对应稳定的 group ID；每组一套持久日志、当前 term、选票、voter 配置和 HW | 元数据登记组身份和初始成员；创建后，成员演进以该组 Raft 日志为准 |
-| 数据组 → 当前 leader | 本组 voter 选举，leader 建立当前 term 的提交边界后报告组 ID、term、节点 ID 和成员配置位置 | 数据组是选举权威；controller 发布经核对的路由缓存，拒绝倒退的 term。请求到达时由数据组再次校验角色、term 和 slot generation |
+| 数据组 → 当前 leader | 本组 voter 选举，active controller 用 `DescribeQuorum` 探测已注册成员，核对返回的 leader、term、HW 与 voter 身份后提交 `GroupLeaderRecord` | 数据组是选举权威；controller 发布经核对的路由缓存，拒绝倒退的 term。请求到达时由数据组再次校验角色、term 和 slot generation |
 | broker → Redis 节点及地址 | 保存稳定的 broker ID 与 Redis node ID 对应关系；从当前注册信息取得其通告的 RESP endpoint | 持久节点身份映射和 broker 注册元数据，供 `MOVED`、`CLUSTER SLOTS/SHARDS/NODES` 使用 |
 
 以 T 表示内部数据 topic `__dragonfly_data`。表中假设 C1、A、B 分别是各组当前的 leader。
@@ -53,12 +53,12 @@
 
 **组编号与恢复。** 首次建群为每个数据组分配正整数 ID，成员换主时组 ID 保持稳定。已初始化的 Raft 集群从自己的控制组日志和快照恢复组编号及其全部槽范围。[组日志目录](../../src/server/cluster/raft/runtime/group.cc) · [首次引导校验](../../src/server/cluster/raft/metadata/bootstrap_topology.cc)
 
-**映射如何落盘。** `SlotAssignmentRecord` 是 Dragonfly 的元数据扩展，按范围记录 `first_slot, last_slot, expected_owner, expected_generation, new_owner, new_generation`。controller 在串行写事件中检查范围、旧值和目标分区是否存在，初始化用未分配作为旧值，运行中按相同 owner 和 generation 的连续区间拆分。通过元数据事务原子提交需要一起生效的变更；节点从稳定元数据日志或快照恢复同一份 slot 表。对外服务前校验 0–16383 全覆盖、无重叠且引用有效；无主分区返回暂不可用。迁移中的新 owner 可以准备数据，所有权在切换记录提交时生效。新记录使用独立类型及 feature gate，所有参与回放的节点都支持后才启用。
+**映射如何落盘。** `SlotAssignmentRecord` 是 Dragonfly 的元数据扩展，按范围记录 `first_slot, last_slot, expected_owner, expected_generation, new_owner, new_generation`。controller 在串行写事件中检查范围、旧值和目标分区是否存在，初始化用未分配作为旧值，运行中按相同 owner 和 generation 的连续区间拆分。首次拓扑与迁槽切换使用元数据事务。节点从稳定元数据日志或快照恢复同一份 slot 表。对外服务前校验 0–16383 全覆盖、无重叠且引用有效。缺少有效 leader 路由时返回暂不可用。迁移中的目标组可以提前准备数据，所有权在切换事务提交并应用后生效。[引导记录和校验](../../src/server/cluster/raft/metadata/bootstrap_topology.cc) · [路由表](../../src/server/cluster/raft/metadata/slot_directory.cc)
 
 | 操作（独立示例） | 哪一层变化 | 客户端及复制结果 |
 | --- | --- | --- |
 | 增加 controller C4 | C4 追平组 0，经该组成员变更成为 voter | 仅改变元数据组的成员和多数门槛，业务 slots 继续按原表路由 |
-| 组 10 计划内从 A 换到 A-r1 | 两个 voter 都在线，A 退位，A-r1 按 Raft 规则取得多数并建立新 term | 0–8191 一起转向 A-r1；任一节点不可达时两节点布局不能完成选举 |
+| 三票组 10 的 A 故障 | A-r1 和 A-r2 可在组内选出 leader 并建立新 term 的 HW | 0–8191 随控制器提交的 leader 路由一起切换 |
 | 组 10 用 A-r2 替换 A-r1 | 先让 A-r2 作为 observer 追平，经组内 KRaft 成员变更添加 voter；该变更提交后，再单独移除 A-r1 | 组 10 的多数门槛随配置从 2/2 变为 2/3，再变为 2/2；slot 归属不变 |
 | 单独将 slot 42 从组 10 迁至组 20 | 两个数据组各自提交冻结或导入，元数据组提交新归属 | slot 42 路由到 B，slot 43 留在 A；各组的 term 和 HW 相互独立 |
 
@@ -71,19 +71,19 @@
 | `--cluster_mode=yes` | 启动数据节点，外部 manager 通过 `DFLYCLUSTER CONFIG` 下发槽表，通过 `REPLICAOF` 建立主从复制 | manager 向重启节点重新下发当前配置。[manager 管理流程](../cluster-mode.md) |
 | `--cluster_mode=raft` | 为每个节点格式化独立目录，启动 controller 和数据组。控制组首次提交数据组成员、地址和槽范围，各数据组选出 leader | 保留各节点的目录及身份，controller 回放已提交的拓扑，数据组从本组快照和后续已提交日志恢复 KV，首次快照前从日志回放。[节点身份与恢复](../../src/server/cluster/raft/bootstrap/raft_directory.cc) |
 
-构建 `dragonfly` 和 `raft_storage` 后，在各 Raft 节点用 `build-dbg/raft_storage format <新目录> <cluster-id> <整数节点ID>` 初始化身份。用相同参数将 `format` 换成 `verify` 可核对身份。
+构建 `dragonfly` 和 `raft_storage` 后，在各 Raft 节点用 `build-dbg/raft_storage format <新目录> <cluster-id> <整数节点ID>` 初始化身份。用相同参数将 `format` 换成 `verify` 可核对身份。这是下例的静态引导方式。动态 voter 引导用 `--initial-controllers` 或 `--no-initial-controllers` 格式化，数据组另用 `--data-group <id>` 指定分区。已格式化目录应随节点保留。[格式化命令](../../src/server/cluster/raft/bootstrap/raft_storage.cc) · [动态成员夹具](../../tests/integration/raft_data_group_test.py)
 
-在 C1、C2、C3 分别格式化目录，使用相同 cluster ID 和不同 node ID。下面是 C1 的启动方式。在另外两台机器上替换本机目录和 node ID，三台使用相同 voter 列表。示例另外开启本机 RESP 管理端口，三个 controller 可各自配置管理地址。
+在 C1、C2、C3 分别格式化目录，使用相同 cluster ID 和不同 node ID。下面是 C1 的启动方式。在另外两台机器上替换本机目录和 node ID，三台使用相同 voter 列表。示例开启本机 RESP 管理端口，业务客户端连接数据节点。
 
 ```sh
 build-dbg/dragonfly --cluster_mode=raft --raft_role=controller \
   --dir=/var/lib/dragonfly/c1 --raft_cluster_id=HIJ1rG6XThu4T7D5Jg8xIg --raft_node_id=1 \
   --raft_quorum_voters=1@c1:9093,2@c2:9093,3@c3:9093 \
-  --admin_bind=127.0.0.1 --admin_port=6380 \
+  --port=0 --admin_bind=127.0.0.1 --admin_port=6380 \
   --raft_bootstrap_topology=/etc/dragonfly/topology.json
 ```
 
-在 Linux 构建目录包含 `dragonfly` 和 `raft_storage` 后，从仓库根目录运行 `DRAGONFLY_PATH=build-dbg/dragonfly python3 tests/integration/raft_controller_test.py -v`。用例通过内部 DescribeQuorum 检查 leader、epoch、HW 和各 voter 日志位置，覆盖单 voter 重启、三进程换主、单票退位和多数恢复后的已提交前缀。[多进程验收](../../tests/integration/raft_controller_test.py)
+控制器与数据组的 Linux 构建和测试命令见验收页。控制组用例通过 DescribeQuorum 检查 leader、epoch、HW 和各 voter 日志位置。[复现命令](todos.md#复现命令)
 
 三台 controller 首次建群使用同一份 `topology.json`。每个组列出对等的 `members` 和初始 `slot_ranges`。成员的 `id` 是向 Redis 客户端通告的节点身份，`broker_id` 是 Raft 节点编号。`ip` 和 `port` 是业务地址，`raft_port` 用于组内通信，内部主机名可以用 `raft_host` 单独指定。以下示例沿用拓扑图中的四台数据节点。
 
@@ -119,43 +119,45 @@ build-dbg/dragonfly --cluster_mode=raft --raft_role=data \
   --raft_listen=a:7100 --port=6379
 ```
 
-已在 Linux Debug 下用 redis-py 5.2.1 和 redis-cli 7 验证二进制 SET/GET、NX/XX、MOVED 和 WAIT。原图的 2/2 数据组失去一票后无法确认新写；另一组仍可写。七节点同时断电后，两组从持久日志恢复已确认值。另一个用例先把 A-r2 作为 observer 追平，再用 AddRaftVoter 加为第三票；原 leader 失效后，同一 slot 范围从新 leader 读回故障前确认的数据。未适配的写命令返回错误。[客户端和故障用例](../../tests/integration/raft_data_group_test.py)
+七节点用例覆盖二进制值、MOVED、少数派停写与整群原盘重启。在单独的三票切主用例中，A-r2 先以 observer 追平，再由 AddRaftVoter 提升为 voter，原 leader 失效后客户端可从新 leader 读回故障前确认的数据。[客户端和故障用例](../../tests/integration/raft_data_group_test.py)
 
 ### Redis 客户端在 Raft 集群中看到什么
 
 一个数据进程有一个稳定的 Redis node ID、一个业务地址，属于一个数据组。客户端连接本集群的任一数据节点获取槽表。独立 controller 通过自己的管理端口接收请求。[路由与角色](../../src/server/cluster/raft/runtime/data_node.cc) · [Redis 命令入口](../../src/server/main_service.cc)
 
-| 操作 | 预期行为 |
+| 操作 | 当前行为 |
 | --- | --- |
-| `CLUSTER SLOTS/SHARDS/NODES` | 返回数据组的槽范围和当前节点地址。组内换主更新 leader 地址，保留原组及槽范围。 |
-| `SET`、`SET … NX/XX` 和 `GET` | 业务键按 Redis 规则选槽。写入由所属数据组多数提交、在 leader 应用后应答，读取也经过数据组的归属与角色检查。 |
-| `WAIT` | 按当前连接的写入位置计算已应用该位置的副本数。上报的日志末端与实际 KV 应用位置分别跟踪。 |
+| `CLUSTER SLOTS/SHARDS/NODES` | 以本地已提交的元数据视图返回槽和节点地址。缺少有效 leader 路由的组暂不出现在槽表中。组内换主后等待控制器发布新 leader 的地址，槽归属保持不变。 |
+| `SET key value`、`SET … NX`、`SET … XX` | 默认 namespace 内支持多 DB 的普通和条件 SET。默认 `flush` 要求组内多数持久化，随后在 leader 应用并回复。`memory` 使用多数 page cache 确认。 |
+| `GET`、`READONLY`、`READWRITE` | GET 默认路由到 leader。连接执行 READONLY 后，已从当前 leader 拉取且追上本地 HW 的同组 follower 可以提供 GET。READWRITE 或 RESET 恢复 leader 路由。follower 读可能落后于 leader。 |
+| `WAIT` | 在原写连接按其写入位置统计当前任期已应用到该位置的 follower voter，数量不含 leader。 |
 | slot 42 迁到另一数据组 | 冻结期间源 leader 对该槽的新读写返回 `TRYAGAIN`。归属切换后，源节点按新的 leader 地址返回 `MOVED`。slot 43 继续由原组服务。 |
 
-七节点夹具分别验证拓扑、写确认、换主和整群原盘重启，还通过 controller 管理端口发起真实迁槽。[Redis 与 Raft 集成用例](../../tests/integration/raft_data_group_test.py)
+数据节点的业务接口限于上述 GET、SET 形式及已接入的连接、拓扑和状态命令。TTL 写、其他键写、事务及脚本尚未接入。数据组通过自身日志和快照恢复，启动校验禁用 AOF、旧主从复制、cache mode 和外部定时保存。[命令分发](../../src/server/main_service.cc) · [启动约束](../../src/server/server_family.cc) · [读写及 WAIT 语义](raft-replication-design.md#6-kv-执行快照与客户端故障语义)
 
 ## 2. 从哪些源文件开始
 
-| 模块 | Kafka 源码 | Dragonfly 侧需要实现的职责 |
+| 模块 | Kafka 源码 | Dragonfly 实现 |
 | --- | --- | --- |
-| 元数据选举和拉取 | [KafkaRaftClient](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java)、[QuorumState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/QuorumState.java)、[LeaderState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/LeaderState.java) | 把 poll、事件、计时器、请求和响应移植到 proactor/fiber；可注入时钟、随机退避和 I/O |
-| 格式化及持久状态 | [Formatter](../../../kafka/metadata/src/main/java/org/apache/kafka/metadata/storage/Formatter.java)、[FileQuorumStateStore](../../../kafka/raft/src/main/java/org/apache/kafka/raft/FileQuorumStateStore.java)、[KafkaRaftLog](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/KafkaRaftLog.java) | 节点及目录身份、选票、元数据 segment、epoch 索引与快照 |
-| 元数据写入及发布 | [QuorumController](../../../kafka/metadata/src/main/java/org/apache/kafka/controller/QuorumController.java)、[OffsetControlManager](../../../kafka/metadata/src/main/java/org/apache/kafka/controller/OffsetControlManager.java)、[MetadataLoader](../../../kafka/metadata/src/main/java/org/apache/kafka/image/loader/MetadataLoader.java) | 单事件队列产生 records；各节点按 offset 回放成不可变 image，发布到路由和副本管理器 |
-| Broker 生命周期 | [BrokerLifecycleManager](../../../kafka/server/src/main/java/org/apache/kafka/server/BrokerLifecycleManager.java)、[ClusterControlManager](../../../kafka/metadata/src/main/java/org/apache/kafka/controller/ClusterControlManager.java) | 注册、身份 fencing 与路由通告；数据组单独校验其 voter 身份、目录及 term |
-| 数据日志和组内选举 | [KafkaRaftLog](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/KafkaRaftLog.java)、[QuorumState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/QuorumState.java)、[LeaderState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/LeaderState.java) | 按组隔离 vote、epoch、批次、快照和多数派 HW。连接可复用，投票及 offset 不可跨组累加 |
-| RESP 写完成 | [Raft 客户端提交回调](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java) | 等待本次写对应的日志批次在正确历史上提交并 apply；失去领导权时取消或重新核实旧任期的等待者 |
+| 元数据选举和拉取 | [KafkaRaftClient](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java)、[QuorumState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/QuorumState.java)、[LeaderState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/LeaderState.java) | 串行组执行器协调选举、Fetch、请求和协议期限。[数据组与控制组运行时](../../src/server/cluster/raft/runtime/group.cc) |
+| 格式化及持久状态 | [Formatter](../../../kafka/metadata/src/main/java/org/apache/kafka/metadata/storage/Formatter.java)、[FileQuorumStateStore](../../../kafka/raft/src/main/java/org/apache/kafka/raft/FileQuorumStateStore.java)、[KafkaRaftLog](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/KafkaRaftLog.java) | 持久化节点及目录身份、选票、分段日志和快照。[格式化](../../src/server/cluster/raft/bootstrap/raft_directory.cc) · [日志](../../src/server/cluster/raft/log/partition_log.cc) |
+| 元数据写入及发布 | [QuorumController](../../../kafka/metadata/src/main/java/org/apache/kafka/controller/QuorumController.java)、[OffsetControlManager](../../../kafka/metadata/src/main/java/org/apache/kafka/controller/OffsetControlManager.java)、[MetadataLoader](../../../kafka/metadata/src/main/java/org/apache/kafka/image/loader/MetadataLoader.java) | active controller 根据稳定 image 追加记录，节点回放已提交的完整 image 并发布路由。[控制器](../../src/server/cluster/raft/runtime/controller.cc) · [元数据回放](../../src/server/cluster/raft/metadata/metadata_image.cc) |
+| Broker 生命周期 | [BrokerLifecycleManager](../../../kafka/server/src/main/java/org/apache/kafka/server/BrokerLifecycleManager.java)、[ClusterControlManager](../../../kafka/metadata/src/main/java/org/apache/kafka/controller/ClusterControlManager.java) | 控制面处理注册、心跳与 fencing。组内复制单独检查 voter 身份、目录及 term。[Broker 状态](../../src/server/cluster/raft/metadata/broker_control.cc) |
+| 数据日志和组内选举 | [KafkaRaftLog](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/KafkaRaftLog.java)、[QuorumState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/QuorumState.java)、[LeaderState](../../../kafka/raft/src/main/java/org/apache/kafka/raft/LeaderState.java) | 每个组独立保存选票、日志和快照，计算多数派 HW。[数据组](../../src/server/cluster/raft/runtime/group.cc) |
+| RESP 写完成 | [Raft 客户端提交回调](../../../kafka/raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java) | 异步普通 SET 使用同任期可回复水位和连接 FIFO，条件写使用串行等待。[回复流程](raft-batch-event-loop.md#3-从提交到回复) |
 
 ### 协议与记录清单
 
-从 [RPC schema](../../../kafka/clients/src/main/resources/common/message)、[元数据 schema](../../../kafka/metadata/src/main/resources/common/metadata) 生成 C++ 编解码器和 Java 对照样本。逐 API 记录支持版本、header、flexible/tagged fields、默认值、错误码和 feature gate。`ApiVersions` 只通告实现过的版本。单个 RPC 版本、`kraft.version`、`metadata.version` 分别协商或校验。[KRaftVersion](../../../kafka/server-common/src/main/java/org/apache/kafka/server/common/KRaftVersion.java)
+C++ 编解码以 Kafka schema 为基线，支持的 RPC 版本由 `ApiVersions` 通告。`kraft.version` 控制 voter 变更能力，`metadata.version` 控制元数据记录能力。组目录、业务写入效果及迁槽状态有各自的 Dragonfly 扩展。[RPC schema](../../../kafka/clients/src/main/resources/common/message) · [元数据 schema](../../../kafka/metadata/src/main/resources/common/metadata) · [Dragonfly 协议](../../src/server/cluster/raft/protocol)
 
-| 场景 | 需要复制的消息或记录 | 对照重点 |
+| 场景 | 消息或记录 | 校验和应用 |
 | --- | --- | --- |
 | 元数据选举与复制 | `Vote`、`BeginQuorumEpoch`、`EndQuorumEpoch`、`Fetch`、`FetchSnapshot`、`DescribeQuorum` | cluster ID、voter/directory 身份、pre-vote、日志新旧比较、epoch、分歧与快照 |
 | voter 变更 | `AddRaftVoter`、`RemoveRaftVoter`、`UpdateRaftVoter`；`KRaftVersionRecord`、`VotersRecord`、`LeaderChangeMessage` | Raft 控制批次由 quorum 自己读取，成员变更有自己的生效时序 |
 | 节点管理 | `BrokerRegistration`、`BrokerHeartbeat`；`RegisterBrokerRecord`、`BrokerRegistrationChangeRecord`、`UnregisterBrokerRecord` | incarnation、broker epoch、metadata offset、fenced 状态、受控退出 |
-| 数据组目录与 slot 归属 | Dragonfly 扩展记录组身份、初始及期望布局、slot generation、迁移和已观察到的 leader/term | controller 可提出成员变更；活动 voter 集合由数据组自己的成员协议确定。元数据里的 leader 提示不能授予写权限 |
-| 数据组共识 | 在组 ID 对应的实例上复用 Vote、Begin/EndQuorumEpoch、Fetch 及 VotersRecord 的语义；KV 快照有独立格式 | 明确索引到 (cluster ID, group ID)，再检查 voter 身份、目录、term 和日志历史；管理 RPC 缺少分组字段时由组级端点或版本化封装显式选组 |
+| 数据组目录与 slot 归属 | Dragonfly 扩展记录组身份、初始及期望布局、slot generation、迁移和已观察到的 leader/term | 控制面登记布局和 leader 路由。活动 voter 集合与写权限由对应组的成员协议和本地角色决定 |
+| 数据组共识 | 在组 ID 对应的实例上复用 Vote、Begin/EndQuorumEpoch、Fetch 及 VotersRecord 的语义；KV 快照有独立格式 | 数据组使用独立的内部端点和日志分区，按接口校验 cluster ID、组、身份、term 与日志历史 |
+| 迁槽 | `SlotMigration`、`FetchSlotImage` | 控制组记录操作阶段，目标组从源组分块获取镜像并在本组提交安装 |
 
 样本覆盖请求、响应及磁盘 record batch，包括批次 CRC、控制记录类型和快照 header/footer。Kafka 字段沿用上游 ID。Redis 命令效果写入数据 record 的 value，使用独立 payload 版本；KV 快照是 Dragonfly 的内部传输接口。
 
@@ -186,11 +188,11 @@ sequenceDiagram
 此处 HW 属于整个集群的元数据日志；业务写确认使用所属复制组独立的数据 HW。
 
 1. **格式化与恢复。** 初次格式化确定 cluster ID、node ID、directory ID，根据静态或动态 bootstrap 模式初始化 voter。重启时核对磁盘身份，恢复选票、快照及连续日志尾，再参与 quorum。bootstrap 地址负责发现节点，现存 quorum 的成员状态从磁盘恢复。
-2. **选举。** 移植 Unattached、Prospective、Candidate、Leader、Follower、Resigned 状态和超时。按协议版本处理 pre-vote，比较 last offset epoch、last offset 及候选身份。正式授票时先持久化 epoch/vote；同一 epoch 最多投给一个候选。取得 voter 多数才成为 leader。observer 可拉取但没有选票。
+2. **选举。** 组以 Unattached、Prospective、Candidate、Leader、Follower、Resigned 状态推进选举。按协议版本处理 pre-vote，比较 last offset epoch、last offset 及候选身份。正式授票时先持久化 epoch/vote；同一 epoch 最多投给一个候选。取得 voter 多数才成为 leader。observer 可拉取但没有选票。
 3. **推进元数据 HW。** 新 leader 追加当前 epoch 的 leader change 控制批次。follower 主动 Fetch；voter 按上游 flush 顺序处理批次，下一次 Fetch 携带新 end offset。leader 取 voter 多数已复制的位置，并要求该位置越过本 epoch 起始 offset 才建立本任期的 HW。offset 小于 HW 的记录已提交。长时间收不到多数 voter 的有效 Fetch/FetchSnapshot，leader 退位。
-4. **回放与发布。** Active controller 可先在可回退状态上 replay 待写记录。涉及持久变更的请求按 deferred queue 等待 stable offset。支持 Begin/End/Abort 元数据事务，半个事务不能发布为路由。controller 切换后回退推测状态；observer 与 standby 消费已提交批次或快照，按完整 image 发布，记录已应用位置。重复发布相同位置应幂等。
+4. **回放与发布。** Active controller 建立本任期 HW 且已消费到本地日志末端后，可基于稳定 image 处理变更。变更请求等待 stable offset 覆盖本次记录后返回。Begin/End/Abort 元数据事务由回放器暂存到事务结束，节点从提交日志或快照发布完整 image。[控制器请求](../../src/server/cluster/raft/runtime/controller.cc) · [元数据事务](../../src/server/cluster/raft/metadata/metadata_image.cc)
 5. **追赶与快照。** follower 报告 last fetched epoch 和 offset，分歧时找共同前缀并截断。若已落后于日志起点，按 `(endOffset, epoch)` 分块拉取元数据快照，校验后原子安装，从 endOffset 续拉。重启不能把未接收完的临时文件当成快照。
-6. **变更 voter。** 固定提交支持 `kraft.version=0/1`，动态成员变更由 1 启用。每次处理一个增删，检查前一变更已提交。新增 voter 先协商版本并验证追平。KRaft 内部读取最新 `VotersRecord` 更新参与计算的集合，增删按新集合多数提交，截断时回退集合。按请求版本处理 `ackWhenCommitted`，移除当前 leader 后按提交结果退位。这个时序必须单独移植。[AddVoterHandler](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/AddVoterHandler.java) · [RemoveVoterHandler](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/RemoveVoterHandler.java)
+6. **变更 voter。** `kraft.version=0` 使用静态 voter，`kraft.version=1` 支持动态成员变更。每次处理一个增删，检查前一变更已提交。新增 voter 先协商版本并验证追平。KRaft 内部读取最新 `VotersRecord` 更新参与计算的集合，增删按新集合多数提交，截断时回退集合。按请求版本处理 `ackWhenCommitted`，移除当前 leader 后按提交结果退位。变更作用于收到请求的组。[AddVoterHandler](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/AddVoterHandler.java) · [RemoveVoterHandler](../../../kafka/raft/src/main/java/org/apache/kafka/raft/internals/RemoveVoterHandler.java)
 
 **Broker 入群与故障。** Broker 以稳定 node ID、新进程 incarnation ID、目录 ID 和 endpoints 注册。controller 分配 broker epoch；broker 在心跳中报告 epoch 和已消费的 metadata offset，根据应答完成追赶、解除 fencing、运行和受控退出。旧 incarnation 的请求按各 API 的 epoch 字段检查。broker 心跳超时后，controller 记录注册状态并刷新发现信息。数据组以本组协议超时触发选举，节点的注册状态不能缩小本组多数门槛。网络隔离期间各节点收到 image 的时间可能不同。
 
@@ -199,7 +201,7 @@ sequenceDiagram
 | quorum epoch | KRaft 选举 | 拒绝过期的投票、leader 通告和元数据复制响应 |
 | broker epoch / incarnation | 注册流程，区分重试和新进程 | 拒绝已淘汰进程的心跳及管理请求 |
 | 数据组 term（leader epoch） | 本组 Raft 选举 | 校验数据复制、拒绝过期 leader 通告、核对写完成回调 |
-| 数据组 voter 配置位置 | 本组成员变更日志 | 恢复有效成员集合、防止重复增删与过期请求 |
+| 数据组 voter 配置位置 | 本组成员变更日志 | 恢复当前成员集合和成员变更进度 |
 | metadata image offset | 节点应用元数据前缀 | 防止重复、倒序发布；衡量节点追赶位置 |
 
 ## 4. 单个 slot 跨组迁移
@@ -226,7 +228,7 @@ sequenceDiagram
 
 | 接入点 | 当前 Raft 路径 |
 | --- | --- |
-| 业务读写 | 服务端将受支持的 GET 和 SET 交给数据组。数据组按已提交的槽归属检查请求，将写入效果按序追加到同一条组日志，并按连续提交前缀应用到对应 DB 和引擎分片。[命令分发](../../src/server/main_service.cc) · [数据日志回放](../../src/server/cluster/raft/data/set_effect.cc) |
+| 业务读写 | 分发层将 GET 和 SET 交给数据组。组内根据已提交槽表、迁移代际与组角色检查请求。SET 写入效果按组日志顺序回放，普通提交前缀由 ApplyLane 按连续同 shard 的分段交给引擎执行。[命令分发](../../src/server/main_service.cc) · [数据日志回放](../../src/server/cluster/raft/data/set_effect.cc) |
 | 拓扑 | 数据节点从已提交的元数据生成 `ClusterShardInfo`。Raft 与 manager 模式共用 Redis 槽算法和拓扑响应编码，各自生成对外发布的路由表。[数据节点](../../src/server/cluster/raft/runtime/data_node.cc) · [拓扑响应](../../src/server/cluster/cluster_family.cc) |
 | 管理变更 | 管理员向 active controller 提交带预期 owner 和 generation 的迁槽请求。controller 根据源、目标两组的已提交位置决定何时发布新归属。[控制器管理 API](cluster-controller.md) |
 
