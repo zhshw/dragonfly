@@ -1,6 +1,6 @@
 # Raft OTEL traces
 
-C++ 在 Raft 执行现场记录 spans/events，计算请求属性，直接上报 Langfuse；CLI 和 Web 共用查询服务。具体分析命令、查询结果与优化依据见 [v16 分析](v16-wal-encode-overlap.md#1-分析查询)。
+C++ 在 Raft 执行现场记录 spans/events，计算请求属性，直接上报 Langfuse；CLI 和 Web 共用查询服务。具体分析命令、查询结果与优化依据见 [v16 分析](../profile/v16-wal-encode-overlap.md#1-分析查询)。
 
 ## 数据流
 
@@ -65,7 +65,7 @@ metadata observer 使用独立的 group 0 stream，事件与耗时属性沿用 `
 - **Slow path**：整轮所有事件按 duration 降序取 Top 10；event name、node、group 和 `-min-duration-ms` 均为可选过滤。点击编号或事件名展开关联时序。
 - **Fetch delay**：按已存 `raft.fetch.return_wait` 排序，展示 RPC、返回空档、gate 和 I/O 证据。页面初始过滤 ≥ 10 ms；CLI 使用 `-min-return-wait-ms`，默认 0。
 - **Trace 统计**：按各轮测量窗口裁剪相交事件，再计算数量、并集和分位数。Fetch RPC 包含正常的无数据长轮询（最多 100 ms），不能仅凭 RPC 耗时判定复制阻塞。
-- `-capture` 固定轮次，`-selected TRACE_ID:SPAN_ID` 选择详情，`-json` 输出同一 API DTO。可复查命令集中在 [v16 文档](v16-wal-encode-overlap.md#1-分析查询)。
+- `-capture` 固定轮次，`-selected TRACE_ID:SPAN_ID` 选择详情，`-json` 输出同一 API DTO。可复查命令集中在 [v16 文档](../profile/v16-wal-encode-overlap.md#1-分析查询)。
 - Node / Event name 下拉来自整轮 capture。下拉可列出节点经历过的角色，单个事件只归属一个角色：优先使用记录的角色或所属请求的 group/epoch；旧事件缺少身份时，须被同一进程内无冲突的角色时段完整覆盖，否则显示 `Unknown`。不将整轮角色集合填入事件，也不将 fsync 文件类型当节点角色。
 
 ## Langfuse 与 Metrics

@@ -2,7 +2,7 @@
 
 更新日期：2026-11-26。工作分支：`profile/v15-replication-trace`。
 
-当前 v15 的准入空档与 Follower flush 阻塞分析采用 **OTEL traces**。数据与查询契约见 [trace.md](trace.md)，分析过程见 [v16 文档](v16-wal-encode-overlap.md)。
+当前 v15 的准入空档与 Follower flush 阻塞分析采用 **OTEL traces**。数据与查询契约见 [trace.md](trace.md)，分析过程见 [v16 文档](../profile/v16-wal-encode-overlap.md)。
 
 本阶段不实现标准 OTEL Metrics：不接入 Meter/Counter/Histogram/MetricReader，不部署 metrics Collector，不新增 ClickHouse metrics 表。请求的 wait、overlap、bytes、counts 是 **span attributes**，不称为 OTEL Metrics。未完成的 MetricsSink 接入草稿已移除。
 

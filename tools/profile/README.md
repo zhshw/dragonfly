@@ -2,7 +2,7 @@
 
 `profile` 提供 benchmark 归档、Trace 查询和 CPU 火焰图分析。当前内置测量流程为 Dragonfly Raft benchmark。
 
-请求分析采用 [Raft OTEL traces](../../docs/cluster/profile/trace.md)：C++ 记录事件并计算请求属性，直接上报 Langfuse，CLI/Web 共用查询。分析示例见 [v16](../../docs/cluster/profile/v16-wal-encode-overlap.md#1-分析查询)。OTEL Metrics 延后。
+请求分析采用 [Raft OTEL traces](../../docs/cluster/otel/trace.md)：C++ 记录事件并计算请求属性，直接上报 Langfuse，CLI/Web 共用查询。分析示例见 [v16](../../docs/cluster/profile/v16-wal-encode-overlap.md#1-分析查询)。OTEL Metrics 延后。
 
 实验、对照选择、benchmark 轮次、验证结果和诊断指标保存在 PostgreSQL。
 原生 Trace 保存在 Langfuse；capture 引用、火焰图和验证日志关联到实验，文件存放在数据盘。历史时间线归档仍可读取。

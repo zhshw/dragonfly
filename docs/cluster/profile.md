@@ -2,7 +2,7 @@
 
 逐轮 benchmark、验证日志、Trace 和火焰图按实验 ID 查询。 [实验平台](http://172.31.23.2:8787/)
 
-[Raft 原生 OTEL traces](profile/trace.md)：C++ 现场计算请求属性，记录等待与 I/O 证据，直接上报 Langfuse，CLI/Web 共用查询；保留准入空档和 flush gate 两个强制复现场景。[OTEL Metrics](profile/metrics.md) 延后。
+[Raft 原生 OTEL traces](otel/trace.md)：C++ 现场计算请求属性，记录等待与 I/O 证据，直接上报 Langfuse，CLI/Web 共用查询；保留准入空档和 flush gate 两个强制复现场景。[OTEL Metrics](otel/metrics.md) 延后。
 
 <a id="experiments"></a>
 
