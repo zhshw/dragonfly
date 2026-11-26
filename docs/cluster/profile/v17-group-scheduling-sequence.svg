@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1080" height="780" viewBox="0 0 1080 780" role="img" aria-labelledby="title desc" lang="zh-CN">
-  <title id="title">P1-8 候选时序：SET 的完成和协议到期</title>
+  <title id="title">v17 时序：SET 的完成和协议到期</title>
   <desc id="desc">三 voter、memory 模式，Follower 通过连续两次 Fetch 先获取数据再报告位置。Leader 结合多数确认和本地 apply 发布有序回复。另一种独立唤醒来自已经登记的协议期限。</desc>
   <style>
     text { font-family: -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #183743; }
@@ -12,7 +12,7 @@
     .life { fill: none; stroke: #adc1ca; stroke-width: 1.2; stroke-dasharray: 4 5; }
   </style>
   <rect width="1080" height="780" fill="#fff"/>
-  <text x="22" y="33" class="title" text-anchor="start">候选时序 · 一批普通 SET 的完成路径</text>
+  <text x="22" y="33" class="title" text-anchor="start">v17 时序 · 一批普通 SET 的完成路径</text>
   <text x="22" y="59" class="sub" text-anchor="start">同一任期，三 voter，批尾位置为 e。箭头表示逻辑交接，RPC 经过网络和 fiber 的路径见架构图。</text>
   <rect x="12" y="79" width="156" height="39" rx="8" fill="#edf5f8" stroke="#9ab6c2"/>
   <text x="90" y="105" class="head" text-anchor="middle">写连接</text>

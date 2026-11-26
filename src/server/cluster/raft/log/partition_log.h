@@ -69,6 +69,7 @@ class PartitionLog {
   }
 
   // Memory mode batches ordinary data barriers. Structural changes must flush first.
+  std::optional<std::chrono::steady_clock::time_point> BufferedFlushDeadline() const;
   bool BufferedFlushDue() const;
   absl::Status FlushBuffered();
 

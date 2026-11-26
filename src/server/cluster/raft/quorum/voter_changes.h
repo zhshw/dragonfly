@@ -30,8 +30,12 @@ class VoterChanges {
   using Result = std::shared_ptr<const VoterChangeResult>;
 
   VoterChanges(ElectionCampaign& campaign, EpochControl& epochs, FetchReplication& fetch,
-               int32_t timeout_ms)
-      : campaign_(campaign), epochs_(epochs), fetch_(fetch), timeout_ms_(timeout_ms) {
+               int32_t timeout_ms, std::function<void()> completed = {})
+      : campaign_(campaign),
+        epochs_(epochs),
+        fetch_(fetch),
+        timeout_ms_(timeout_ms),
+        completed_(std::move(completed)) {
   }
 
   Result Begin(const protocol::AddRaftVoterRequest& request, int64_t now_ms, int64_t wall_ms);
@@ -44,6 +48,11 @@ class VoterChanges {
                                            const protocol::ApiVersionsResponse& response,
                                            int64_t now_ms, int64_t wall_ms);
   void Poll(int64_t now_ms);
+  std::optional<int64_t> Deadline() const {
+    if (pending_)
+      return pending_->deadline;
+    return std::nullopt;
+  }
 
  private:
   enum class Operation { kAdd, kRemove, kUpdate };
@@ -69,6 +78,7 @@ class VoterChanges {
   EpochControl& epochs_;
   FetchReplication& fetch_;
   int32_t timeout_ms_;
+  std::function<void()> completed_;
   uint64_t sequence_ = 0;
   std::optional<Pending> pending_;
 

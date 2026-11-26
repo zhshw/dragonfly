@@ -259,10 +259,15 @@ void PartitionLog::RecordBuffered(size_t bytes) {
   buffered_bytes_ += bytes;
 }
 
+optional<chrono::steady_clock::time_point> PartitionLog::BufferedFlushDeadline() const {
+  if (flushing_ || !buffered_durable_end_)
+    return nullopt;
+  return buffered_since_ + chrono::milliseconds(buffered_bytes_ >= (64U << 20) ? 0 : 100);
+}
+
 bool PartitionLog::BufferedFlushDue() const {
-  return !flushing_ && buffered_durable_end_ &&
-         (buffered_bytes_ >= (64U << 20) ||
-          chrono::steady_clock::now() - buffered_since_ >= chrono::milliseconds(100));
+  auto deadline = BufferedFlushDeadline();
+  return deadline && chrono::steady_clock::now() >= *deadline;
 }
 
 absl::Status PartitionLog::FlushBuffered() {

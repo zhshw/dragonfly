@@ -83,6 +83,9 @@ class ElectionCampaign {
   const auto& LeaderEndpoint() const {
     return leader_endpoint_;
   }
+  uint64_t PeerRevision() const {
+    return peer_revision_;
+  }
 
   // Voters needed for the new leader's LeaderChangeMessage.
   std::vector<int32_t> GrantingVoters() const;
@@ -104,6 +107,7 @@ class ElectionCampaign {
   QuorumVoteState state_;
   bool recovered_ = false;
   std::optional<Endpoint> leader_endpoint_;
+  uint64_t peer_revision_ = 0;
   std::optional<EpochElection> round_;
   uint64_t sequence_ = 0;
   std::map<int32_t, uint64_t> pending_;

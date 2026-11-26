@@ -286,6 +286,27 @@ class RaftDataGroupFixture(unittest.TestCase):
 
 
 class RaftDataGroupTest(RaftDataGroupFixture):
+    def test_idle_leader_retires_without_request_and_elects_after_reconnect(self):
+        slots = self.wait_for(self.slots)
+        by_port = {port: node for node, port in self.resp.items()}
+        leader, follower = (by_port[endpoint[1]] for endpoint in slots[0][2:4])
+        before = self.wait_for(lambda: describe(self.raft[leader], b"__dragonfly_data", 10))
+        self.stop(follower, crash=True)
+
+        # Check the durable election state without driving the group through an RPC.
+        state = self.root / str(leader) / "__dragonfly_data-10" / "quorum-state"
+        self.wait_for(
+            lambda: json.loads(state.read_text())["leaderEpoch"] > before.epoch, timeout=8
+        )
+        self.assertIsNone(describe(self.raft[leader], b"__dragonfly_data", 10))
+
+        self.start(follower)
+        slots = self.wait_for(self.slots)
+        key = self.key_for_range(*slots[0][:2])
+        with redis.Redis(host=HOST, port=slots[0][2][1], single_connection_client=True) as client:
+            self.assertTrue(client.set(key, b"after reconnect"))
+            self.assertEqual(client.wait(1, 2500), 1)
+
     def test_two_voters_per_group(self):
         slots = self.wait_for(self.slots)
         self.assertEqual([(r[0], r[1]) for r in slots], [(0, 8191), (8192, 16383)])

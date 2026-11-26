@@ -33,6 +33,8 @@ void VoterChanges::Finish(int16_t error, optional<string> message) {
     pending_->result->message = std::move(message);
   }
   pending_.reset();
+  if (completed_)
+    completed_();
 }
 
 void VoterChanges::Poll(int64_t now_ms) {

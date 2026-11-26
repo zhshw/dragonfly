@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1040" height="496" viewBox="0 0 1040 496" role="img" aria-labelledby="title desc" lang="zh-CN">
   <title id="title">共同的 io_uring 事件循环与两种组内调度方式</title>
-  <desc id="desc">WAL 完成直接进入 GroupLoop，RPC 经网络循环及 fiber 交接，ApplyLane 交回成功前缀。旧入口可以同时检查数据与协议，候选按就绪原因处理，真实到期才调度超时工作。</desc>
+  <desc id="desc">WAL 完成直接进入 GroupLoop，RPC 经网络循环及 fiber 交接，ApplyLane 交回成功前缀。旧入口可以同时检查数据与协议，v17 按就绪原因处理，真实到期才调度超时工作。</desc>
   <style>
     text { font-family: -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #183743; }
     .title { font-weight: 650; font-size: 22px; }
@@ -29,12 +29,12 @@
   <path class="ink" d="M520 239 V259 M270 278 V259 H770 V278 M266 271 l4 7 l4 -7 M766 271 l4 7 l4 -7"/>
   <rect x="26" y="280" width="488" height="193" rx="8" fill="#fbf6ee" stroke="#d7c29b"/>
   <rect x="526" y="280" width="488" height="193" rx="8" fill="#edf6f5" stroke="#9abeb8"/>
-  <text x="44" y="312" class="title" text-anchor="start">现有 · 多个入口重入 Tick()</text>
+  <text x="44" y="312" class="title" text-anchor="start">v17 之前 · 多个入口重入 Tick()</text>
   <text x="44" y="347" class="body" text-anchor="start">常规路径进入 PollTimers()。</text>
   <text x="44" y="373" class="body" text-anchor="start">选举与 epoch 检查前后都做 Synchronize()，</text>
   <text x="44" y="397" class="body" text-anchor="start">每次同步都可能尝试 apply。</text>
   <text x="44" y="447" class="sub" text-anchor="start">另有 25 ms 的 peer 管理巡检和空闲／退避唤醒。</text>
-  <text x="544" y="312" class="title" text-anchor="start">候选 · 按就绪原因推进</text>
+  <text x="544" y="312" class="title" text-anchor="start">v17 · 按就绪原因推进</text>
   <text x="544" y="347" class="body" text-anchor="start">WAL / Fetch 更新复制位置，HW 前进时投递 apply。</text>
   <text x="544" y="373" class="body" text-anchor="start">ApplyLane 完成后更新回复水位，按需续批。</text>
   <text x="544" y="397" class="body" text-anchor="start">角色或成员变化时同步对应协议状态。</text>

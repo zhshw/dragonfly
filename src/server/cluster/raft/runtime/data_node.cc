@@ -128,7 +128,6 @@ struct LocalPartition {
   fb2::FiberQueue apply_queue{8};
   fb2::Fiber apply_fiber;
   shared_ptr<CommittedEffects::ApplyBatch> applying;
-  absl::Status apply_status;
   DataApplyProgress progress;
   atomic_uint64_t replica_version{0};
   fb2::EventCount replica_changed;
@@ -345,6 +344,7 @@ class DataNodeImpl final : public DataNode {
                                           cmn::BackedArguments* owned_args,
                                           trace::Admission* admission = nullptr);
   absl::Status QueueSet(shared_ptr<LocalPartition> local, PendingSet* request);
+  static shared_ptr<WriteEpoch> AdvanceReply(LocalPartition& local, RaftGroup::State state);
   optional<steady_clock::time_point> PumpSets(LocalPartition& local, RaftGroup::State state,
                                               bool unavailable);
   absl::Status WaitApplied(shared_ptr<LocalPartition> local, const PendingSet& proposal,
@@ -471,8 +471,6 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
     local->raft->SetApplyLane(
         [this, replica = local.get(), apply](const PartitionLog& log,
                                              int64_t hw) -> absl::StatusOr<int64_t> {
-          if (!replica->apply_status.ok())
-            return replica->apply_status;
           if (replica->applying || stopping_)
             return replica->effects.applied_offset();
           if (replica->effects.applied_offset() >= log.StartOffset() &&
@@ -494,14 +492,23 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
                 const auto finished = trace ? trace->Now() : 0;
                 if (trace)
                   trace->Record("raft.apply.lane_run", start, finished);
-                replica->raft->CompleteApply([replica, batch, completed, status, trace, finished] {
+                replica->raft->CompleteApply([replica, batch, completed, status, trace, finished](
+                                                 RaftGroup::State state, bool unavailable) {
                   if (trace) {
                     trace->Record("raft.apply.complete_queue", finished, trace->Now());
                     trace->Publish();
                   }
                   auto finish = replica->effects.FinishApply(*batch, completed);
-                  replica->apply_status = finish.ok() ? status : finish;
                   replica->applying.reset();
+                  if (!finish.ok())
+                    return finish;
+
+                  // Acknowledge the completed prefix before applying more or fencing the group.
+                  if (!unavailable) {
+                    if (auto epoch = AdvanceReply(*replica, state))
+                      epoch->changed.notifyAll();
+                  }
+                  return status;
                 });
               }));
               return replica->effects.applied_offset();
@@ -941,6 +948,29 @@ absl::Status DataNodeImpl::QueueSet(shared_ptr<LocalPartition> local, PendingSet
   return request->status;
 }
 
+shared_ptr<WriteEpoch> DataNodeImpl::AdvanceReply(LocalPartition& local, RaftGroup::State state) {
+  const auto& election = state.election.state();
+  auto epoch = local.reply_epoch.load();
+  if (!epoch || election.role != QuorumRole::kLeader || epoch->epoch != election.election.epoch)
+    return nullptr;
+  const auto offset =
+      min({state.log.End().end_offset, state.replication.HighWatermark().value_or(-1),
+           local.effects.applied_offset()});
+  const auto previous = epoch->reply_offset.load(memory_order_relaxed);
+  if (offset <= previous)
+    return nullptr;
+  if (local.trace) {
+    const auto stamp = local.trace->Now();
+    auto event = local.trace->MakeEvent("raft.reply.advance", stamp, stamp);
+    event.attributes["epoch"] = to_string(epoch->epoch);
+    event.attributes["previous_offset"] = to_string(previous);
+    event.attributes["end_offset"] = to_string(offset);
+    local.trace->Emit(std::move(event));
+  }
+  epoch->reply_offset.store(offset, memory_order_release);
+  return epoch;
+}
+
 optional<steady_clock::time_point> DataNodeImpl::PumpSets(LocalPartition& local,
                                                           RaftGroup::State state,
                                                           bool unavailable) {
@@ -967,24 +997,9 @@ optional<steady_clock::time_point> DataNodeImpl::PumpSets(LocalPartition& local,
       ++local.queued_requests;
       local.pending_writes.push_back(std::move(accepted));
     }
-    auto reply_epoch = local.reply_epoch.load();
-    if (!unavailable && election.role == QuorumRole::kLeader && reply_epoch &&
-        reply_epoch->epoch == election.election.epoch) {
-      const auto r =
-          min({state.log.End().end_offset, state.replication.HighWatermark().value_or(-1),
-               local.effects.applied_offset()});
-      if (r > reply_epoch->reply_offset.load(memory_order_relaxed)) {
-        if (local.trace) {
-          const auto stamp = local.trace->Now();
-          auto event = local.trace->MakeEvent("raft.reply.advance", stamp, stamp);
-          event.attributes["epoch"] = to_string(reply_epoch->epoch);
-          event.attributes["previous_offset"] = to_string(reply_epoch->reply_offset.load());
-          event.attributes["end_offset"] = to_string(r);
-          local.trace->Emit(std::move(event));
-        }
-        reply_epoch->reply_offset.store(r, memory_order_release);
-        remember(reply_epoch);
-      }
+    if (!unavailable) {
+      if (auto epoch = AdvanceReply(local, state))
+        remember(epoch);
     }
     for (auto it = local.pending_writes.begin(); it != local.pending_writes.end();) {
       auto& write = **it;

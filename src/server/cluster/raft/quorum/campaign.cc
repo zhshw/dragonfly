@@ -57,6 +57,7 @@ error_code ElectionCampaign::InstallVoters(vector<CampaignVoter> voters) {
     keys.push_back(voter.key);
   }
   voters_ = std::move(voters);
+  ++peer_revision_;
   voter_keys_ = std::move(keys);
   state_.election.voters = std::move(ids);
   if (state_.election.leader_id) {
@@ -249,6 +250,7 @@ error_code ElectionCampaign::FollowLeader(int32_t epoch, optional<int32_t> leade
   if (auto ec = Save(std::move(next), leader ? QuorumRole::kFollower : QuorumRole::kUnattached); ec)
     return ec;
   leader_endpoint_ = std::move(endpoint);
+  ++peer_revision_;
   round_.reset();
   return {};
 }

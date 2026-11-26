@@ -36,6 +36,7 @@ class EpochControl {
   // Caller sends the eligible notifications subject to per-peer transport backoff.
   // A check-quorum timeout first resigns the leader and returns EndQuorumEpoch messages.
   [[nodiscard]] std::error_code Poll(int64_t now_ms, std::vector<EpochNotification>* notifications);
+  std::optional<int64_t> NextDeadline(int64_t now_ms, int32_t end_retry_ms) const;
 
   // Accepted Fetch and FetchSnapshot requests establish liveness for this epoch. Pass
   // the follower's known end offset on Fetch to order preferred successors on resignation.
@@ -82,6 +83,7 @@ class EpochControl {
   int32_t tracked_epoch_ = -1;
   int64_t last_majority_ms_ = 0;
   std::optional<int64_t> last_begin_ms_;
+  std::optional<int64_t> last_end_ms_;
   std::map<int32_t, PeerState> peers_;
   std::set<int32_t> fetched_voters_;
   std::vector<ReplicaKey> successors_;

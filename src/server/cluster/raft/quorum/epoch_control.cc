@@ -186,6 +186,7 @@ void EpochControl::TrackRole(int64_t now_ms) {
   fetched_voters_.clear();
   last_majority_ms_ = now_ms;
   last_begin_ms_.reset();
+  last_end_ms_.reset();
   if (state.role == QuorumRole::kLeader || state.role == QuorumRole::kResigned) {
     for (const auto& voter : campaign_.voters()) {
       if (voter.key.id != campaign_.target().local_replica.id)
@@ -233,6 +234,7 @@ error_code EpochControl::Poll(int64_t now_ms, vector<EpochNotification>* notific
       if (it != peers_.end() && !it->second.acknowledged)
         notifications->push_back({voter.key, tracked_epoch_, MakeEnd()});
     }
+    last_end_ms_ = now_ms;
   }
   if (tracked_role_ != QuorumRole::kLeader)
     return {};
@@ -250,6 +252,30 @@ error_code EpochControl::Poll(int64_t now_ms, vector<EpochNotification>* notific
       notifications->push_back({voter.key, tracked_epoch_, MakeBegin(voter.key)});
   }
   return {};
+}
+
+optional<int64_t> EpochControl::NextDeadline(int64_t now_ms, int32_t end_retry_ms) const {
+  const auto& state = campaign_.state();
+  if (state.storage_error)
+    return nullopt;
+  if (tracked_role_ != state.role || tracked_epoch_ != state.election.epoch)
+    return now_ms;
+  if (tracked_role_ == QuorumRole::kResigned) {
+    if (any_of(peers_.begin(), peers_.end(),
+               [](const auto& peer) { return !peer.second.acknowledged; }))
+      return last_end_ms_ ? *last_end_ms_ + end_retry_ms : now_ms;
+    return nullopt;
+  }
+  if (tracked_role_ != QuorumRole::kLeader || peers_.empty())
+    return nullopt;
+  auto next = last_majority_ms_ + int64_t{fetch_timeout_ms_} * 3 / 2;
+  const int64_t interval = fetch_timeout_ms_ / 2;
+  for (const auto& [id, peer] : peers_) {
+    const auto begin = max(last_begin_ms_ ? *last_begin_ms_ + interval : now_ms,
+                           peer.last_fetch ? *peer.last_fetch + interval : now_ms);
+    next = min(next, begin);
+  }
+  return next;
 }
 
 error_code EpochControl::Resign(int64_t now_ms) {

@@ -24,11 +24,11 @@
 - [v14b Folly io_uring 批次事件循环首版修正](profile/v14b-batch-progress.md)
 - [v15 P0-2 已提交 SET 的 shard 合批](profile/v15-shard-apply.md)
 - [v16 Raft SET 批量补发与 Follower 并发 flush](profile/v16-wal-encode-overlap.md)
+- [v17 P1-8 数据组按 I/O 就绪事件推进](profile/v17-group-scheduling.md)
 
 ## 专题索引
 
 - <a id="ticket-completion-review"></a>[P1-3 按 applied offset 批量完成票据](profile/p1-3-review.md)
-- [P1-8 数据组按 I/O 就绪事件推进（架构提案）](profile/p1-8-group-scheduling.md)
 - [批次事件循环的设计与验证](raft-batch-event-loop.md)
 - [历史 benchmark](replication-benchmark.md) · [初始火焰图与 Trace](replication-observability.md)
 

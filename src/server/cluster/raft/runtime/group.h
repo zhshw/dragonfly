@@ -58,8 +58,8 @@ class RaftGroup {
   // Nonblocking admission snapshot. The worker must revalidate it before appending.
   std::optional<int32_t> LeaderEpoch() const;
 
-  // Drives bounded admission and reply progress on the serial owner after each group event.
-  // WakeData never waits; a full owner queue already guarantees a subsequent drive.
+  // Drives bounded admission and reply progress on the serial owner when inputs are ready.
+  // WakeData coalesces pending admission work and never waits for queue capacity.
   using DataDriver =
       std::function<std::optional<std::chrono::steady_clock::time_point>(State, bool unavailable)>;
   void SetDataDriver(DataDriver driver);
@@ -75,7 +75,8 @@ class RaftGroup {
   void SetApplyLane(ApplyStep step, std::function<bool()> busy);
 
   // Application completion is control traffic: it may run while WAL I/O is pending or stopping.
-  void CompleteApply(std::function<void()> completion);
+  using ApplyCompletion = std::function<absl::Status(State, bool unavailable)>;
+  void CompleteApply(ApplyCompletion completion);
   void Encode(std::function<void()> work, std::function<void()> completion);
 
   // Run on the disk worker and recheck after a commit or leadership change until done.
