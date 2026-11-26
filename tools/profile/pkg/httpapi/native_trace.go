@@ -15,9 +15,15 @@ import (
 
 func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.NativeConfig) {
 	reader := otel.NewNativeReader(config)
-	ready := func(w http.ResponseWriter, r *http.Request) bool {
+	configured := func(w http.ResponseWriter) bool {
 		if config.Langfuse.URL == "" || config.Langfuse.EnvFile == "" {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Native trace query is not configured"})
+			return false
+		}
+		return true
+	}
+	ready := func(w http.ResponseWriter, r *http.Request) bool {
+		if !configured(w) {
 			return false
 		}
 		if _, err := store.Get(r.PathValue("id")); err != nil {
@@ -38,7 +44,13 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 		writeJSON(w, http.StatusOK, map[string]any{"captures": captures})
 	})
 	api.HandleFunc("GET /api/v1/experiments/{id}/event-summary", func(w http.ResponseWriter, r *http.Request) {
-		if !ready(w, r) {
+		if !configured(w) {
+			return
+		}
+		id := r.PathValue("id")
+		record, err := store.Get(id)
+		if err != nil {
+			respondError(w, err)
 			return
 		}
 		capture := r.URL.Query().Get("capture")
@@ -52,29 +64,28 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid scope"})
 			return
 		}
-		if scope != "capture" {
-			record, err := store.Get(r.PathValue("id"))
-			if err != nil {
-				respondError(w, err)
-				return
+		nodeRoles := map[string]string{}
+		for variant, diagnostic := range record.Summary.Diagnostics {
+			if diagnostic.CaptureID != capture {
+				continue
 			}
-			for variant, diagnostic := range record.Summary.Diagnostics {
-				if diagnostic.CaptureID != capture {
-					continue
-				}
-				data, err := store.Measurement(r.PathValue("id"), "diagnostic-"+variant)
+			for role, info := range diagnostic.Nodes {
+				nodeRoles[info.Node] = role
+			}
+			if scope != "capture" {
+				data, err := store.Measurement(id, "diagnostic-"+variant)
 				if err != nil || json.Unmarshal(data, &window) != nil || window.Start <= 0 || window.End <= window.Start {
 					writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Capture has no valid measurement window"})
 					return
 				}
-				break
 			}
-			if window.Start == 0 {
-				writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Capture is not linked to a diagnostic measurement; use scope=capture for the full capture"})
-				return
-			}
+			break
 		}
-		report, err := reader.SummaryWindow(r.Context(), r.PathValue("id"), capture, window)
+		if scope != "capture" && window.Start == 0 {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Capture is not linked to a diagnostic measurement; use scope=capture for the full capture"})
+			return
+		}
+		report, err := reader.SummaryWindow(r.Context(), id, capture, window, nodeRoles)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return

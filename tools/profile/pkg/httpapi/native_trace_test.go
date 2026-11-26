@@ -23,7 +23,8 @@ func (nativeSummaryStore) Get(id string) (models.Record, error) {
 		return models.Record{}, os.ErrNotExist
 	}
 	return models.Record{Detail: models.Detail{Summary: models.Summary{Diagnostics: map[string]models.Diagnostic{
-		"current": {Diagnostic: workflow.Diagnostic{CaptureID: "capture", Native: true}},
+		"current": {Diagnostic: workflow.Diagnostic{CaptureID: "capture", Native: true,
+			Nodes: map[string]workflow.NodeDiagnostic{"leader": {Node: "11"}}}},
 	}}}}, nil
 }
 
@@ -82,6 +83,9 @@ func TestEventSummaryUsesNativeCapture(t *testing.T) {
 				if stage.Count != 1 || (stage.Name == "custom.event" && (stage.Union != 5 || stage.P95 != 5)) {
 					t.Fatalf("incorrect event statistics: %+v", stage)
 				}
+			}
+			if len(report.RoleStages) != 2 || report.RoleStages[1].Role != "leader" || report.Stages[1].Role != "follower" {
+				t.Fatalf("expected role totals using the benchmark role: %+v", report)
 			}
 		}
 	}

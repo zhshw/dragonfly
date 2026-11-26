@@ -321,7 +321,7 @@ func TestNativeSummaryCountsPointsAndSeparatesProcessClocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := data.eventSummary()
+	r, err := data.eventSummary(Window{}, nil)
 	if err != nil || r.Total != 6 || r.Complete || len(r.Issues) == 0 || len(r.EventNames) != 2 || len(r.Stages) != 4 {
 		t.Fatalf("wrong counts or lost incomplete status: %+v %v", r, err)
 	}
@@ -345,7 +345,17 @@ func TestNativeSummaryCountsPointsAndSeparatesProcessClocks(t *testing.T) {
 			}
 		}
 	}
-	windowed, err := data.eventSummary(Window{Start: origin + 9_000_000, End: origin + 11_000_000})
+	combined, err := data.eventSummary(Window{}, map[string]string{"11": "follower"})
+	if err != nil || len(combined.RoleStages) != 2 {
+		t.Fatalf("expected one row per event and benchmark role: %+v %v", combined.RoleStages, err)
+	}
+	for _, stage := range combined.RoleStages {
+		if stage.Name == "custom.operation" && (stage.Role != "follower" || stage.Node != "" ||
+			stage.Count != 5 || stage.Sum != 33 || stage.Union != 27 || stage.P95 != 10) {
+			t.Fatalf("benchmark role aggregate must pool durations and merge within each clock: %+v", stage)
+		}
+	}
+	windowed, err := data.eventSummary(Window{Start: origin + 9_000_000, End: origin + 11_000_000}, nil)
 	if err != nil || windowed.Scope != "measurement" || windowed.Total != 3 || len(windowed.Stages) != 1 {
 		t.Fatalf("incorrect window filtering: %+v %v", windowed, err)
 	}

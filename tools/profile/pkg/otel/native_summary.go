@@ -21,31 +21,28 @@ type NativeSummary struct {
 	Total      int      `json:"total"`
 	EventNames []string `json:"event_names"`
 	Stages     []Stage  `json:"stages"`
+	RoleStages []Stage  `json:"role_stages"`
 	Scope      string   `json:"scope"`
 }
 
 // Summary uses the same validated capture and cache as Slow Path and Fetch delay queries.
 // It aggregates recorded span boundaries without deriving business wait attributes.
 func (r *NativeReader) Summary(ctx context.Context, experiment, capture string) (NativeSummary, error) {
-	return r.SummaryWindow(ctx, experiment, capture, Window{})
+	return r.SummaryWindow(ctx, experiment, capture, Window{}, nil)
 }
 
 // SummaryWindow clips intersecting spans to the same measurement bounds as archived traces.
-func (r *NativeReader) SummaryWindow(ctx context.Context, experiment, capture string, window Window) (NativeSummary, error) {
+func (r *NativeReader) SummaryWindow(ctx context.Context, experiment, capture string, window Window, nodeRoles map[string]string) (NativeSummary, error) {
 	data, err := r.load(ctx, experiment, capture)
 	if err != nil {
 		return NativeSummary{}, err
 	}
-	return data.eventSummary(window)
+	return data.eventSummary(window, nodeRoles)
 }
 
-func (data *nativeCaptureData) eventSummary(windows ...Window) (NativeSummary, error) {
+func (data *nativeCaptureData) eventSummary(window Window, nodeRoles map[string]string) (NativeSummary, error) {
 	r := NativeSummary{Capture: data.summary.Capture, Complete: data.summary.Complete,
-		Issues: data.summary.Issues, Stages: []Stage{}, Scope: "capture"}
-	var window Window
-	if len(windows) > 0 {
-		window = windows[0]
-	}
+		Issues: data.summary.Issues, Scope: "capture"}
 	if window.Start != 0 || window.End != 0 {
 		if window.Start < 0 || window.End <= window.Start {
 			return r, fmt.Errorf("invalid measurement window")
@@ -55,11 +52,22 @@ func (data *nativeCaptureData) eventSummary(windows ...Window) (NativeSummary, e
 	names := map[string]bool{}
 	type group struct {
 		stage     Stage
-		nodes     map[string]bool
 		clocks    map[string][]Interval
 		durations []int64
 	}
 	groups := map[string]*group{}
+	roleGroups := map[string]*group{}
+	add := func(groups map[string]*group, key string, stage Stage, clock string, interval Interval) {
+		g := groups[key]
+		if g == nil {
+			g = &group{stage: stage, clocks: map[string][]Interval{}}
+			groups[key] = g
+		}
+		g.clocks[clock] = append(g.clocks[clock], interval)
+		duration := interval.End - interval.Begin
+		g.durations = append(g.durations, duration)
+		g.stage.Sum += float64(duration) / 1e6
+	}
 	for _, e := range data.events {
 		if e.Name == "raft.capture" {
 			continue
@@ -80,38 +88,44 @@ func (data *nativeCaptureData) eventSummary(windows ...Window) (NativeSummary, e
 		if role == "" {
 			role = "unknown"
 		}
-		key := e.Fields["node_id"] + "\x00" + role + "\x00" + e.Name
-		g := groups[key]
-		if g == nil {
-			g = &group{stage: Stage{Role: role, Name: e.Name}, nodes: map[string]bool{}, clocks: map[string][]Interval{}}
-			groups[key] = g
-		}
-		g.nodes[e.Fields["node_id"]] = true
+		node := e.Fields["node_id"]
 
 		// Streams from one process share a clock. Never merge intervals across processes.
 		clock := e.Fields["process_instance"]
 		if clock == "" {
 			clock = e.TraceID
 		}
-		clock = e.Fields["node_id"] + "\x00" + clock
-		g.clocks[clock] = append(g.clocks[clock], Interval{start, end})
-		g.durations = append(g.durations, end-start)
-		g.stage.Sum += float64(end-start) / 1e6
+		clock = node + "\x00" + clock
+		interval := Interval{start, end}
+		add(groups, node+"\x00"+role+"\x00"+e.Name, Stage{Node: node, Role: role, Name: e.Name}, clock, interval)
+
+		// Match the benchmark data-group role across rounds, even if a node changes ID.
+		comparisonRole := nodeRoles[node]
+		if comparisonRole == "" {
+			comparisonRole = role
+		}
+		add(roleGroups, comparisonRole+"\x00"+e.Name, Stage{Role: comparisonRole, Name: e.Name}, clock, interval)
 		r.Total++
 	}
-	for _, key := range sortedKeys(groups) {
-		g := groups[key]
-		sort.Slice(g.durations, func(i, j int) bool { return g.durations[i] < g.durations[j] })
-		s := g.stage
-		s.Count, s.Node = len(g.durations), strings.Join(sortedKeys(g.nodes), ", ")
-		s.P50 = float64(g.durations[s.Count/2]) / 1e6
-		s.P95 = float64(g.durations[int(math.Ceil(float64(s.Count)*.95))-1]) / 1e6
-		s.Max = float64(g.durations[s.Count-1]) / 1e6
-		for _, clock := range sortedKeys(g.clocks) {
-			s.Union += UnionMS(g.clocks[clock])
+	summarize := func(groups map[string]*group) []Stage {
+		stages := make([]Stage, 0, len(groups))
+		for _, key := range sortedKeys(groups) {
+			g := groups[key]
+			sort.Slice(g.durations, func(i, j int) bool { return g.durations[i] < g.durations[j] })
+			s := g.stage
+			s.Count = len(g.durations)
+			s.P50 = float64(g.durations[s.Count/2]) / 1e6
+			s.P95 = float64(g.durations[int(math.Ceil(float64(s.Count)*.95))-1]) / 1e6
+			s.Max = float64(g.durations[s.Count-1]) / 1e6
+			for _, clock := range sortedKeys(g.clocks) {
+				s.Union += UnionMS(g.clocks[clock])
+			}
+			stages = append(stages, s)
 		}
-		r.Stages = append(r.Stages, s)
+		return stages
 	}
+	r.Stages = summarize(groups)
+	r.RoleStages = summarize(roleGroups)
 	r.EventNames = sortedKeys(names)
 	return r, nil
 }

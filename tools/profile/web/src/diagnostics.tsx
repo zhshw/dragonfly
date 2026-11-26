@@ -2,10 +2,12 @@ import { Fragment, useEffect, useState } from 'react';
 import { ArrowDownToLine, ArrowUpRight, Flame, Search, Workflow } from 'lucide-react';
 import { api, artifactURL, endpoint, number, targetTitle } from './model';
 import type { DiagnosticCapture, DiagnosticComparison, DiagnosticSummary, ReferenceDiagnostics, Role, Stage } from './model';
-import type { TimelinePhase } from './timeline';
 
 type Panel = { key: 'current' | 'previous' | 'reference'; title: string; id?: string; capture?: DiagnosticCapture; raft?: boolean };
-type EventSummary = { capture_id: string; complete: boolean; issues: string[]; total: number; event_names: string[]; stages: Stage[]; scope: 'measurement' | 'capture' };
+type EventSummary = {
+  capture_id: string; complete: boolean; issues: string[]; total: number; event_names: string[];
+  stages: Stage[]; role_stages?: Stage[]; scope: 'measurement' | 'capture';
+};
 
 export function DiagnosticsView({ id, view, referenceID }: { id: string; view: 'flamegraphs' | 'trace'; referenceID?: string }) {
   const [comparison, setComparison] = useState<DiagnosticComparison>();
@@ -151,19 +153,17 @@ function TraceOverview({ panels }: { panels: Panel[] }) {
       .finally(() => { if (!abort.signal.aborted) setLoading(false); });
     return () => abort.abort();
   }, [sources]);
-  const resolved = panels.map((panel) => {
+  const summaryFor = (panel: Panel) => {
     const summary = summaries[panel.key];
-    if (!panel.capture || !summary || summary.capture_id !== panel.capture.profile.capture_id) return panel;
-    return { ...panel, capture: { ...panel.capture, observation: { ...panel.capture.observation, stages: summary.stages } } };
-  });
+    return summary?.capture_id === panel.capture?.profile.capture_id ? summary : undefined;
+  };
   return <>
     <div className="diagnostic-columns">
-      {resolved.map((panel) => <TracePanel key={panel.key} panel={panel}
-        summary={summaries[panel.key]?.capture_id === panel.capture?.profile.capture_id ? summaries[panel.key] : undefined} />)}
+      {panels.map((panel) => <TracePanel key={panel.key} panel={panel} summary={summaryFor(panel)} />)}
     </div>
     {loading && <div role="status" className="notice">Loading event statistics…</div>}
     {error && <div role="alert" className="notice">Event statistics: {error}</div>}
-    {resolved.some(({ capture }) => capture) && <TraceComparison panels={resolved} />}
+    {panels.some(({ capture }) => capture) && <TraceComparison panels={panels} summaries={panels.map(summaryFor)} />}
   </>;
 }
 
@@ -192,31 +192,28 @@ const waitMetrics: { label: string; value: (diagnostic: DiagnosticSummary) => st
   { label: 'fsync 中启动编码 / 追加 (次)', value: (trace) => `${trace.nodes.leader.starts_during_fsync} / ${trace.nodes.follower.starts_during_fsync}` },
 ];
 
-type PhaseRow = TimelinePhase & { node: string; groupRole?: string; values: (Stage | undefined)[] };
+type StageMetrics = { count: number; union_ms: number; p95_ms?: number };
+type PhaseRow = { key: string; stage: string; role: string; values: (StageMetrics | undefined)[] };
 
-function TraceComparison({ panels }: { panels: Panel[] }) {
+function TraceComparison({ panels, summaries }: { panels: Panel[]; summaries: (EventSummary | undefined)[] }) {
   const [query, setQuery] = useState('');
   const [role, setRole] = useState('all');
   const [showAll, setShowAll] = useState(false);
   const raftPanels = panels.filter((panel) => panel.raft !== false && !panel.capture?.profile.native);
   const grouped = new Map<string, PhaseRow>();
   const search = query.trim().toLowerCase();
-  const splitRoles = new Set<string>();
-  for (const { capture } of panels) {
-    const seen = new Set<string>();
-    for (const stage of capture?.observation.stages ?? []) {
-      const key = `${stage.node}:${stage.stage}`;
-      if (seen.has(key)) splitRoles.add(key);
-      seen.add(key);
-    }
-  }
   panels.forEach(({ capture }, index) => {
-    for (const stage of capture?.observation.stages ?? []) {
-      const nodeRole = Object.entries(capture?.profile.nodes ?? {}).find(([, info]) => info.node === stage.node)?.[0] ?? stage.role;
-      const groupRole = splitRoles.has(`${stage.node}:${stage.stage}`) ? stage.role : undefined;
-      const key = `${nodeRole}:${stage.node}:${stage.stage}:${groupRole ?? ''}`;
-      const row = grouped.get(key) ?? { key, stage: stage.stage, role: nodeRole, node: stage.node, groupRole, values: Array<Stage | undefined>(panels.length).fill(undefined) };
-      row.values[index] = stage;
+    const summary = summaries[index];
+    const nodeRoles = new Map(Object.entries(capture?.profile.nodes ?? {}).map(([role, info]) => [info.node, role]));
+    for (const stage of summary?.role_stages ?? summary?.stages ?? capture?.observation.stages ?? []) {
+      const nodeRole = nodeRoles.get(stage.node) ?? stage.role;
+      const key = `${stage.stage}\0${nodeRole}`;
+      const row = grouped.get(key) ?? {
+        key, stage: stage.stage, role: nodeRole, values: Array<StageMetrics | undefined>(panels.length).fill(undefined),
+      };
+      const existing = row.values[index];
+      // Older archives may contain only per-node percentiles.
+      row.values[index] = existing ? { count: existing.count + stage.count, union_ms: existing.union_ms + stage.union_ms } : stage;
       grouped.set(key, row);
     }
   });
@@ -236,7 +233,7 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
     </section>}
     <section className="panel data-panel">
       <div className="panel-heading phase-heading">
-        <div><h2>Event statistics</h2><p>{canCompare ? 'Sorted by the larger duration union. ' : 'Sorted by duration union. '}Each node is counted separately. Node roles follow the benchmark data group. —: not recorded in this capture.</p></div>
+        <div><h2>Event statistics</h2><p>Grouped by event and node role. {canCompare ? 'Sorted by the larger duration union. ' : 'Sorted by duration union. '}—: unavailable.</p></div>
         <div className="phase-controls">
           <select aria-label="Node role" value={role} onChange={(event) => { setRole(event.target.value); setShowAll(false); }}>
             <option value="all">All roles</option>{roles.map((value) => <option key={value} value={value}>{value}</option>)}
@@ -246,14 +243,14 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
       </div>
       <div className="table-scroll"><table className="data-table diagnostic-table">
         <thead>
-          <tr><th rowSpan={2}>Event</th><th rowSpan={2}>Node</th>{panels.map((panel) => <th colSpan={3} scope="colgroup" className="phase-start" key={panel.key}>{panelTitle(panel)}</th>)}</tr>
+          <tr><th rowSpan={2}>Event</th><th rowSpan={2}>Node role</th>{panels.map((panel) => <th colSpan={3} scope="colgroup" className="phase-start" key={panel.key}>{panelTitle(panel)}</th>)}</tr>
           <tr>{panels.map(({ key }) => <Fragment key={key}><th className="phase-start">Events</th><th>Union ms</th><th>P95 ms</th></Fragment>)}</tr>
         </thead>
         <tbody>{(showAll ? phases : phases.slice(0, 12)).map((phase) => <tr key={phase.key}>
-          <td className="mono strong">{phase.stage}</td><td>{phase.role}{phase.node !== 'client' && ` · ${phase.node}`}{phase.groupRole && <small>Group: {phase.groupRole}</small>}</td>
+          <td className="mono strong">{phase.stage}</td><td>{phase.role}</td>
           {phase.values.map((value, i) => <Fragment key={panels[i].key}>
             <td className="mono phase-start">{value ? number(value.count, 0) : '—'}</td>
-            <td className="mono">{value ? number(value.union_ms, 3) : '—'}</td><td className="mono">{value ? number(value.p95_ms, 3) : '—'}</td>
+            <td className="mono">{value ? number(value.union_ms, 3) : '—'}</td><td className="mono">{value?.p95_ms === undefined ? '—' : number(value.p95_ms, 3)}</td>
           </Fragment>)}
         </tr>)}</tbody>
       </table></div>
