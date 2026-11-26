@@ -26,6 +26,8 @@ namespace dfly::cluster::raft {
 
 enum class SetCondition { kIfMissing, kIfExists };
 
+enum class DataReadMode { kLeaderOnly, kAllowFollower };
+
 struct DataTopology {
   // Published only after every slot has an owner. Shards list only groups with a routable leader.
   ClusterShardInfos shards;
@@ -96,7 +98,10 @@ class DataCommandHandler {
                            DataWritePosition* position) = 0;
   virtual absl::StatusOr<bool> SetIf(DbIndex db, std::string_view key, std::string_view value,
                                      SetCondition condition, DataWritePosition* position) = 0;
-  virtual absl::StatusOr<std::optional<std::string>> Get(DbIndex db, std::string_view key) = 0;
+
+  // Follower reads return locally applied committed data and may lag the leader.
+  virtual absl::StatusOr<std::optional<std::string>> Get(DbIndex db, std::string_view key,
+                                                         DataReadMode mode) = 0;
 
   virtual absl::StatusOr<DataReplicationState> ReplicationState() {
     return absl::UnavailableError("-CLUSTERDOWN Data group has no known leader");

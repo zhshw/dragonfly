@@ -1,0 +1,70 @@
+{
+  "binary_sha": "69d1b9333bfdc541e38c05fd956be7e0da256ca5b03fed0948028bef157c6b08",
+  "final_leader": {
+    "connected_slaves": "2",
+    "master_repl_offset": "1094",
+    "role": "master",
+    "slave0": "ip=127.0.0.1,port=38187,state=online,offset=1094,lag=0",
+    "slave1": "ip=127.0.0.1,port=41441,state=online,offset=1094,lag=0"
+  },
+  "followers": [
+    {
+      "endpoint": "127.0.0.1:38187",
+      "get_response": "Redis: MOVED 42 127.0.0.1:45879",
+      "keyspace": {
+        "db0": "keys=1090,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1"
+      },
+      "node": 11,
+      "polls": 1,
+      "replication": {
+        "master_host": "127.0.0.1",
+        "master_link_status": "up",
+        "master_port": "45879",
+        "role": "slave",
+        "slave_read_only": "1",
+        "slave_repl_offset": "1094"
+      },
+      "role": [
+        "slave",
+        "127.0.0.1",
+        "45879",
+        "online"
+      ]
+    },
+    {
+      "endpoint": "127.0.0.1:41441",
+      "get_response": "Redis: MOVED 42 127.0.0.1:45879",
+      "keyspace": {
+        "db0": "keys=1090,expires=0,hits=0,misses=0,hit_ratio=0.00,avg_ttl=-1"
+      },
+      "node": 13,
+      "polls": 38,
+      "replication": {
+        "master_host": "127.0.0.1",
+        "master_link_status": "up",
+        "master_port": "45879",
+        "role": "slave",
+        "slave_read_only": "1",
+        "slave_repl_offset": "1094"
+      },
+      "role": [
+        "slave",
+        "127.0.0.1",
+        "45879",
+        "online"
+      ]
+    }
+  ],
+  "formal_writes": 1024,
+  "leader": {
+    "connected_slaves": "1",
+    "master_repl_offset": "1094",
+    "role": "master",
+    "slave0": "ip=127.0.0.1,port=38187,state=online,offset=1089,lag=5"
+  },
+  "leader_node": 12,
+  "marker_keys": 2,
+  "queried_at": "2026-11-26T05:52:12.262790828Z",
+  "target_offset": 1094,
+  "warmup_writes": 64
+}

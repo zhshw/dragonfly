@@ -1587,7 +1587,9 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
         static_cast<RedisReplyBuilder*>(cmd->rb())->SendNull();
       return DispatchResult::OK;
     }
-    auto value = raft_data_commands_->Get(cntx->db_index(), args[0]);
+    auto mode = cntx->conn_state.raft_read_only ? cluster::raft::DataReadMode::kAllowFollower
+                                                : cluster::raft::DataReadMode::kLeaderOnly;
+    auto value = raft_data_commands_->Get(cntx->db_index(), args[0], mode);
     if (!value.ok())
       return reject(value.status().message());
     auto* rb = static_cast<RedisReplyBuilder*>(cmd->rb());
@@ -1598,6 +1600,7 @@ optional<DispatchResult> Service::DispatchRaftCommand(const CommandId& cid, cons
     return DispatchResult::OK;
   }
   if (name == "READWRITE" || name == "READONLY") {
+    cntx->conn_state.raft_read_only = name == "READONLY";
     cmd->SendSimpleString("OK");
     return DispatchResult::OK;
   }
@@ -2166,6 +2169,7 @@ void Service::Reset(CmdArgParser, CommandContext* cmd_cntx) {
 
   conn_state.db_index = 0;
   conn_state.raft_last_write.reset();
+  conn_state.raft_read_only = false;
 
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
   rb->SetRespVersion(RespVersion::kResp2);

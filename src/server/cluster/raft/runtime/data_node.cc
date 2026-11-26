@@ -315,7 +315,7 @@ class DataNodeImpl final : public DataNode {
                    DataWritePosition* position) override;
   absl::StatusOr<bool> SetIf(DbIndex db, string_view key, string_view value, SetCondition condition,
                              DataWritePosition* position) override;
-  absl::StatusOr<optional<string>> Get(DbIndex db, string_view key) override;
+  absl::StatusOr<optional<string>> Get(DbIndex db, string_view key, DataReadMode mode) override;
   absl::StatusOr<DataTopology> Topology() override;
   absl::StatusOr<DataReplicationState> ReplicationState() override;
 
@@ -356,7 +356,8 @@ class DataNodeImpl final : public DataNode {
   void BrokerLoop();
   void MigrationLoop();
   void RegisterOrHeartbeat(PeerConnection& peer, const MetadataImage& image, const Broker& broker);
-  absl::StatusOr<RedisRoute> Route(SlotId slot, const LocalPartition* partition) const;
+  absl::StatusOr<RedisRoute> Route(SlotId slot, const LocalPartition* partition,
+                                   DataReadMode mode = DataReadMode::kLeaderOnly) const;
 
   filesystem::path dir_;
   RaftDirectoryIdentity identity_;
@@ -653,7 +654,8 @@ void DataNodeImpl::MigrationLoop() {
     peer->Close();
 }
 
-absl::StatusOr<RedisRoute> DataNodeImpl::Route(SlotId slot, const LocalPartition* partition) const {
+absl::StatusOr<RedisRoute> DataNodeImpl::Route(SlotId slot, const LocalPartition* partition,
+                                               DataReadMode mode) const {
   auto image = image_.load();
   if (stopping_ || !image)
     return ClusterDown();
@@ -663,7 +665,11 @@ absl::StatusOr<RedisRoute> DataNodeImpl::Route(SlotId slot, const LocalPartition
   auto local = image->directory.nodes().find(identity_.node_id);
   if (local == image->directory.nodes().end())
     return ClusterDown();
-  if (route->node_id != local->second)
+  const auto& members = image->directory.groups().at(route->owner.group_id).members;
+  const bool local_read = mode == DataReadMode::kAllowFollower && partition &&
+                          partition->id == route->owner.group_id &&
+                          find(members.begin(), members.end(), identity_.node_id) != members.end();
+  if (route->node_id != local->second && !local_read)
     return absl::FailedPreconditionError(
         absl::StrCat("-MOVED ", slot, " ", route->host, ":", route->port));
   const auto& broker = image->brokers.at(identity_.node_id);
@@ -694,18 +700,22 @@ absl::StatusOr<RedisRoute> DataNodeImpl::Route(SlotId slot, const LocalPartition
   return *route;
 }
 
-absl::StatusOr<optional<string>> DataNodeImpl::Get(DbIndex db, string_view key) {
+absl::StatusOr<optional<string>> DataNodeImpl::Get(DbIndex db, string_view key, DataReadMode mode) {
   auto slot = KeySlot(key);
   auto local = partition_.load();
   if (!local)
     return Route(slot, nullptr).status();
   optional<string> value;
   auto status = local->raft->Visit([&](RaftGroup::State state) {
-    auto route = Route(slot, local.get());
+    auto route = Route(slot, local.get(), mode);
     if (!route.ok())
       return route.status();
     auto hw = state.replication.HighWatermark();
-    if (state.election.state().role != QuorumRole::kLeader || !hw ||
+    const auto& election = state.election.state();
+    const bool follower_read = mode == DataReadMode::kAllowFollower &&
+                               election.role == QuorumRole::kFollower &&
+                               election.fetched_from_leader;
+    if ((election.role != QuorumRole::kLeader && !follower_read) || !hw ||
         local->effects.applied_offset() < *hw)
       return ClusterDown();
     return owner_->Await([&] {

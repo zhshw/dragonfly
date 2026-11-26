@@ -295,7 +295,8 @@ class RaftAdmissionConnectionTest : public DragonflyConnectionTest,
                              raft::DataWritePosition*) override {
     return absl::InternalError("Unexpected conditional SET");
   }
-  absl::StatusOr<std::optional<std::string>> Get(DbIndex, std::string_view) override {
+  absl::StatusOr<std::optional<std::string>> Get(DbIndex, std::string_view,
+                                                 raft::DataReadMode) override {
     return absl::InternalError("Unexpected GET");
   }
 

@@ -106,6 +106,8 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
     ++sets_;
     if (!ready_)
       return absl::UnavailableError("-TRYAGAIN Group has no committed leader");
+    if (!leader_)
+      return absl::FailedPreconditionError("-MOVED 42 127.0.0.1:7002");
     *pos = {10, 3, 8};
     JournalExecutor executor(service_.get());
     return ExecuteSetEffect(executor, {10, db, KeySlot(key), 0, string(key), string(value)});
@@ -125,9 +127,9 @@ class DataDispatchTest : public BaseFamilyTest, public DataCommandHandler {
     return true;
   }
 
-  absl::StatusOr<optional<string>> Get(DbIndex db, string_view key) override {
+  absl::StatusOr<optional<string>> Get(DbIndex db, string_view key, DataReadMode mode) override {
     ++reads_;
-    if (!ready_)
+    if (!ready_ || (!leader_ && mode != DataReadMode::kAllowFollower))
       return absl::UnavailableError("-MOVED 42 127.0.0.1:7002");
     JournalExecutor executor(service_.get());
     return ReadCommittedValue(executor, db, key);
@@ -207,6 +209,36 @@ TEST_F(DataDispatchTest, GateRunsBeforeTransactionsAndBypassesOnlyInternalReplay
   const string binary(2048, '\0');
   EXPECT_EQ(Run({"SET", "k", binary}), "OK");
   EXPECT_EQ(Run({"GET", "k"}).GetString(), binary);
+}
+
+TEST_F(DataDispatchTest, ReadOnlyAllowsFollowerReadsOnlyOnThisConnectionUntilReadWriteOrReset) {
+  ready_ = true;
+  const string binary("value\0\xff", 7);
+  ASSERT_EQ(Run({"SET", "k", binary}), "OK");
+  leader_ = false;
+  auto run = [&](string_view connection, initializer_list<string_view> args) {
+    return Run(connection, facade::ArgSlice{args.begin(), args.size()});
+  };
+  auto moved = facade::ErrArg("MOVED 42 127.0.0.1:7002");
+  EXPECT_THAT(run("reader", {"GET", "k"}), moved);
+  EXPECT_EQ(run("reader", {"READONLY"}), "OK");
+  EXPECT_EQ(run("reader", {"GET", "k"}).GetString(), binary);
+  EXPECT_THAT(run("reader", {"GET", "missing"}), facade::ArgType(facade::RespExpr::NIL));
+  EXPECT_THAT(run("other", {"GET", "k"}), moved);
+  EXPECT_THAT(run("reader", {"SET", "k", "wrong"}), moved);
+  EXPECT_EQ(run("reader", {"GET", "k"}).GetString(), binary);
+  EXPECT_EQ(run("reader", {"READWRITE"}), "OK");
+  EXPECT_THAT(run("reader", {"GET", "k"}), moved);
+  EXPECT_EQ(run("reader", {"READONLY"}), "OK");
+  EXPECT_EQ(run("reader", {"GET", "k"}).GetString(), binary);
+  EXPECT_EQ(run("reader", {"RESET"}), "RESET");
+  EXPECT_THAT(run("reader", {"GET", "k"}), moved);
+
+  // READONLY permits replica reads; it does not prohibit writes on the leader.
+  leader_ = true;
+  EXPECT_EQ(run("reader", {"READONLY"}), "OK");
+  EXPECT_EQ(run("reader", {"SET", "k", "leader value"}), "OK");
+  EXPECT_EQ(run("reader", {"GET", "k"}), "leader value");
 }
 
 TEST_F(DataDispatchTest, ConditionalSetReturnsNullOrOkWithoutOverwritingOnFailure) {
@@ -293,6 +325,8 @@ TEST_F(DataDispatchTest, AsyncSetsSubmitBeforeConfirmationAndKeepBarriers) {
                        {"SET", "same", "conditional", "NX"},
                        {"SET", "same", "conditional", "XX"},
                        {"SELECT", "1"},
+                       {"READONLY"},
+                       {"READWRITE"},
                        {"RESET"},
                        {"AUTH", "password"},
                        {"SET", "bad"},

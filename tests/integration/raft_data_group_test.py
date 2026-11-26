@@ -28,6 +28,7 @@ GROUPS = {10: (11, 12), 20: (21, 22)}
 
 
 class RaftDataGroupFixture(unittest.TestCase):
+    groups = GROUPS
     learner = None
     new_controller = None
     controller_admin = False
@@ -54,7 +55,7 @@ class RaftDataGroupFixture(unittest.TestCase):
                 sock.bind((HOST, 0))
                 return sock.getsockname()[1]
 
-            nodes = [1, 2, 3, 11, 12, 21, 22]
+            nodes = [1, 2, 3, *(node for members in self.groups.values() for node in members)]
             if self.new_controller is not None:
                 nodes.append(self.new_controller)
             if self.learner is not None:
@@ -80,12 +81,12 @@ class RaftDataGroupFixture(unittest.TestCase):
                         options.append("--no-initial-controllers")
                     else:
                         options += ["--initial-controllers", initial_voters((1, 2, 3))]
-                elif self.learner and (node in GROUPS[10] or node == self.learner):
+                elif self.learner and (node in self.groups[10] or node == self.learner):
                     options = [directory(node), "--data-group", "10"]
                     if node == self.learner:
                         options.append("--no-initial-controllers")
                     else:
-                        options += ["--initial-controllers", initial_voters(GROUPS[10])]
+                        options += ["--initial-controllers", initial_voters(self.groups[10])]
                 subprocess.run(
                     [
                         self.bin.with_name("raft_storage"),
@@ -110,7 +111,7 @@ class RaftDataGroupFixture(unittest.TestCase):
             )
 
         groups = []
-        for gid, node_ids in GROUPS.items():
+        for gid, node_ids in self.groups.items():
             start = 0 if gid == 10 else 8192
             members = [entry(node) for node in node_ids]
             if self.learner is not None and gid == 10:
@@ -425,6 +426,86 @@ class RaftDataGroupTest(RaftDataGroupFixture):
             leader = next(n for n in members if self.resp[n] == row[2][1])
             result = probe(leader, "__dragonfly_data", gid, len(members))
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class RaftFollowerReadTest(RaftDataGroupFixture):
+    groups = {10: (11, 12, 13), 20: (21, 22)}
+    data_threads = 4
+
+    def test_readonly_reads_online_and_recovered_followers(self):
+        slots = self.wait_for(self.slots)
+        leader = next(node for node in self.groups[10] if self.resp[node] == slots[0][2][1])
+        followers = [node for node in self.groups[10] if node != leader]
+        key = self.key_for_range(*slots[0][:2])
+        foreign_key = self.key_for_range(*slots[1][:2])
+        values = {b"{" + key + b"}:" + str(i).encode(): bytes([i]) * 32768 for i in range(32)}
+        sample = next(iter(values))
+        missing = b"{" + key + b"}:missing"
+
+        def connect(node):
+            client = redis.Redis(
+                host=HOST, port=self.resp[node], single_connection_client=True, socket_timeout=7
+            )
+            self.addCleanup(client.close)
+            return client
+
+        writer = connect(leader)
+
+        def assert_moved(client, *command, port=self.resp[leader]):
+            with self.assertRaises(redis.exceptions.ResponseError) as rejected:
+                client.execute_command(*command)
+            self.assertIn(f"{HOST}:{port}", str(rejected.exception))
+
+        def verify(node, phase):
+            reader = self.wait_for(lambda: connect(node))
+
+            # Recovery can apply data before the controller accepts the new incarnation.
+            self.wait_for(lambda: reader.execute_command("CLUSTER", "SLOTS"))
+            offset = writer.info("replication")["master_repl_offset"]
+            self.wait_for(lambda: reader.info("replication").get("slave_repl_offset", -1) >= offset)
+            self.assertEqual(reader.info("replication")["master_link_status"], "up")
+            self.assertEqual(reader.execute_command("ROLE")[0], b"slave")
+            assert_moved(reader, "GET", sample)
+            self.assertTrue(reader.execute_command("READONLY"))
+            for name, expected in values.items():
+                self.assertEqual(reader.get(name), expected)
+            self.assertIsNone(reader.get(missing))
+            self.assertTrue(reader.select(1))
+            self.assertEqual(reader.get(sample), b"db-one\x00\xff")
+            self.assertTrue(reader.select(0))
+            assert_moved(connect(node), "GET", sample)
+            assert_moved(reader, "GET", foreign_key, port=slots[1][2][1])
+            assert_moved(reader, "SET", sample, b"wrong")
+            assert_moved(reader, "SET", sample, b"wrong", "XX")
+            self.assertEqual(reader.get(sample), values[sample])
+            self.assertTrue(reader.execute_command("READWRITE"))
+            assert_moved(reader, "GET", sample)
+            self.assertTrue(reader.execute_command("READONLY"))
+            self.assertEqual(reader.execute_command("RESET"), "RESET")
+            assert_moved(reader, "GET", sample)
+            self.assertEqual(reader.execute_command("ROLE")[0], b"slave")
+            self.assertEqual(writer.execute_command("ROLE")[0], b"master")
+            print(
+                f"{phase}: follower {node}, offset {offset}, {len(values)} values verified",
+                flush=True,
+            )
+
+        for name, value in values.items():
+            self.assertTrue(writer.set(name, value))
+        self.assertTrue(writer.select(1))
+        self.assertTrue(writer.set(sample, b"db-one\x00\xff"))
+        self.assertTrue(writer.select(0))
+        for follower in followers:
+            verify(follower, "online")
+
+        # The remaining two voters keep serving writes while this follower is offline.
+        self.stop(followers[1], crash=True)
+        for name in values:
+            values[name] += b"\x00after-restart\xff"
+            self.assertTrue(writer.set(name, values[name]))
+        verify(followers[0], "online after writes")
+        self.start(followers[1])
+        verify(followers[1], "recovered")
 
 
 class RaftPipelineTest(RaftDataGroupFixture):
@@ -783,6 +864,10 @@ class ControllerAdminTest(RaftDataGroupFixture):
         frozen_cut = describe(self.raft[source_leader], b"__dragonfly_data", 10).hw
         for member in GROUPS[10]:
             self.wait_for(lambda: self.retained_checkpoint(member, 10, frozen_cut))
+        with redis.Redis(host=HOST, port=slots[0][3][1], single_connection_client=True) as replica:
+            self.assertTrue(replica.execute_command("READONLY"))
+            assert_frozen(replica, "GET", keys[0])
+            self.assertEqual(replica.get(neighbor), b"written while frozen")
         for member in GROUPS[10]:
             self.stop(member, crash=True)
         for member in GROUPS[10]:
@@ -833,8 +918,18 @@ class ControllerAdminTest(RaftDataGroupFixture):
                 for key, payload in zip(keys, values):
                     self.assertEqual(target.get(key), payload)
                 self.assertEqual(target.get(request_key), b"business value")
+                target_offset = target.info("replication")["master_repl_offset"]
             with redis.Redis(host=HOST, port=target_port, db=1) as target:
                 self.assertEqual(target.get(keys[0]), b"db1\x00\xff")
+            with redis.Redis(
+                host=HOST, port=routes[1][3][1], single_connection_client=True
+            ) as replica:
+                self.assertTrue(replica.execute_command("READONLY"))
+                self.wait_for(
+                    lambda: replica.info("replication")["slave_repl_offset"] >= target_offset
+                )
+                for key, payload in zip(keys, values):
+                    self.assertEqual(replica.get(key), payload)
             return target_port
 
         new_key = b"{12561}:after-cutover"

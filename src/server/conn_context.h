@@ -347,6 +347,9 @@ struct ConnectionState {
   std::optional<cluster::raft::DataWritePosition> raft_last_write;
   std::shared_ptr<cluster::raft::trace::Admission> raft_admission;
 
+  // READONLY permits local follower reads; writes still follow the leader route.
+  bool raft_read_only = false;
+
   ExecInfo exec_info;
   ReplicationInfo replication_info;
 
