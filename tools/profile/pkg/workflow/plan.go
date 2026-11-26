@@ -11,32 +11,19 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
-
-	"dragonflydb.io/profile/pkg/langfuse"
 )
-
-const observe = "tools/raft-observability/"
 
 func plan(c Config) []Step {
 	var steps []Step
 	if c.Baseline != "" {
 		steps = append(steps, Step{"baseline", func(r *Runner, rec *Record) ([]string, error) {
+			if c.Diagnostics {
+				if err := requireNativeBuild(c.Baseline); err != nil {
+					return nil, err
+				}
+			}
 			return copyFiles(c.Baseline, rec.Dir, "dragonfly", "raft_storage")
-		}})
-	}
-	if c.Diagnostics && c.Baseline != "" {
-		steps = append(steps, Step{"baseline-probe", func(r *Runner, rec *Record) ([]string, error) {
-			if err := verifyProbe(c.BaselineProbe, r.dir("baseline")); err != nil {
-				return nil, err
-			}
-			files, err := copyFiles(c.BaselineProbe, rec.Dir, "dragonfly", "sources.json")
-			if err != nil {
-				return nil, err
-			}
-			storage := filepath.Join(rec.Dir, "raft_storage")
-			return append(files, storage), copyFile(filepath.Join(r.dir("baseline"), "raft_storage"), storage)
 		}})
 	}
 	for i, v := range c.Validation {
@@ -77,20 +64,24 @@ func plan(c Config) []Step {
 			if err := r.command(nil, "ninja", "-C", c.Release, fmt.Sprintf("-j%d", c.Jobs), "dragonfly", "raft_storage"); err != nil {
 				return nil, err
 			}
+			if c.Diagnostics {
+				if err := requireNativeBuild(c.Release); err != nil {
+					return nil, err
+				}
+			}
 			return copyFiles(c.Release, rec.Dir, "dragonfly", "raft_storage")
 		}},
 		Step{"compare", func(r *Runner, rec *Record) ([]string, error) {
+			if err := requireBenchmarkSource(c.Repo); err != nil {
+				return nil, err
+			}
 			workload := BenchmarkWorkload()
-			args := []string{"--build-dir", r.dir("candidate"),
-				"--ack-mode", workload.Ack, "--clients", strconv.Itoa(workload.Clients),
-				"--pipeline-depth", strconv.Itoa(workload.Depth), "--output-dir", rec.Dir}
+			options := benchmarkOptions{build: r.dir("candidate"), ack: workload.Ack,
+				clients: workload.Clients, depth: workload.Depth, output: rec.Dir, cluster: c.IncludeCluster}
 			if c.Baseline != "" {
-				args = append(args, "--baseline-build", r.dir("baseline"))
+				options.baseline = r.dir("baseline")
 			}
-			if c.IncludeCluster {
-				args = append(args, "--include-cluster")
-			}
-			if err := r.python("tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py", args...); err != nil {
+			if err := runBenchmark(r.Ctx, options, r.Log); err != nil {
 				return nil, err
 			}
 			if _, err := ReadComparison(rec.Dir); err != nil {
@@ -99,54 +90,27 @@ func plan(c Config) []Step {
 			return artifactFiles(rec.Dir)
 		}})
 	if c.Diagnostics {
-		steps = append(steps, Step{"candidate-probe", func(r *Runner, rec *Record) ([]string, error) {
-			if err := r.python(observe+"prepare.py", "--build-dir", c.Release, "--skip-build", "--output", rec.Dir); err != nil {
-				return nil, err
-			}
-			if err := verifyProbe(rec.Dir, r.dir("candidate")); err != nil {
-				return nil, err
-			}
-			storage := filepath.Join(rec.Dir, "raft_storage")
-			if err := os.Remove(storage); err != nil {
-				return nil, err
-			}
-			if err := copyFile(filepath.Join(r.dir("candidate"), "raft_storage"), storage); err != nil {
-				return nil, err
-			}
-			return artifactFiles(rec.Dir)
-		}})
 		for _, variant := range observedVariants(c) {
 			steps = append(steps, Step{"observe-" + variant, func(r *Runner, rec *Record) ([]string, error) {
-				probe, mode := "candidate-probe", "memory"
-				if variant == "before" {
-					probe = "baseline-probe"
-				} else if variant == "cluster" {
-					mode = "cluster"
-				}
-				run := observationDir(c, rec, variant)
-				if err := r.python(observe+"collect.py", "--binary", filepath.Join(r.dir(probe), "dragonfly"),
-					"--output", run, "--mode", mode, "--profiler", c.Profiler); err != nil {
-					return nil, err
-				}
-				return artifactFiles(run)
+				return r.observe(rec, variant)
 			}})
 			steps = append(steps, Step{"report-" + variant, func(r *Runner, rec *Record) ([]string, error) {
 				run := observationDir(c, r.State.Steps["observe-"+variant], variant)
 				ctx, cancel := context.WithTimeout(r.Ctx, time.Duration(c.Timeout)*time.Minute)
 				defer cancel()
-				out := filepath.Join(run, "report")
-				if err := generateReport(ctx, run, out, ReportOptions{Go: c.Go, Flamegraph: c.Flamegraph}, r.Log); err != nil {
+				if err := nativeReport(ctx, c, run, rec.Dir, r.Log); err != nil {
 					return nil, err
 				}
-				return artifactFiles(out)
+				return artifactFiles(rec.Dir)
 			}})
 		}
 	}
+
 	steps = append(steps, Step{"summarize", func(r *Runner, rec *Record) ([]string, error) {
 		reports := map[string]string{}
 		if c.Diagnostics {
 			for _, variant := range observedVariants(c) {
-				reports[variant] = filepath.Join(observationDir(c, r.State.Steps["observe-"+variant], variant), "report")
+				reports[variant] = r.dir("report-" + variant)
 			}
 		}
 		if err := summarize(r.dir("compare"), reports["before"], reports["after"], reports["cluster"], rec.Dir, r.Log); err != nil {
@@ -154,35 +118,6 @@ func plan(c Config) []Step {
 		}
 		return artifactFiles(rec.Dir)
 	}})
-	if c.Publish {
-		for _, variant := range observedVariants(c) {
-			steps = append(steps, Step{"publish-" + variant, func(r *Runner, rec *Record) ([]string, error) {
-				run := observationDir(c, r.State.Steps["observe-"+variant], variant)
-				ctx, cancel := context.WithTimeout(r.Ctx, time.Duration(c.Timeout)*time.Minute)
-				defer cancel()
-				var config langfuse.Config
-				if c.Langfuse != nil {
-					config = *c.Langfuse
-				}
-				receipt, err := langfuse.Import(ctx, run, config)
-				if err != nil {
-					return nil, err
-				}
-				path := filepath.Join(run, "report", "langfuse.json")
-				if err := atomicJSON(path, receipt); err != nil {
-					return nil, err
-				}
-				if err := os.Chmod(path, 0644); err != nil {
-					return nil, err
-				}
-				fmt.Fprintf(r.Log, "Langfuse verified %d observations, %s\n", receipt.Verified, receipt.URL)
-				if err := r.python(observe+"publish.py", "--run", run); err != nil {
-					return nil, err
-				}
-				return []string{path, rec.Log}, nil
-			}})
-		}
-	}
 	return steps
 }
 
@@ -198,24 +133,7 @@ func observedVariants(c Config) []string {
 	return variants
 }
 
-func verifyProbe(probe, baseline string) error {
-	var sources map[string]string
-	if err := readJSON(filepath.Join(probe, "sources.json"), &sources); err != nil {
-		return err
-	}
-	for key, path := range map[string]string{"baseline": filepath.Join(baseline, "dragonfly"), "probe": filepath.Join(probe, "dragonfly")} {
-		hash, err := hashFile(path)
-		if err != nil {
-			return err
-		}
-		if sources[key] != hash {
-			return fmt.Errorf("probe %s hash mismatch: %s", key, probe)
-		}
-	}
-	return nil
-}
-
-// The publisher uses the directory basename as its public ID. Include experiment and variant.
+// Each workload attempt owns a distinct capture; report retries keep the completed capture.
 func observationDir(c Config, rec *Record, variant string) string {
 	hash := sha256.Sum256([]byte(c.Output))
 	return filepath.Join(rec.Dir, fmt.Sprintf("%s-%s-%x-a%d", filepath.Base(c.Output), variant, hash[:4], rec.Attempt))

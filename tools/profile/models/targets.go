@@ -62,8 +62,9 @@ func (c Comparisons) allows(ids ChoiceIDs) bool {
 }
 
 type TargetComparison struct {
-	Target Target          `json:"target"`
-	Result *RelativeChange `json:"result,omitempty"`
+	Target  Target          `json:"target"`
+	Result  *RelativeChange `json:"result,omitempty"`
+	Warning string          `json:"warning,omitempty"`
 }
 
 type RelativeChange struct {
@@ -98,14 +99,9 @@ func (s Summary) CheckWorkflow(repo string) error {
 	if s.Workload != workloadFromRow(workflow.BenchmarkWorkload()) {
 		return fmt.Errorf("%w: 所选对照与执行机的 Raft memory benchmark 负载不一致", ErrInvalid)
 	}
-	harness, err := workflow.HarnessSHA(repo)
-	if err != nil {
-		return err
-	}
-	if s.Harness != harness {
-		return fmt.Errorf("%w: 所选对照与执行机的 benchmark 脚本版本不一致", ErrInvalid)
-	}
-	return nil
+	// The run records its own harness identity; references may use an older implementation.
+	_, err := workflow.HarnessSHA(repo)
+	return err
 }
 
 func (s Store) Targets() ([]Target, error) {
@@ -265,10 +261,10 @@ func selectTargets(ids ChoiceIDs, list func() ([]Target, error)) (Comparisons, e
 	if base.Mode != "raft" || base.Ack != "memory" {
 		return choices, fmt.Errorf("%w: 基线需要使用 Raft memory 的正式结果", ErrInvalid)
 	}
-	if base.Harness != ref.Harness || !base.Workload.matches(ref.Workload) {
+	if !base.Workload.matches(ref.Workload) {
 		return choices, fmt.Errorf("%w: 基线与对比参照的负载或测试口径不同", ErrInvalid)
 	}
-	if prev := choices.Previous; prev != nil && (prev.Target.Harness != base.Harness || !prev.Target.Workload.matches(base.Workload)) {
+	if prev := choices.Previous; prev != nil && !prev.Target.Workload.matches(base.Workload) {
 		return choices, fmt.Errorf("%w: 上一轮基线与基线的负载或测试口径不同", ErrInvalid)
 	}
 	return choices, nil
@@ -280,13 +276,28 @@ func (c *Comparisons) measure(workload Workload, harness string, current workflo
 			continue
 		}
 		target := comparison.Target
-		if target.Harness != harness || !workload.matches(target.Workload) {
+		if !workload.matches(target.Workload) {
 			return fmt.Errorf("%w: 本轮与 %s 的负载或测试口径不同", ErrInvalid, target.Title)
 		}
-		rate := current.Rate.Median / target.Metrics.Rate.Median
-		comparison.Result = &RelativeChange{100 * (rate - 1), 100 * (current.P95.Median/target.Metrics.P95.Median - 1), 100 * rate}
+		comparison.setResult(workload, harness, current)
 	}
 	return nil
+}
+
+func (c *TargetComparison) setResult(workload Workload, harness string, current workflow.Metrics) {
+	c.Result, c.Warning = nil, ""
+	switch {
+	case !workload.matches(c.Target.Workload):
+		c.Warning = "负载参数不同，差值仅供参考"
+	case harness == "" || harness != c.Target.Harness:
+		c.Warning = "压测版本不同，差值仅供参考"
+	}
+	if c.Target.Metrics.Rate.Median <= 0 || c.Target.Metrics.P95.Median <= 0 {
+		c.Warning = "对照结果不足，无法计算差值"
+		return
+	}
+	rate := current.Rate.Median / c.Target.Metrics.Rate.Median
+	c.Result = &RelativeChange{100 * (rate - 1), 100 * (current.P95.Median/c.Target.Metrics.P95.Median - 1), 100 * rate}
 }
 
 func draftRecord(in CreateRequest, list func() ([]Target, error)) (Record, error) {

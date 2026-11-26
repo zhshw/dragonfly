@@ -17,12 +17,12 @@ import (
 	"strings"
 
 	"dragonflydb.io/profile/models"
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
-func Handler(store models.Repository, web fs.FS, executor http.Handler, native ...langfuse.Config) http.Handler {
+func Handler(store models.Repository, web fs.FS, executor http.Handler, native ...otel.NativeConfig) http.Handler {
 	api := http.NewServeMux()
-	var traceConfig langfuse.Config
+	var traceConfig otel.NativeConfig
 	if len(native) > 0 {
 		traceConfig = native[0]
 	}
@@ -90,6 +90,26 @@ func Handler(store models.Repository, web fs.FS, executor http.Handler, native .
 	api.HandleFunc("GET /api/v1/experiments/{id}", withExperiment(store, func(w http.ResponseWriter, _ *http.Request, rec models.Record) {
 		writeJSON(w, http.StatusOK, rec.Detail)
 	}))
+	api.HandleFunc("PUT /api/v1/experiments/{id}/comparisons", func(w http.ResponseWriter, r *http.Request) {
+		media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || media != "application/json" {
+			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "请提交 JSON"})
+			return
+		}
+		var request models.ChoiceIDs
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "对照配置不是有效的 JSON"})
+			return
+		}
+		summary, err := store.SetComparisons(r.Context(), r.PathValue("id"), request)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, summary)
+	})
 	api.HandleFunc("GET /api/v1/experiments/{id}/diagnostic-comparison", withExperiment(store, func(w http.ResponseWriter, _ *http.Request, rec models.Record) {
 		comparison, err := models.CompareDiagnostics(rec, store.Get)
 		if err != nil {

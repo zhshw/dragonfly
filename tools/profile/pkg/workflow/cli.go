@@ -15,7 +15,7 @@ import (
 	"regexp"
 	"strings"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 type Validation struct {
@@ -26,22 +26,24 @@ type Validation struct {
 }
 
 type Config struct {
-	Repo           string           `json:"repo"`
-	Output         string           `json:"output"`
-	Baseline       string           `json:"baseline_build,omitempty"`
-	Release        string           `json:"release_build"`
-	Validation     []Validation     `json:"validation"`
-	Diagnostics    bool             `json:"diagnostics"`
-	IncludeCluster bool             `json:"include_cluster,omitempty"`
-	BaselineProbe  string           `json:"baseline_probe,omitempty"`
-	Profiler       string           `json:"profiler,omitempty"`
-	Go             string           `json:"go,omitempty"`
-	Flamegraph     string           `json:"flamegraph_dir,omitempty"`
-	Publish        bool             `json:"publish,omitempty"`
-	Langfuse       *langfuse.Config `json:"langfuse,omitempty"`
-	ExtraInputs    []string         `json:"extra_inputs,omitempty"`
-	Jobs           int              `json:"jobs,omitempty"`
-	Timeout        int              `json:"timeout_minutes,omitempty"`
+	Repo           string       `json:"repo"`
+	Output         string       `json:"output"`
+	Baseline       string       `json:"baseline_build,omitempty"`
+	Release        string       `json:"release_build"`
+	Validation     []Validation `json:"validation"`
+	Diagnostics    bool         `json:"diagnostics"`
+	IncludeCluster bool         `json:"include_cluster,omitempty"`
+	Experiment     string       `json:"experiment_id,omitempty"`
+	Profiler       string       `json:"profiler,omitempty"`
+	Go             string       `json:"go,omitempty"`
+	Flamegraph     string       `json:"flamegraph_dir,omitempty"`
+
+	// Publish is accepted for existing executor configs; native traces always export on shutdown.
+	Publish     bool                 `json:"publish,omitempty"`
+	Langfuse    *otel.LangfuseConfig `json:"langfuse,omitempty"`
+	ExtraInputs []string             `json:"extra_inputs,omitempty"`
+	Jobs        int                  `json:"jobs,omitempty"`
+	Timeout     int                  `json:"timeout_minutes,omitempty"`
 }
 
 func readJSON(path string, value any) error {
@@ -89,7 +91,7 @@ func LoadConfig(path string) (Config, error) {
 		return p
 	}
 	c.Output, c.Baseline, c.Release = resolve(c.Output), resolve(c.Baseline), resolve(c.Release)
-	c.BaselineProbe, c.Profiler, c.Flamegraph = resolve(c.BaselineProbe), resolve(c.Profiler), resolve(c.Flamegraph)
+	c.Profiler, c.Flamegraph = resolve(c.Profiler), resolve(c.Flamegraph)
 	if c.Langfuse != nil {
 		c.Langfuse.EnvFile = resolve(c.Langfuse.EnvFile)
 	}
@@ -129,13 +131,34 @@ func LoadConfig(path string) (Config, error) {
 	for i, p := range c.ExtraInputs {
 		c.ExtraInputs[i] = resolve(p)
 	}
-	if c.Diagnostics && (c.Profiler == "" || c.Flamegraph == "" || (c.Baseline != "" && c.BaselineProbe == "")) {
-		return c, errors.New("diagnostics requires profiler and flamegraph_dir, with baseline_probe for a baseline_build")
+	if c.Diagnostics && (c.Profiler == "" || c.Flamegraph == "") {
+		return c, errors.New("diagnostics requires profiler and flamegraph_dir")
 	}
 	if c.Publish && !c.Diagnostics {
 		return c, errors.New("publish requires diagnostics")
 	}
+	if c.Diagnostics {
+		for _, variant := range observedVariants(c) {
+			if _, err := traceExperiment(c, variant); err != nil {
+				return c, err
+			}
+		}
+	}
 	return c, nil
+}
+
+func traceExperiment(c Config, variant string) (string, error) {
+	id := c.Experiment
+	if id == "" {
+		id = filepath.Base(c.Output)
+	}
+	if variant == "before" {
+		id += "-baseline"
+	}
+	if !regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`).MatchString(id) {
+		return "", errors.New("set experiment_id to a lowercase experiment slug (1-64 characters, including the baseline suffix)")
+	}
+	return id, nil
 }
 
 func CLI(ctx context.Context, args []string) error {
@@ -144,6 +167,8 @@ func CLI(ctx context.Context, args []string) error {
 	}
 	f := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
+	case "benchmark":
+		return benchmarkCLI(ctx, f, args[1:])
 	case "plan", "run":
 		file := f.String("config", "", "experiment JSON; relative paths use repo")
 		resume := f.Bool("resume", false, "verify inputs and skip completed steps")
@@ -192,7 +217,7 @@ func CLI(ctx context.Context, args []string) error {
 		}
 		return nil
 	case "summarize":
-		compare := f.String("compare", "", "completed pipeline_compare output")
+		compare := f.String("compare", "", "completed benchmark output")
 		before := f.String("before", "", "baseline report directory")
 		after := f.String("after", "", "candidate report directory")
 		cluster := f.String("cluster", "", "original cluster report directory")
@@ -204,25 +229,6 @@ func CLI(ctx context.Context, args []string) error {
 			return errors.New("summarize requires -compare and -out")
 		}
 		return summarize(*compare, *before, *after, *cluster, *out, os.Stdout)
-	case "report":
-		run := f.String("run", "", "raw diagnostic collection directory")
-		out := f.String("out", "", "new report directory; defaults to RUN/report")
-		goBin := f.String("go", "go", "Go executable for pprof")
-		flamegraph := f.String("flamegraph-dir", "", "directory containing flamegraph.pl")
-		if err := f.Parse(args[1:]); err != nil {
-			return err
-		}
-		if f.NArg() != 0 || *run == "" {
-			return errors.New("report requires -run DIR")
-		}
-		if *out == "" {
-			*out = filepath.Join(*run, "report")
-		}
-		if err := generateReport(ctx, *run, *out, ReportOptions{Go: *goBin, Flamegraph: *flamegraph}, os.Stderr); err != nil {
-			return err
-		}
-		fmt.Println(*out)
-		return nil
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}

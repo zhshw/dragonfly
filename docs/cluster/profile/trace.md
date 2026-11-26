@@ -13,7 +13,7 @@ Raft C++ → 有界内存缓冲与延后定稿 → OTEL trace exporter → Langf
 - [trace.h / trace.cc](../../../src/server/cluster/raft/trace.h) 定义事件、属性及计算边界；[otel](../../../src/server/cluster/raft/otel) 负责标准 traces 编码与发送。
 - 请求 wait、overlap、bytes、counts 在 C++ 完成处计算一次。查询层读取已存属性，过滤、排序和关联证据；事件耗时使用自身起止边界，不重新配对生成请求数值。
 - Langfuse 保存 Trace，Profile PostgreSQL 管理实验和 capture 引用，无需 CSV、timeline JSON 或中间导入步骤。
-- CLI 和 Web 均调用 `/api/v1/experiments/{id}/captures`、`/requests`、`/events`，共用 `pkg/httpapi` → `pkg/langfuse.QueryNative/RankNative` 和同一 DTO。
+- CLI 和 Web 均调用 `/api/v1/experiments/{id}/captures`、`/requests`、`/events`，共用 `pkg/httpapi` → `pkg/otel` 的查询、校验、排序和 DTO。
 
 ## 名称、单位与关联
 

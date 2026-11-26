@@ -11,8 +11,7 @@ memory 取消逐轮持久化确认后，未插桩吞吐只提高 4.4%。此次�
 - [raft.memory Langfuse trace](http://172.31.23.2:3007/project/dragonfly-performance/traces/7833a94e00d55cfabb8ab8758766240c)
 - [原 cluster Langfuse trace](http://172.31.23.2:3007/project/dragonfly-performance/traces/ed28fa05c47550fcbf81e9fb9bf592bc)
 
-服务监听 `0.0.0.0:3007` / `0.0.0.0:3137`；部署、登录和复现方法见
-[工具说明](../../tools/raft-observability/README.md)。持久数据在 `/data`，原 NTFS 和已有文件保留。
+启动方法见 [Profile 工具说明](../../tools/profile/README.md#启动)。
 
 ## 负载与证据
 

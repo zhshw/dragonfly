@@ -4,6 +4,7 @@
 package models
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 	"regexp"
 	"sort"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 	"dragonflydb.io/profile/pkg/workflow"
 )
 
@@ -120,7 +121,7 @@ type Observation struct {
 	Variant     string            `json:"variant"`
 	Flamegraphs map[string]string `json:"flamegraphs"`
 	Timeline    string            `json:"timeline"`
-	Stages      []langfuse.Stage  `json:"stages"`
+	Stages      []otel.Stage      `json:"stages"`
 }
 
 type Detail struct {
@@ -148,6 +149,7 @@ type Repository interface {
 	Get(string) (Record, error)
 	Targets() ([]Target, error)
 	Create(CreateRequest) (Summary, error)
+	SetComparisons(context.Context, string, ChoiceIDs) (Summary, error)
 	ArtifactFor(string, string) (string, error)
 	Measurement(string, string) (json.RawMessage, error)
 	Trace(string, TraceQuery) (TracePage, error)

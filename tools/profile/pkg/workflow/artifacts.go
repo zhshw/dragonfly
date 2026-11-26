@@ -23,7 +23,6 @@ func StepNames(config Config) []string {
 type Artifacts struct {
 	Compare        string
 	Report         string
-	ProbeSources   string
 	ValidationLogs []string
 }
 
@@ -36,15 +35,14 @@ func CurrentArtifacts(output string) (Artifacts, error) {
 	if state.Status != "done" {
 		return files, errors.New("workflow is incomplete")
 	}
-	for _, name := range []string{"compare", "candidate-probe", "observe-after", "report-after", "publish-after"} {
+	for _, name := range []string{"compare", "observe-after", "report-after"} {
 		step := state.Steps[name]
 		if step == nil || step.Status != "done" || step.Dir == "" {
 			return files, fmt.Errorf("workflow step %s is incomplete", name)
 		}
 	}
 	files.Compare = state.Steps["compare"].Dir
-	files.ProbeSources = filepath.Join(state.Steps["candidate-probe"].Dir, "sources.json")
-	files.Report = filepath.Join(observationDir(state.Config, state.Steps["observe-after"], "after"), "report")
+	files.Report = state.Steps["report-after"].Dir
 	for i := range state.Config.Validation {
 		name := fmt.Sprintf("validate-%02d", i+1)
 		step := state.Steps[name]

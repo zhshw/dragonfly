@@ -14,12 +14,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	"dragonflydb.io/profile/models"
-	"dragonflydb.io/profile/pkg/langfuse"
 	"dragonflydb.io/profile/pkg/trace"
 	"dragonflydb.io/profile/pkg/workflow"
 )
@@ -208,25 +206,13 @@ func diagnosticCLI(ctx context.Context, command string, f *flag.FlagSet, args []
 }
 
 func verifyTrace(ctx context.Context, run string, asJSON bool) error {
-	files, err := workflow.CurrentArtifacts(run)
-	if err != nil {
-		return err
-	}
-	state, err := workflow.ReadState(run)
-	if err != nil {
-		return err
-	}
-	var config langfuse.Config
-	if state.Config.Langfuse != nil {
-		config = *state.Config.Langfuse
-	}
-	receipt, err := langfuse.Verify(ctx, filepath.Dir(files.Report), config)
+	receipt, err := workflow.VerifyCapture(ctx, run)
 	if err != nil {
 		return err
 	}
 	if asJSON {
 		return json.NewEncoder(os.Stdout).Encode(receipt)
 	}
-	fmt.Printf("%d events, %d Langfuse observations verified\n%s\n", receipt.FullSpans, receipt.Verified, receipt.URL)
+	fmt.Printf("Capture %s: %d events verified\n", receipt.ID, receipt.Events)
 	return nil
 }

@@ -93,7 +93,7 @@ v14、v14b 和 v15 使用同一个 benchmark 脚本和负载。三轮正式结�
 
 ## shard 诊断与收益边界
 
-下表使用 v15 首次独立插桩运行的计时窗口。时间是各阶段在该节点上的区间并集，阶段之间有重叠。`shard_run` 包含事务执行和可能的锁等待。`shard_queue` 从投递 L2 计到回调开始，包含入队反压。`shard_run.arg0` 记录该段笔数，`arg1` 为 key 加 value 的字节数。 [采集口径](../../../tools/raft-observability/README.md) · [v15 首次诊断](http://172.31.23.2:3137/v15-run-001-after-8e13ac49-a1/index.html)
+下表使用 v15 首次独立插桩运行的计时窗口。时间是各阶段在该节点上的区间并集，阶段之间有重叠。`shard_run` 包含事务执行和可能的锁等待。`shard_queue` 从投递 L2 计到回调开始，包含入队反压。`shard_run.arg0` 记录该段笔数，`arg1` 为 key 加 value 的字节数。 [工具说明](../../../tools/profile/README.md) · [v15 首次诊断](http://172.31.23.2:3137/v15-run-001-after-8e13ac49-a1/index.html)
 
 | 标准负载的 1024 笔 SET | Leader | Follower |
 | --- | ---: | ---: |

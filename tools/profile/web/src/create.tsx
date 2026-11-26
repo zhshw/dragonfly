@@ -6,7 +6,7 @@ import type { Summary, Target } from './model';
 
 function compatible(base: Target, target: Target) {
   const keys = ['clients', 'pipeline_depth', 'payload_mib', 'value_kib', 'warmup_writes', 'settle_seconds', 'rounds_per_variant'] as const;
-  return base.harness_sha256 === target.harness_sha256 && keys.every((key) => base.workload[key] === target.workload[key]);
+  return keys.every((key) => base.workload[key] === target.workload[key]);
 }
 
 export function TargetDetails({ target }: { target: Target }) {

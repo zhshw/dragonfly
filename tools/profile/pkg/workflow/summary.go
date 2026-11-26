@@ -11,33 +11,14 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+
+	"dragonflydb.io/profile/pkg/benchmark"
 )
 
-type BenchRow struct {
-	Order      int     `json:"run_order,omitempty"`
-	Trial      int     `json:"trial,omitempty"`
-	Variant    string  `json:"variant,omitempty"`
-	Mode       string  `json:"mode"`
-	Ack        string  `json:"ack_mode,omitempty"`
-	Clients    int     `json:"clients"`
-	Depth      int     `json:"pipeline_depth"`
-	Payload    int     `json:"payload_mib"`
-	Keys       int     `json:"keys"`
-	Warmup     int     `json:"warmup_writes"`
-	Settle     float64 `json:"settle_seconds"`
-	Rate       float64 `json:"replication_mib_per_s"`
-	SetRate    float64 `json:"mib_per_s"`
-	Tail       float64 `json:"replication_tail_ms"`
-	P95        float64 `json:"pipeline_batch_p95_ms"`
-	Confirmed  int     `json:"confirmed_replicas"`
-	RecoveryMS float64 `json:"restart_to_wait_two_ms"`
-	Readback   int     `json:"readback_node"`
-	Start      int64   `json:"measure_start_ns"`
-	WriteEnd   int64   `json:"measure_end_ns"`
-	End        int64   `json:"replication_end_ns"`
-}
+type BenchRow benchmark.Result
 
 type BuildInfo struct {
 	SHA  string `json:"sha256"`
@@ -46,6 +27,7 @@ type BuildInfo struct {
 }
 
 type Environment struct {
+	Runner   string               `json:"runner,omitempty"`
 	Builds   map[string]BuildInfo `json:"builds"`
 	Harness  string               `json:"harness_sha256"`
 	Metric   string               `json:"primary_metric"`
@@ -168,11 +150,17 @@ func (c *Comparison) readVariant(name string) (map[int]BenchRow, error) {
 		if row.Ack != build.Ack || row.Mode != build.Mode {
 			return nil, errors.New("mixed acknowledgement/cluster mode")
 		}
-		// The existing harness checks WAIT 2 and all values after printing its timing row.
+		// The Go runner writes its receipt only after recovery, readback and shutdown succeed.
 		log := filepath.Join(c.Path, row.LogName())
 		data, err := os.ReadFile(log)
-		if err != nil || !strings.HasSuffix(strings.TrimSpace(string(data)), "\nOK") {
-			return nil, fmt.Errorf("missing successful recovery/readback unittest log: %s", log)
+		if c.Environment.Runner == "go" {
+			var receipt BenchRow
+			path := filepath.Join(c.Path, strings.TrimSuffix(row.LogName(), ".log"), "result.json")
+			if err != nil || readJSON(path, &receipt) != nil || !reflect.DeepEqual(receipt, row) {
+				return nil, fmt.Errorf("missing or inconsistent completed benchmark receipt: %s", path)
+			}
+		} else if c.Environment.Runner != "" || err != nil || !strings.HasSuffix(strings.TrimSpace(string(data)), "\nOK") {
+			return nil, fmt.Errorf("missing successful legacy recovery/readback log: %s", log)
 		}
 		trials[row.Trial] = row
 	}
@@ -242,7 +230,7 @@ func BenchmarkWorkload() BenchRow {
 }
 
 func HarnessSHA(repo string) (string, error) {
-	return hashFile(filepath.Join(repo, "tests/integration/replication_comparison_test.py"))
+	return benchmark.HarnessSHA(repo)
 }
 
 // ReadComparison validates current and any explicitly included comparison builds.
@@ -353,6 +341,13 @@ func summarize(compare, before, after, cluster, out string, output io.Writer) er
 				return fmt.Sprintf("%d / %d", d.Nodes["leader"].StartsDuringFsync, d.Nodes["follower"].StartsDuringFsync)
 			}},
 		}
+		native := false
+		for _, d := range c.Diagnostics {
+			native = native || d.Native
+		}
+		if native {
+			rows = rows[:3]
+		}
 		for _, row := range rows {
 			fmt.Fprintf(&md, "| %s |", row.label)
 			for _, name := range []string{"baseline", "candidate", "cluster"} {
@@ -364,7 +359,12 @@ func summarize(compare, before, after, cluster, out string, output io.Writer) er
 			}
 			fmt.Fprintln(&md)
 		}
-		fmt.Fprintln(&md, "\n诊断使用全部事件，无丢失；CPU 来自采样。阶段区间有重叠，不能相加；单次诊断不能证明吞吐收益。")
+		fmt.Fprintln(&md, "\nCPU 来自独立诊断采样；单次诊断不能证明吞吐收益。")
+		for _, name := range []string{"baseline", "candidate"} {
+			if id := c.Diagnostics[name].CaptureID; id != "" {
+				fmt.Fprintf(&md, "\n%s Trace capture: %s\n", name, id)
+			}
+		}
 	}
 	fmt.Fprintln(&md, "\n完整指标、哈希与各角色 CPU top 在 summary.json；保留/回退仍需结合正确性与实验波动判断。")
 	if err := os.MkdirAll(filepath.Dir(out), 0755); err != nil {

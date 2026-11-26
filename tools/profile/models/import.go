@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 	"dragonflydb.io/profile/pkg/workflow"
 )
 
@@ -49,7 +49,7 @@ func WorkflowArchive(id, output string) (ImportConfig, error) {
 	return ImportConfig{
 		Experiment: Label{ID: id}, Compare: files.Compare, ValidationLogs: files.ValidationLogs,
 		Diagnostics: map[string]DiagnosticSource{
-			"current": {Report: files.Report, Sources: files.ProbeSources, RequireTrace: true},
+			"current": {Report: files.Report, RequireTrace: true},
 		},
 	}, nil
 }
@@ -441,6 +441,11 @@ func newRun(id, kind, variant, log string, row workflow.BenchRow) Run {
 }
 
 func (r *Record) importDiagnostic(dest, variant string, source DiagnosticSource, env workflow.Environment) error {
+	if report, err := workflow.ReadNativeDiagnostic(source.Report); err == nil {
+		return r.importNativeDiagnostic(dest, variant, source.Report, report, env)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if source.Report == "" || source.Sources == "" {
 		return errors.New("report and probe_sources are required for a diagnostic")
 	}
@@ -481,7 +486,7 @@ func (r *Record) importDiagnostic(dest, variant string, source DiagnosticSource,
 		}
 	}
 	trace := Diagnostic{Diagnostic: d}
-	var receipt langfuse.Receipt
+	var receipt otel.Receipt
 	err = decodeFile(filepath.Join(source.Report, "langfuse.json"), &receipt)
 	if err == nil {
 		link, e := url.Parse(receipt.URL)

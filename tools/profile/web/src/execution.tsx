@@ -14,11 +14,9 @@ type Progress = {
 const stepLabels: Record<string, string> = {
   candidate: '构建本轮 Release',
   compare: '运行三轮 Benchmark',
-  'candidate-probe': '构建独立插桩二进制',
-  'observe-after': '采集 Leader / Follower Trace 和 CPU 栈',
-  'report-after': '生成时间线和火焰图',
+  'observe-after': 'Collect native Trace and CPU profiles',
+  'report-after': 'Verify native Trace and generate flamegraphs',
   summarize: '汇总指标',
-  'publish-after': '核对 Langfuse Trace 并发布火焰图',
   archive: '录入实验结果',
 };
 

@@ -1,7 +1,7 @@
 // Copyright 2026, DragonflyDB authors. All rights reserved.
 // See LICENSE for licensing terms.
 
-package langfuse
+package otel
 
 import (
 	"bufio"
@@ -43,6 +43,7 @@ type NodeInfo struct {
 }
 
 type Metadata struct {
+	Runner     string              `json:"runner,omitempty"`
 	Mode       string              `json:"mode"`
 	Binary     string              `json:"binary"`
 	BinarySHA  string              `json:"binary_sha256"`

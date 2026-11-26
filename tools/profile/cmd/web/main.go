@@ -19,7 +19,7 @@ import (
 
 	"dragonflydb.io/profile/models"
 	"dragonflydb.io/profile/pkg/httpapi"
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 func main() {
@@ -85,7 +85,14 @@ func serve(ctx context.Context, address, data, web, dsn, socket string) error {
 	if err != nil {
 		return err
 	}
-	native := langfuse.Config{URL: os.Getenv("LANGFUSE_URL"), EnvFile: os.Getenv("LANGFUSE_ENV_FILE")}
+	envFile := os.Getenv("LANGFUSE_ENV_FILE")
+	native := otel.NativeConfig{
+		Langfuse: otel.LangfuseConfig{URL: os.Getenv("LANGFUSE_URL"), EnvFile: envFile},
+		ClickHouse: otel.ClickHouseConfig{
+			URL: os.Getenv("PROFILE_CLICKHOUSE_URL"), User: cmp.Or(os.Getenv("PROFILE_CLICKHOUSE_USER"), "langfuse"),
+			EnvFile: envFile,
+		},
+	}
 	s := &http.Server{Handler: httpapi.Handler(repo, os.DirFS(web), executor, native), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()

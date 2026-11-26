@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"strings"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 type Hotspot struct {
@@ -281,25 +281,20 @@ func symbolize(ctx context.Context, raw string, log io.Writer) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func cpuReports(ctx context.Context, run, out string, m langfuse.Metadata, opt ReportOptions, log io.Writer) ([]string, error) {
+func cpuReports(ctx context.Context, run, out string, m otel.Metadata, opt ReportOptions, log io.Writer) ([]string, error) {
 	var prefixes []string
 	for _, node := range sortedKeys(m.Nodes) {
 		prefix := m.Nodes[node].Role + "-node-" + node
 		var raw string
 		var err error
-		if opt.CPUFrom != "" {
-			b, e := os.ReadFile(filepath.Join(opt.CPUFrom, prefix+".raw.txt"))
-			raw, err = string(b), e
-		} else {
-			profiles, e := filepath.Glob(filepath.Join(run, "cpu", "node-"+node+".prof.*"))
-			if e != nil || len(profiles) == 0 {
-				return nil, fmt.Errorf("no CPU profile for %s", prefix)
-			}
-			args := append([]string{opt.Go, "tool", "pprof", "-symbolize=none", "-raw", m.Binary}, profiles...)
-			raw, err = capture(ctx, "", log, args...)
-			if err == nil {
-				raw, err = symbolize(ctx, raw, log)
-			}
+		profiles, e := filepath.Glob(filepath.Join(run, "cpu", "node-"+node+".prof.*"))
+		if e != nil || len(profiles) == 0 {
+			return nil, fmt.Errorf("no CPU profile for %s", prefix)
+		}
+		args := append([]string{opt.Go, "tool", "pprof", "-symbolize=none", "-raw", m.Binary}, profiles...)
+		raw, err = capture(ctx, "", log, args...)
+		if err == nil {
+			raw, err = symbolize(ctx, raw, log)
 		}
 		if err != nil {
 			return nil, err

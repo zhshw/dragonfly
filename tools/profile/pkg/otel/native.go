@@ -1,7 +1,7 @@
 // Copyright 2026, DragonflyDB authors. All rights reserved.
 // See LICENSE for licensing terms.
 
-package langfuse
+package otel
 
 import (
 	"context"
@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -78,54 +77,16 @@ type NativeReport struct {
 	EventNames []string          `json:"event_names"`
 }
 
+const maxNativeObservations = 250_000
+
 type nativeObservation struct {
 	ID       string         `json:"id"`
 	TraceID  string         `json:"traceId"`
+	Project  string         `json:"projectId"`
 	Name     string         `json:"name"`
 	Start    string         `json:"startTime"`
-	Version  string         `json:"version"`
+	End      string         `json:"endTime"`
 	Metadata map[string]any `json:"metadata"`
-}
-
-func metadataFilter(key, value string) map[string]string {
-	return map[string]string{"type": "stringObject", "column": "metadata", "key": key, "operator": "=", "value": value}
-}
-
-func (c client) nativeObservations(ctx context.Context, experiment, capture, name string) ([]nativeObservation, error) {
-	filters := []map[string]string{metadataFilter("schema", "3"), metadataFilter("experiment_id", experiment)}
-	if capture != "" {
-		filters = append(filters, metadataFilter("capture_id", capture))
-	}
-	encoded, _ := json.Marshal(filters)
-	params := url.Values{"limit": {"1000"}, "fields": {"core,basic,metadata"}, "expandMetadata": {"ticket_ids"}, "filter": {string(encoded)}}
-	if name != "" {
-		params.Set("name", name)
-	}
-	var rows []nativeObservation
-	seen := map[string]bool{}
-	for {
-		var page struct {
-			Data []nativeObservation `json:"data"`
-			Meta struct {
-				Cursor string `json:"cursor"`
-			} `json:"meta"`
-		}
-		if err := c.request(ctx, http.MethodGet, "/api/public/v2/observations?"+params.Encode(), nil, &page); err != nil {
-			return nil, err
-		}
-		rows = append(rows, page.Data...)
-		if len(rows) > 250000 {
-			return nil, errors.New("native capture exceeds query safety limit; no partial ranking returned")
-		}
-		if page.Meta.Cursor == "" {
-			return rows, nil
-		}
-		if seen[page.Meta.Cursor] {
-			return nil, errors.New("Langfuse returned a repeated native trace cursor")
-		}
-		seen[page.Meta.Cursor] = true
-		params.Set("cursor", page.Meta.Cursor)
-	}
 }
 
 func flattenMetadata(prefix string, value any, out map[string]string) {
@@ -199,12 +160,14 @@ func NativeNumber(value string) (*big.Rat, error) {
 	return n, nil
 }
 
-func NativeCaptures(ctx context.Context, config Config, experiment string) ([]NativeCapture, error) {
-	c, err := open(config)
+func NativeCaptures(ctx context.Context, config LangfuseConfig, experiment string) ([]NativeCapture, error) {
+	c, err := openLangfuse(config)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := c.nativeObservations(ctx, experiment, "", "raft.capture")
+	rows, err := c.nativeObservations(ctx, experiment, "", url.Values{
+		"name": {"raft.capture"}, "fields": {"core,basic,metadata"}, "expandMetadata": {"ticket_ids"},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -231,59 +194,37 @@ func NativeCaptures(ctx context.Context, config Config, experiment string) ([]Na
 	return out, nil
 }
 
-func QueryNative(ctx context.Context, config Config, experiment, capture string, query NativeQuery) (NativeReport, error) {
+func QueryNative(ctx context.Context, config LangfuseConfig, experiment, capture string, query NativeQuery) (NativeReport, error) {
 	if capture == "" || experiment == "" {
 		return NativeReport{}, errors.New("experiment and capture are required")
 	}
-	c, err := open(config)
+	c, err := openLangfuse(config)
 	if err != nil {
 		return NativeReport{}, err
 	}
-	rows, err := c.nativeObservations(ctx, experiment, capture, "")
+	events, err := c.nativeEvents(ctx, experiment, capture, url.Values{
+		"fields": {"core,basic,metadata"}, "expandMetadata": {"ticket_ids"},
+	})
 	if err != nil {
 		return NativeReport{}, err
-	}
-	var events []NativeEvent
-	seen := map[string]bool{}
-	for _, row := range rows {
-		e, err := decodeNative(row)
-		if err != nil {
-			return NativeReport{}, err
-		}
-		key := e.TraceID + ":" + e.SpanID
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		events = append(events, e)
 	}
 	return RankNative(capture, events, query)
 }
 
-// RankNative sorts every event by its own span duration unless a request attribute is selected.
-// It contains no RPC pairing or business wait/overlap calculation.
-func RankNative(capture string, events []NativeEvent, q NativeQuery) (NativeReport, error) {
-	r := NativeReport{Capture: capture, Sort: "duration", Attribute: q.Attribute, Rows: []NativeEvent{}, Events: []NativeEvent{}, Issues: []string{}, Units: map[string]string{}}
-	if q.Attribute != "" {
-		r.Sort = "attribute"
-	}
-	if q.Minimum == "" {
-		q.Minimum = "0"
-	}
-	minimum, err := NativeNumber(q.Minimum)
-	if err != nil || minimum.Sign() < 0 {
-		return r, errors.New("invalid minimum value")
-	}
-	if q.Limit < 1 || q.Limit > 100 || (q.Partial != "" && q.Partial != "0" && q.Partial != "1") || q.Start < 0 || q.End < 0 || (q.End != 0 && q.Start > q.End) {
-		return r, errors.New("invalid native query: limit, partial or time range")
-	}
+type nativeCaptureData struct {
+	events  []NativeEvent
+	summary NativeReport
+}
+
+func prepareNativeCapture(capture string, events []NativeEvent) (*nativeCaptureData, error) {
+	r := NativeReport{Capture: capture, Issues: []string{}, Units: map[string]string{}}
 	manifests := map[string]NativeEvent{}
 	counts := map[string]int{}
 	processes := map[string]int{}
 	nodes := map[string]bool{}
 	for _, e := range events {
 		if e.Fields["capture_id"] != capture {
-			return r, errors.New("mixed capture identity")
+			return nil, errors.New("mixed capture identity")
 		}
 		if e.Name == "raft.capture" {
 			manifests[e.TraceID] = e
@@ -334,14 +275,45 @@ func RankNative(capture string, events []NativeEvent, q NativeQuery) (NativeRepo
 			}
 		}
 	}
-	if q.Attribute != "" && len(r.Units) > 0 && r.Units[q.Attribute] == "" {
-		return r, fmt.Errorf("unknown span attribute %q", q.Attribute)
-	}
 	sort.Strings(r.Issues)
 	r.Issues = compactStrings(r.Issues)
 	r.Complete = len(r.Issues) == 0
 	events = append([]NativeEvent(nil), events...)
 	r.Nodes, r.EventNames = nativeOptions(events)
+	return &nativeCaptureData{events: events, summary: r}, nil
+}
+
+// RankNative sorts every event by its own span duration unless a request attribute is selected.
+// It contains no RPC pairing or business wait/overlap calculation.
+func RankNative(capture string, events []NativeEvent, q NativeQuery) (NativeReport, error) {
+	data, err := prepareNativeCapture(capture, events)
+	if err != nil {
+		return NativeReport{}, err
+	}
+	return data.rank(q)
+}
+
+func (data *nativeCaptureData) rank(q NativeQuery) (NativeReport, error) {
+	r := data.summary
+	r.Sort, r.Attribute = "duration", q.Attribute
+	r.Rows, r.Events = []NativeEvent{}, []NativeEvent{}
+	if q.Attribute != "" {
+		r.Sort = "attribute"
+	}
+	if q.Minimum == "" {
+		q.Minimum = "0"
+	}
+	minimum, err := NativeNumber(q.Minimum)
+	if err != nil || minimum.Sign() < 0 {
+		return r, errors.New("invalid minimum value")
+	}
+	if q.Limit < 1 || q.Limit > 100 || (q.Partial != "" && q.Partial != "0" && q.Partial != "1") || q.Start < 0 || q.End < 0 || (q.End != 0 && q.Start > q.End) {
+		return r, errors.New("invalid native query: limit, partial or time range")
+	}
+	if q.Attribute != "" && len(r.Units) > 0 && r.Units[q.Attribute] == "" {
+		return r, fmt.Errorf("unknown span attribute %q", q.Attribute)
+	}
+	events := data.events
 	values := map[string]*big.Rat{}
 	for _, e := range events {
 		if e.Name == "raft.capture" || (q.Name != "" && e.Name != q.Name) || (q.Node != "" && e.Fields["node_id"] != q.Node) || (q.Group != "" && e.Fields["group_id"] != q.Group) || (q.Outcome != "" && e.Fields["outcome"] != q.Outcome) {
@@ -396,7 +368,8 @@ func RankNative(capture string, events []NativeEvent, q NativeQuery) (NativeRepo
 	}
 	for i := range events {
 		if events[i].TraceID+":"+events[i].SpanID == selected {
-			r.Selected = &events[i]
+			event := events[i]
+			r.Selected = &event
 			break
 		}
 	}

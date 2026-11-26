@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"time"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, args []string) error {
@@ -95,7 +95,7 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 	path := experimentsAPI + "/" + url.PathEscape(*id)
 	if command == "captures" || *capture == "" {
 		var result struct {
-			Captures []langfuse.NativeCapture `json:"captures"`
+			Captures []otel.NativeCapture `json:"captures"`
 		}
 		if err := client.request(ctx, http.MethodGet, path+"/captures", nil, &result); err != nil {
 			return err
@@ -119,7 +119,7 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 	if command == "fetch-delay" {
 		endpoint = "/requests"
 	}
-	var report langfuse.NativeReport
+	var report otel.NativeReport
 	if err := client.request(ctx, http.MethodGet, path+endpoint+"?"+params.Encode(), nil, &report); err != nil {
 		return err
 	}
@@ -134,7 +134,7 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 		label, value := report.Attribute, nativeValueText(row, report.Attribute, report.Units)
 		if report.Sort == "duration" {
 			label = "duration"
-			number, err := langfuse.NativeNumber(row.Duration)
+			number, err := otel.NativeNumber(row.Duration)
 			if err != nil {
 				return err
 			}
@@ -154,13 +154,13 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 	return nil
 }
 
-func nativeValueText(event langfuse.NativeEvent, name string, units map[string]string) string {
+func nativeValueText(event otel.NativeEvent, name string, units map[string]string) string {
 	value, ok := event.Values[name]
 	if !ok || event.States[name] != "Observed" {
 		return cmp.Or(event.States[name], "Missing")
 	}
 	if units[name] == "ms" {
-		number, err := langfuse.NativeNumber(value)
+		number, err := otel.NativeNumber(value)
 		if err != nil {
 			return "Invalid"
 		}

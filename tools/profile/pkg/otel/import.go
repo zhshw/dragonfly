@@ -1,7 +1,7 @@
 // Copyright 2026, DragonflyDB authors. All rights reserved.
 // See LICENSE for licensing terms.
 
-package langfuse
+package otel
 
 import (
 	"context"
@@ -55,16 +55,16 @@ func attributes(values map[string]any) []otlpAttribute {
 }
 
 // Import sends missing OTLP observations and returns a receipt after every ID is readable.
-func Import(ctx context.Context, run string, config Config) (Receipt, error) {
+func Import(ctx context.Context, run string, config LangfuseConfig) (Receipt, error) {
 	return checkRun(ctx, run, config, true)
 }
 
 // Verify checks the observations for a captured run without submitting spans.
-func Verify(ctx context.Context, run string, config Config) (Receipt, error) {
+func Verify(ctx context.Context, run string, config LangfuseConfig) (Receipt, error) {
 	return checkRun(ctx, run, config, false)
 }
 
-func checkRun(ctx context.Context, run string, config Config, upload bool) (Receipt, error) {
+func checkRun(ctx context.Context, run string, config LangfuseConfig, upload bool) (Receipt, error) {
 	var receipt Receipt
 	if config.URL == "" {
 		config.URL = "http://172.31.23.2:3007"
@@ -78,7 +78,7 @@ func checkRun(ctx context.Context, run string, config Config, upload bool) (Rece
 	if config.Project == "" {
 		config.Project = "dragonfly-performance"
 	}
-	c, err := open(config)
+	c, err := openLangfuse(config)
 	if err != nil {
 		return receipt, err
 	}

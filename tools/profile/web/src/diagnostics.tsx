@@ -135,6 +135,7 @@ function TracePanel({ panel }: { panel: Panel }) {
       <div><strong>{number(capture.profile.span_count, 0)}</strong> 条完整事件</div>
       {capture.profile.trace_url && <p>Langfuse 已核验 {number(capture.profile.verified_observations ?? 0, 0)} 条展示样本</p>}
       <div className="trace-actions">
+        {capture.profile.capture_id && <a className="button primary" href={`#/${capture.experiment_id}/stages`}>Open event analysis <ArrowUpRight size={15} /></a>}
         {capture.observation.timeline && <a className="button" href={artifactURL(capture.experiment_id, capture.observation.timeline)} download={`${capture.experiment_id}-${capture.observation.variant}-timeline.json`}><ArrowDownToLine size={15} />时间线 JSON</a>}
         {capture.profile.trace_url && <a className="button primary" href={capture.profile.trace_url} target="_blank" rel="noreferrer">打开 Langfuse <ArrowUpRight size={15} /></a>}
       </div>
@@ -155,7 +156,7 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
   const [query, setQuery] = useState('');
   const [role, setRole] = useState('all');
   const [showAll, setShowAll] = useState(false);
-  const raftPanels = panels.filter((panel) => panel.raft !== false);
+  const raftPanels = panels.filter((panel) => panel.raft !== false && !panel.capture?.profile.native);
   const grouped = new Map<string, PhaseRow>();
   const search = query.trim().toLowerCase();
   panels.forEach(({ capture }, index) => {

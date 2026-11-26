@@ -14,6 +14,7 @@ import { StageAnalysis } from './stages';
 import { CreateExperiment, TargetDetails } from './create';
 import { ExecutionPanel } from './execution';
 import { DeleteExperiment } from './delete';
+import { ConfigureComparisons } from './comparisons';
 
 const views = [
   { id: 'overview', label: '总览', icon: ChartNoAxesCombined },
@@ -77,7 +78,7 @@ function ComparisonChart({ rows, metric, title, subtitle, unit, scaleStep }: {
   </section>;
 }
 
-function Overview({ summary }: { summary: Summary }) {
+function Overview({ summary, configure }: { summary: Summary; configure: () => void }) {
   const { experiment, variants: builds, diagnostics, comparisons } = summary;
   const previous = comparisons.previous;
   const current = builds.current?.metrics;
@@ -95,9 +96,12 @@ function Overview({ summary }: { summary: Summary }) {
   ];
   const capture = diagnostics?.current;
   return <div className="view-content">
+    <div className="section-toolbar"><h2>实验对照</h2><button className="button" onClick={configure}>配置对照</button></div>
+    {[...new Set([base, previous, reference].flatMap((choice) => choice?.warning ? [choice.warning] : []))]
+      .map((warning) => <p className="dialog-help" key={warning}>{warning}</p>)}
     <div className="metrics-grid">
       <section className="metric-card">
-        <p>累计吞吐收益</p>
+        <p>{base?.warning ? '较基准吞吐差值' : '累计吞吐收益'}</p>
         <div className="metric-value cumulative">{base?.result ? percent(base.result.throughput_pct) : '—'}</div>
         <div className="metric-foot" title={targetTitle(base?.target)}>{base ? `${targetTitle(base.target)} · ${number(base.target.metrics.replication_mib_per_s.median)} MiB/s` : '未选基线'}</div>
       </section>
@@ -113,7 +117,7 @@ function Overview({ summary }: { summary: Summary }) {
       </section>
       <section className="metric-card">
         <p>{compared ? '批次 P95 耗时较上一轮' : '批次 P95 耗时'}</p>
-        <div className="metric-value">{p95Change === undefined ? '—' : percent(p95Change)}</div>
+        <div className="metric-value">{p95Change === undefined ? number(current.batch_p95_ms.median) : percent(p95Change)}</div>
         <div className="metric-foot" title="三轮正式测试的批次 P95 中位数">
           <span>{compared && `${number(compared.batch_p95_ms.median)} → `}{number(current.batch_p95_ms.median)} ms</span>
           {!compared && <span>暂无上一轮</span>}
@@ -163,6 +167,7 @@ function App() {
   const [copyState, setCopyState] = useState<'idle' | 'loading' | 'copied'>('idle');
   const [copyError, setCopyError] = useState('');
   const [creating, setCreating] = useState(false);
+  const [configuring, setConfiguring] = useState(false);
   const [canDelete, setCanDelete] = useState(false);
   const [deleting, setDeleting] = useState<ExperimentLabel | null>(null);
   const [deleteWarning, setDeleteWarning] = useState('');
@@ -289,7 +294,7 @@ function App() {
               <Icon size={17} />{label}
             </a>)}
           </nav>
-          {page.view === 'overview' && <Overview summary={active.summary} />}
+          {page.view === 'overview' && <Overview summary={active.summary} configure={() => setConfiguring(true)} />}
           {page.view === 'runs' && <RunsView key={experiment.id} id={experiment.id} />}
           {page.view === 'stages' && <StageAnalysis key={experiment.id} detail={active} requests={page.requestAnalysis} />}
           {(page.view === 'flamegraphs' || page.view === 'trace') && <DiagnosticsView key={experiment.id} id={experiment.id} view={page.view}
@@ -303,6 +308,12 @@ function App() {
       location.hash = href(id, 'overview');
       setRequest((n) => n + 1);
     }} />}
+    {configuring && active && <ConfigureComparisons key={active.summary.experiment.id} summary={active.summary}
+      close={() => setConfiguring(false)} saved={(summary) => {
+        setConfiguring(false);
+        setDetail((detail) => detail?.summary.experiment.id === summary.experiment.id ? { ...detail, summary } : detail);
+        refresh();
+      }} />}
     {deleting && <DeleteExperiment experiment={deleting} close={() => setDeleting(null)} deleted={(warning) => {
       const id = deleting.id;
       setDeleting(null);

@@ -5,7 +5,7 @@
 请求分析采用 [Raft OTEL traces](../../docs/cluster/profile/trace.md)：C++ 记录事件并计算请求属性，直接上报 Langfuse，CLI/Web 共用查询。分析示例见 [v16](../../docs/cluster/profile/v16-wal-encode-overlap.md#1-分析查询)。OTEL Metrics 延后。
 
 实验、对照选择、benchmark 轮次、验证结果和诊断指标保存在 PostgreSQL。
-火焰图、时间线和验证日志通过产物表关联到实验，文件存放在数据盘。
+原生 Trace 保存在 Langfuse；capture 引用、火焰图和验证日志关联到实验，文件存放在数据盘。历史时间线归档仍可读取。
 
 | 比较 | 计算 | 来源 |
 | --- | --- | --- |
@@ -16,7 +16,7 @@
 创建实验时选定上一轮，可沿用该实验的基线与对比参照。每项选择会保存测试口径、版本和指标快照。
 v10 的上一轮使用 v9 的历史数据。旧实验按原有版本关系关联上一轮归档。总览的耗时卡片突出批次 P95 较上一轮的变化百分比，下方显示两轮各自的 P95 三轮中位数。
 总览、运行记录、火焰图、阶段分析和 Trace 都使用选定版本的数据。首个版本没有上一轮时，火焰图和 Trace 展示本轮与所选对比参照。
-「阶段分析」的「指标分析」按原始埋点名和上一轮对比，逐条查看指标事件的 Slow Path。「请求分析」按客户端总耗时排序请求，默认打开最慢请求并列出最长回复间隔。其余回复间隔按耗时排序，可关联的 Fetch 等待与原始事件显示在同一时间轴。 [v15 阶段分析](http://172.31.23.2:8787/#/v15/stages)
+阶段分析使用 Event Slow Path 和 Fetch delay，先排序事件或请求，再展开关联时序。
 运行记录的 Diff 表按指标展示 `baseline`、上一轮、本轮的三轮算术平均值，以及本轮与上一轮的均值差。表底每组有一个入口，可读取合并后的三轮原始日志。本轮的正确性验证和独立诊断放在同一张卡片。
 总览的「查看基准诊断」打开所选参照的独立页面，展示 CPU 火焰图、Trace 和阶段耗时。
 
@@ -28,9 +28,11 @@ v10 的上一轮使用 v9 的历史数据。旧实验按原有版本关系关联
 make profile
 ```
 
-`make profile` 启动 Compose 服务，再启动宿主机的 `profile-executor` 用户服务并等待就绪。首次在实验账号下运行 `make -C tools/profile build`，构建 `profile`、`profile-web` 和前端。Web 容器使用该账号的 UID/GID，默认发布 `0.0.0.0:8787`。可用 `BIN_DIR`、`WEB_DIST` 和 `PROFILE_LISTEN` 覆盖安装路径、前端目录和发布地址。 [Compose 配置](compose.yaml) · [打开实验平台](http://172.31.23.2:8787/)
+`make profile` 启动 Compose 服务，再启动宿主机的 `profile-executor` 用户服务并等待就绪。容器由 Docker 的 `unless-stopped` 策略管理，只有宿主机执行器使用 systemd。首次在实验账号下运行 `make -C tools/profile build`，构建 `profile`、`profile-web` 和前端。Web 容器使用该账号的 UID/GID，默认发布 `0.0.0.0:8787`。可用 `BIN_DIR`、`WEB_DIST` 和 `PROFILE_LISTEN` 覆盖安装路径、前端目录和发布地址。 [Compose 配置](compose.yaml) · [打开实验平台](http://172.31.23.2:8787/)
 
 `profile-web` 默认从 DaoCloud 拉取 Ubuntu 26.04，镜像固定到 Docker 官方发布的多架构索引摘要。可在 Compose 的环境文件中用 `PROFILE_WEB_IMAGE` 指定其他完整镜像地址。
+
+原生 Trace 首次读取用 Langfuse 确认项目和 capture 时间窗口，再通过 ClickHouse HTTP 只读查询加载完整 span。校验失败时回退到 Langfuse API。在 Compose 的环境文件中将 `PROFILE_CLICKHOUSE_URL` 设为空可关闭直读。使用单独的 ClickHouse 查询账号时，设置 `PROFILE_CLICKHOUSE_USER` 和 `PROFILE_CLICKHOUSE_PASSWORD`，并授予该账号读取 `default.events_full` 的权限。
 
 更新 Web 后，在仓库根目录重建容器。正在执行的 benchmark 由独立的宿主机进程继续运行。
 
@@ -38,7 +40,7 @@ make profile
 make profile restart
 ```
 
-从旧部署切换时，先等当前 benchmark 结束。若仍在使用旧的宿主机 `profile-web.service`，先运行一次 `sudo systemctl stop profile-web.service` 释放端口。只启动 Langfuse 和火焰图服务用 `make -C tools/profile langfuse`。 [数据盘准备](../raft-observability/README.md#部署与启动)
+从旧部署切换时，先等当前 benchmark 结束。若仍在使用旧的宿主机 `profile-web.service`，先运行一次 `sudo systemctl stop profile-web.service` 释放端口。只启动 Langfuse 和火焰图服务用 `make -C tools/profile langfuse`。 [部署脚本](ops/setup_host.sh)
 
 构建、benchmark、Trace 采集和发布由宿主机的 `profile executor` 完成，使用配置中的 checkout、工具链和归档路径。Web 通过 `config/executor/executor.sock` 转发运行、进度、日志和删除请求，实验归档只读挂载入容器。执行器以实验账号的 systemd 用户服务运行，日志用 `journalctl --user -u profile-executor` 查看。更新执行器或修改工作流配置后，等本轮结束，运行 `systemctl --user stop profile-executor`，再用 `make -C tools/profile executor` 启动。 [工作流步骤](pkg/workflow/plan.go)
 
@@ -59,9 +61,9 @@ profile backfill -data "$experiment_data" -archive docs/cluster/benchmarks
 
 ## 在实验台运行
 
-创建实验并选择对照后，点击「运行 Benchmark」。执行机验证构建、运行本轮三轮正式测试，再用单独的插桩二进制采集 Leader 和 Follower 的 Trace 与 CPU 栈。Langfuse 确认可读后，结果、日志、火焰图和时间线自动关联到实验。上一轮、基线和对比参照沿用创建时选定的归档。
+创建实验并选择对照后，点击「运行 Benchmark」。执行机验证构建、运行本轮三轮正式测试，再用同一份 Release 二进制独立采集 Leader 和 Follower 的原生 Trace 与 CPU 栈。C++ 退出排空后直接上报 Langfuse，校验 capture 的版本、负载、节点、stream 和事件完整性后，归档结果、日志、CPU 火焰图及 capture 引用。上一轮、基线和对比参照沿用创建时选定的归档。
 
-执行状态记录在 PostgreSQL，原始采集和续跑检查点保存在执行机。失败后可在校验已完成的产物后继续，或从头启动一次新的执行。同一执行机一次运行一个实验。
+执行状态记录在 PostgreSQL，CPU 原始采样和续跑检查点保存在执行机。采集与校验分步执行：入库延迟时重试只核对已完成的 capture；采集失败重跑使用新 capture ID。同一执行机一次运行一个实验。
 
 `make profile` 读取 `config/profile.json`，可用 `WORKFLOW_CONFIG` 指定文件。文件使用 `plan` / `run` 的 JSON 配置，`output` 是执行归档根目录。
 
@@ -72,7 +74,7 @@ profile backfill -data "$experiment_data" -archive docs/cluster/benchmarks
   "release_build": "build-opt",
   "validation": [{
     "build": "build-dbg",
-    "unit_tests": ["partition_log_test", "folly_io_test"],
+    "unit_tests": ["trace_test", "trace_exporter_test", "partition_log_test", "folly_io_test"],
     "integration_tests": ["tests.integration.raft_data_group_test.RaftMemoryAckTest.test_idle_memory_writes_publish_recovery_boundary"]
   }],
   "profiler": "~/.local/opt/dragonfly-observability/profiler-build/libprofiler.so",
@@ -82,19 +84,22 @@ profile backfill -data "$experiment_data" -archive docs/cluster/benchmarks
 }
 ```
 
-正式 benchmark 使用 Raft memory、1 连接、pipeline 64、256 MiB。创建时选定的归档须使用相同负载和测试脚本。`output` 放在 benchmark 使用的本地磁盘上，`-data` 指向 PostgreSQL 关联的产物目录。采集机的 Python 和 Langfuse 依赖见 [采集配置](../raft-observability/README.md)。
+构建目录须启用 `-DWITH_RAFT_OTEL=ON`（Raft 使用 Folly I/O）。workflow 不修改 CMake 配置；正式压测清除 Trace/CPU 采集环境，诊断才设置 capture 身份与凭据。Langfuse 默认使用本机 3007 和受保护的 `/data/dragonfly-observability/config/langfuse.env`，可用 `langfuse.url` / `langfuse.env_file` 覆盖。
+
+压测、集群管理、恢复校验和 CPU 采样控制由 `pkg/benchmark` 的 Go 实现完成，workflow 直接调用。Python 仅用于配置中选定的集成回归。Go 压测器使用独立的源码哈希；历史 Python 归档仍可选为对照，版本差异会显示在比较结果中。
+
+正式 benchmark 使用 Raft memory、1 连接、pipeline 64、256 MiB。创建时选定的归档须使用相同负载。`output` 放在 benchmark 使用的本地磁盘上，`-data` 指向 PostgreSQL 关联的产物目录。采集机需要 gperftools libprofiler、Go pprof、addr2line 和 flamegraph.pl；配置了 Python 集成回归时还需要 Python Redis。压测输出不能放在 tmpfs。
 
 `cmd/cli` 构建 `profile`，`cmd/web` 构建 `profile-web`。`models` 包含实验数据模型和 GORM 持久化，沿用 PostgreSQL 的显式 SQL 迁移。`pkg` 提供测量、执行、HTTP 路由和 Langfuse Trace 处理。
 
 ## 原生 Trace 查询
 
-Web 从 `LANGFUSE_URL` 和 `LANGFUSE_ENV_FILE` 读取查询配置，Compose 已配置内部 traces 服务与只读凭据文件。CLI 和页面都使用 `pkg/httpapi` → `pkg/langfuse.QueryNative`，没有单独的 CLI 分析算法。
+Web 从 `LANGFUSE_URL` 和 `LANGFUSE_ENV_FILE` 读取查询配置，Compose 已配置内部 traces 服务与只读凭据文件。CLI 和页面通过 `pkg/httpapi` 共用 `pkg/otel` 的 capture 查询、校验和排序。
 
 ```sh
 profile captures -id v15
 profile fetch-delay -id v15 -min-return-wait-ms 10
-profile slow-path -id v15
-profile slow-path -id v15 -name raft.set.admission.wal_idle
+profile slow-path -id v15 -limit 5
 ```
 
 默认最近一轮 capture、降序 Top 10。耗时属性与输出统一为 ms，沿用原 `raft.*` trace 名称。`slow-path -min-duration-ms 10` 筛选事件耗时；`fetch-delay -min-return-wait-ms 10` 筛选 RPC 返回后的等待。Fetch 的其他字段可用 `-min-rpc-ms`、`-min-io-wait-ms`、`-min-appended-bytes` 等参数，一次选择一个阈值并按该字段排序；无阈值时可用 `-attribute` 选择排序字段。`-capture` 固定轮次，`-selected TRACE_ID:SPAN_ID` 查看指定请求，`-start-ns/-end-ns` 用原始单调时钟筛选请求起点，`-json` 输出 Web 使用的同一 DTO。`complete=false` 表示记录缺失或未排空，不能当作完整排名。此处 JSON 是 HTTP 查询响应，不是导入文件。
@@ -109,10 +114,13 @@ CLI 和页面使用同一份实验记录。CLI 自动读取系统环境变量 `P
 profile create -id v11 -title '本轮优化' -previous v10
 profile run -id v11
 profile show -id v11
+profile comparisons -id v16 -baseline v3:current -previous v15 -reference v3:cluster
 profile trace -id v11 -run diagnostic-current -role follower -stage raft. -sort p95 -limit 5
 profile flamegraph -id v11 -run diagnostic-current -role leader -view inclusive -limit 5
 profile delete -id v11
 ```
+
+已完成实验可在总览点击「配置对照」，或使用 `comparisons` 修改基准、上一轮和参照。CLI 未指定的字段保持原值，显式传空值可清除；不同压测版本仍展示历史数值和差值，并标明差异。配置仅更新对照关系，不重跑实验。
 
 `run -id` 等到入库后退出，失败后再次运行可继续。`show` 输出三轮指标。页面和 CLI 都能删除 PostgreSQL 实验及其平台归档。正在运行或被其他实验用作对照时，删除请求返回具体原因。对外发布的诊断由各自服务管理。
 
@@ -128,24 +136,9 @@ profile flamegraph -id v10 -role leader -symbol 'CRC32::Extend' -caller-depth 8
 
 `apply-to-confirm` 按日志 offset 关联 Leader 上的 apply 批次和写入确认，统计匹配数、应用后的延迟、worker 排队与 apply 的重叠，以及票据峰值。只有确认 offset 连续且完整覆盖客户端批次时，才按 `client.pipeline` 的写入序号计算批尾耗时。输出同时列出有效批尾数和批次数。
 
-```sh
-profile trace -id v15 -role client -sort union
-profile trace -id v15 -stage raft. -sort union
-profile trace -id v15 -analysis slow-path
-profile trace -id v15 -analysis admission-wait -tickets 31 -batch 12
-profile trace -id v16 -analysis request-phases -sort count
-profile trace -timeline "$report/timeline.json" -analysis fetch-delay -limit 1 -json
-```
+`-symbol` 按函数名子串查询 CPU 调用路径，`-caller-depth` 限定上游帧数；`-view inclusive` 每个样本只计一次。
 
-`request-phases` 先给出整轮 SET 和末尾 WAIT 时间，再按各阶段占批次总耗时的比例降序排列。`-sort count` 按受到该阶段等待影响的写入比例排列。同一笔写入可能依次等多个阶段，因此受影响的写入比例可以重叠。耗时按相邻回复水位之间的等待切分，每段时间只归入一个阶段。
-
-`slow-path` 默认展开最慢的客户端批次，`-batch` 可按从 1 开始的批次编号指定。它列出该批阶段占比、最长的回复间隔及各间隔的分段耗时。`-role` 或 `-stage` 可查该批时间窗口内的原始 span，`-limit` 分别限制回复间隔和匹配 span 的输出条数。早期 Raft Trace 只有准入与回复水位时，报告使用较粗的 `group-to-reply` 阶段。
-
-`admission-wait` 统计准入等待内同连接线程的票据退役，以及最近一次 WAL 完成后到恢复准入的空档。`-tickets` 传入本次负载一波能容纳的票据数，`-batch` 可限定一批。早期 Trace 使用 `raft.folly.write` 的结束时间作为 WAL 完成时间。`fetch-delay` 按日志 offset 对齐 Follower 追加和 Fetch RPC，报告返回到开始处理的延迟、实际写入字节数及 `await_io` 与 `fsync` 的重叠。
-
-通过 `-id` 和 `-run` 查询时，CLI 从平台读取已归档的完整观测。未入库的独立诊断可用 `-timeline FILE` 读取归档，或用 `-timeline -` 从 stdin 读取。分析读取单连接 Raft Trace，支持 `-json`。
-
-`-symbol` 对函数名做区分大小写的子串匹配，按调用路径列出样本数及其占该节点总样本的比例。`-caller-depth` 为参与分组的上游帧数，默认使用完整路径。`-view inclusive` 使用靠近叶子的匹配帧，每个样本只计一次。两个查询都支持 `-json`。
+历史 timeline 归档仍支持 `profile trace` 查询；新实验使用上面的 `captures`、`slow-path` 和 `fetch-delay`，不经过文件导入。
 
 v10 归档的查询结果见文档示例。 [Trace 和火焰图分析示例](../../docs/cluster/profile.md#trace-和火焰图分析示例)
 
@@ -153,14 +146,14 @@ v10 归档的查询结果见文档示例。 [Trace 和火焰图分析示例](../
 
 ### 汇总本地归档
 
-`profile summarize` 读取 `pipeline_compare` 的输出目录和已有的诊断 `report` 目录。
+`profile summarize` 读取 `profile benchmark` 的输出目录和已有的诊断 `report` 目录。
 
 ```sh
 profile summarize -compare "$compare_dir" \
   -before "$baseline_report" -after "$current_report" -out "$summary_dir"
 ```
 
-只有本轮诊断时可只传 `-after`。`-out` 指定新目录，`summary.md` 包含吞吐、批次 P95 和关键等待，`summary.json` 另含各节点的 CPU 热点与构建校验信息。
+只有本轮诊断时可只传 `-after`。`-out` 指定新目录，`summary.md` 包含吞吐、批次 P95、CPU 和 capture 引用，`summary.json` 另含各节点的 CPU 热点与构建校验信息。
 
 ## API
 
@@ -171,6 +164,7 @@ profile summarize -compare "$compare_dir" \
 | GET | `/api/v1/comparison-targets` | 可选的正式 benchmark |
 | GET | `/api/v1/comparison-targets/{target}/diagnostics` | 一条基准的独立诊断和产物 ID |
 | GET | `/api/v1/experiments/{id}` | 摘要、轮次、诊断与产物 ID |
+| PUT | `/api/v1/experiments/{id}/comparisons` | 保存已完成实验的基准、上一轮及参照，空字段清除对应选择 |
 | DELETE | `/api/v1/experiments/{id}` | 删除实验及其平台归档 |
 | GET | `/api/v1/experiments/{id}/summary` | 对照结果、CPU 热点、关键等待和 Langfuse 回执 |
 | GET | `/api/v1/experiments/{id}/execution` | 执行状态和阶段进度 |
@@ -188,6 +182,6 @@ profile summarize -compare "$compare_dir" \
 也可用 `cumulative_baseline` 和 `reference` 显式指定对照。页面的「复制实验摘要」调用同一个摘要接口。
 
 `plan -config FILE` 查看测量步骤，`run -config FILE` 运行，`-resume` 核验输入与产物后继续。
-默认只测本轮。选定的上一轮直接读取归档，显式提供 `baseline_build` 才会追加 A/B 测量。
-`report -run RUN` 将已有采集转为报告，附 `-flamegraph-dir DIR` 生成交互 SVG。
+默认只测本轮。选定的上一轮直接读取归档，显式提供 `baseline_build` 才会追加 A/B 测量。启用 diagnostics 时，冻结的 baseline 也须包含原生 Trace 能力和 CMakeCache.txt；before capture 使用 experiment_id 加 -baseline，避免混入本轮。include_cluster 只额外采集 CPU，不要求 Raft Trace。独立 run -config 可设置 experiment_id，默认使用 output 的目录名；平台执行自动采用实验 ID。
+原生诊断由 workflow 自动生成 CPU 火焰图并保存 capture 回执；旧 report 文件生成入口已移除。
 `import -config FILE` 可为数据库中的待测实验补上本轮结果。配置提供实验 ID、benchmark 目录和可选诊断路径。

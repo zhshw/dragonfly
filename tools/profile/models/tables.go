@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 type experimentRow struct {
@@ -84,8 +84,8 @@ type traceStageRow struct {
 	Node         string `gorm:"primaryKey"`
 	Stage        string `gorm:"primaryKey"`
 	Count        int
-	UnionMS      float64        `gorm:"column:union_ms"`
-	Statistics   langfuse.Stage `gorm:"serializer:json;type:jsonb"`
+	UnionMS      float64    `gorm:"column:union_ms"`
+	Statistics   otel.Stage `gorm:"serializer:json;type:jsonb"`
 }
 
 func (traceStageRow) TableName() string { return "raft_workflow.trace_stages" }

@@ -15,7 +15,7 @@ import (
 
 	"dragonflydb.io/profile/models"
 	"dragonflydb.io/profile/pkg/httpapi"
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 func TestNativeCLIAndWebUseTheSameStoredTraceQuery(t *testing.T) {
@@ -49,7 +49,9 @@ func TestNativeCLIAndWebUseTheSameStoredTraceQuery(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"data": []any{manifest, request, other}, "meta": map[string]any{}})
 	}))
 	defer upstream.Close()
-	platform := httptest.NewServer(httpapi.Handler(models.Store{Root: root}, fstest.MapFS{}, nil, langfuse.Config{URL: upstream.URL, EnvFile: credentials}))
+	platform := httptest.NewServer(httpapi.Handler(models.Store{Root: root}, fstest.MapFS{}, nil, otel.NativeConfig{
+		Langfuse: otel.LangfuseConfig{URL: upstream.URL, EnvFile: credentials},
+	}))
 	defer platform.Close()
 	for _, tc := range []struct {
 		command, path, query, name, duration, value string
@@ -83,7 +85,7 @@ func TestNativeCLIAndWebUseTheSameStoredTraceQuery(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer response.Body.Close()
-			var fromCLI, fromWeb langfuse.NativeReport
+			var fromCLI, fromWeb otel.NativeReport
 			if err = json.Unmarshal(printed, &fromCLI); err != nil {
 				t.Fatal(err)
 			}

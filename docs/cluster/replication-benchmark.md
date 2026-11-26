@@ -54,14 +54,16 @@
 
 ## 当前优化复现与原始数据
 
+以下命令使用 Go 压测器；历史 Python 结果保留原记录，新对照须用同版 Go 压测器重采。
+
 保留改动前的 `dragonfly`、`raft_storage`，在真实磁盘目录运行；[Folly 构建方法](io_uring.md#folly-编译变体)。
 
 ```sh
 ninja -C build-opt dragonfly raft_storage
-python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
-  --build-dir build-opt --baseline-build /path/to/v9-build \
-  --ack-mode memory --include-cluster --clients 1 --pipeline-depth 64 \
-  --output-dir "$PWD/docs/cluster/benchmarks/profile-flush-overlap-c1"
+profile benchmark \
+  -build-dir build-opt -baseline-build /path/to/v9-build \
+  -ack-mode memory -include-cluster -clients 1 -pipeline-depth 64 \
+  -output-dir "$PWD/docs/cluster/benchmarks/profile-flush-overlap-c1"
 ```
 
 原始数据仅保存在本地 `docs/cluster/benchmarks/` 及测试机，已由 `.gitignore` 排除；
@@ -89,10 +91,10 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
 复现单连接对照：
 
 ```sh
-python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
-  --build-dir build-opt --ack-modes flush memory --include-cluster \
-  --clients 1 --pipeline-depth 64 \
-  --output-dir "$PWD/docs/cluster/benchmarks/ack-modes-c1"
+profile benchmark \
+  -build-dir build-opt -ack-modes flush,memory -include-cluster \
+  -clients 1 -pipeline-depth 64 \
+  -output-dir "$PWD/docs/cluster/benchmarks/ack-modes-c1"
 ```
 
 原始结果在测试机隔离仓库 `docs/cluster/benchmarks/ack-modes-20261123-c1/`，不提交 Git。
@@ -118,10 +120,10 @@ SET + WAIT 1 口径，新旧版本显式使用 `memory`，各三轮交错运行�
 - 本轮只测 1 连接；effect 缓存副本、drain 聚合复制和逐笔应用仍保留。 [v4 共享 WAL 缓冲](profile/v4-wal-buffer.md) · [v5 批量应用](profile/v5-batched-apply.md) · [v6 直接聚合](profile/v6-drain-sharing.md)
 
 ```sh
-python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
-  --build-dir build-opt --baseline-build /path/to/before-build \
-  --ack-mode memory --include-cluster --clients 1 --pipeline-depth 64 \
-  --output-dir "$PWD/docs/cluster/benchmarks/profile-buffer-c1"
+profile benchmark \
+  -build-dir build-opt -baseline-build /path/to/before-build \
+  -ack-mode memory -include-cluster -clients 1 -pipeline-depth 64 \
+  -output-dir "$PWD/docs/cluster/benchmarks/profile-buffer-c1"
 ```
 
 原始数据和两阶段二进制保存在测试机 `docs/cluster/benchmarks/profile-buffer-20261123/`，由 Git 忽略。
@@ -145,7 +147,7 @@ python3 tests/integration/raft_commit_benchmark/dragonfly/pipeline_compare.py \
   离线副本恢复、WAIT 2 和全部 1088 个值读回。本轮没有扩大连接数。
 - 普通 SET 的命令分发、follower WAL 读回/解码和确认票据回查仍存在；本轮不是整个应用路径的零复制。
 
-复现使用上面的 `--ack-mode memory` 命令，基线指定 `profile-buffer-20261123/encoded-bin`。
+复现使用上面的 `-ack-mode memory` 命令，基线指定 `profile-buffer-20261123/encoded-bin`。
 本轮二进制、源码差异和原始结果在 `docs/cluster/benchmarks/profile-apply-20261123/`，不提交 Git。
 火焰图和 trace 结论见 [v5 实验](profile/v5-batched-apply.md)。
 

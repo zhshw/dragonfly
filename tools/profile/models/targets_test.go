@@ -48,6 +48,11 @@ func TestSelectPreviousExperiment(t *testing.T) {
 			}
 		})
 	}
+	targets[0].Workload.Clients = 2
+	if _, err := selectTargets(ChoiceIDs{Cumulative: base.ID, Reference: reference.ID},
+		func() ([]Target, error) { return targets, nil }); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("different workloads should not define a new benchmark: %v", err)
+	}
 }
 
 func TestArchiveUsesSavedTargetsAndSeparateRoundDelta(t *testing.T) {
@@ -62,10 +67,15 @@ func TestArchiveUsesSavedTargetsAndSeparateRoundDelta(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	request := CreateRequest{ID: "next", Title: "Next", Targets: ChoiceIDs{Cumulative: "initial", Reference: "incompatible"}}
-	if _, err := store.Create(request); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("expected incompatible targets to be rejected, got %v", err)
+	request := CreateRequest{ID: "historic", Title: "Historic references", Targets: ChoiceIDs{Cumulative: "initial", Reference: "incompatible"}}
+	if _, err := store.Create(request); err != nil {
+		t.Fatalf("historical harness should remain selectable: %v", err)
 	}
+	historical, err := store.Import(ImportConfig{Experiment: Label{ID: "historic"}, Compare: current})
+	if err != nil || historical.Comparisons.Reference.Warning == "" || historical.Comparisons.Reference.Result.Reached != 50 {
+		t.Fatalf("historical import lost comparison or harness warning: %+v %v", historical, err)
+	}
+	request.ID, request.Title = "next", "Next"
 	request.Targets.Reference = "reference"
 	draft, err := store.Create(request)
 	if err != nil || draft.Experiment.State != "draft" || draft.Comparisons.Cumulative.Result != nil {

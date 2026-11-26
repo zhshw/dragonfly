@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 	"dragonflydb.io/profile/pkg/trace"
 	"gorm.io/gorm"
 )
@@ -38,7 +38,7 @@ type TracePage struct {
 	Total          int64                    `json:"total"`
 	Limit          int                      `json:"limit"`
 	Offset         int                      `json:"offset"`
-	Stages         []langfuse.Stage         `json:"stages"`
+	Stages         []otel.Stage             `json:"stages"`
 	ApplyToConfirm *trace.ApplyConfirmation `json:"apply_to_confirm,omitempty"`
 }
 
@@ -49,16 +49,16 @@ type diagnosticRun struct {
 
 type traceMetric struct {
 	column string
-	value  func(langfuse.Stage) float64
+	value  func(otel.Stage) float64
 }
 
 var traceMetrics = map[string]traceMetric{
-	"union": {"union_ms", func(s langfuse.Stage) float64 { return s.Union }},
-	"sum":   {"COALESCE((statistics->>'sum_ms')::double precision, 0)", func(s langfuse.Stage) float64 { return s.Sum }},
-	"p50":   {"COALESCE((statistics->>'p50_ms')::double precision, 0)", func(s langfuse.Stage) float64 { return s.P50 }},
-	"p95":   {"COALESCE((statistics->>'p95_ms')::double precision, 0)", func(s langfuse.Stage) float64 { return s.P95 }},
-	"max":   {"COALESCE((statistics->>'max_ms')::double precision, 0)", func(s langfuse.Stage) float64 { return s.Max }},
-	"count": {"count", func(s langfuse.Stage) float64 { return float64(s.Count) }},
+	"union": {"union_ms", func(s otel.Stage) float64 { return s.Union }},
+	"sum":   {"COALESCE((statistics->>'sum_ms')::double precision, 0)", func(s otel.Stage) float64 { return s.Sum }},
+	"p50":   {"COALESCE((statistics->>'p50_ms')::double precision, 0)", func(s otel.Stage) float64 { return s.P50 }},
+	"p95":   {"COALESCE((statistics->>'p95_ms')::double precision, 0)", func(s otel.Stage) float64 { return s.P95 }},
+	"max":   {"COALESCE((statistics->>'max_ms')::double precision, 0)", func(s otel.Stage) float64 { return s.Max }},
+	"count": {"count", func(s otel.Stage) float64 { return float64(s.Count) }},
 }
 
 func (q *TraceQuery) validate() error {
@@ -90,7 +90,7 @@ func (q TraceQuery) page(run diagnosticRun) TracePage {
 	return TracePage{
 		ExperimentID: run.ExperimentID, Run: run.ID, Variant: run.Observation.Variant,
 		TraceURL: run.Profile.TraceURL, SpanCount: run.Profile.SpanCount, Verified: run.Profile.Verified,
-		Sort: q.Sort, Order: q.Order, Limit: q.Limit, Offset: q.Offset, Stages: []langfuse.Stage{},
+		Sort: q.Sort, Order: q.Order, Limit: q.Limit, Offset: q.Offset, Stages: []otel.Stage{},
 	}
 }
 
@@ -163,7 +163,7 @@ func (s Store) Trace(id string, q TraceQuery) (TracePage, error) {
 			return TracePage{}, err
 		}
 	}
-	stages := make([]langfuse.Stage, 0, len(run.Observation.Stages))
+	stages := make([]otel.Stage, 0, len(run.Observation.Stages))
 	for _, stage := range run.Observation.Stages {
 		if (q.Role == "" || stage.Role == q.Role) && strings.HasPrefix(stage.Name, q.Stage) && stage.Union >= q.MinUnionMS {
 			stages = append(stages, stage)

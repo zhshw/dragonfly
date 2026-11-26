@@ -11,7 +11,7 @@ import (
 	"slices"
 	"sort"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 type ApplyConfirmation struct {
@@ -39,7 +39,7 @@ type ConfirmationTime struct {
 }
 
 type offsetInterval struct {
-	langfuse.Interval
+	otel.Interval
 	first, last int64
 }
 
@@ -50,12 +50,12 @@ func AnalyzeApplyConfirmation(timeline io.Reader) (ApplyConfirmation, error) {
 		return ApplyConfirmation{}, err
 	}
 	var applies, confirmations, pipeline []offsetInterval
-	var applyTimes, workerQueue, tickets []langfuse.Interval
+	var applyTimes, workerQueue, tickets []otel.Interval
 	for _, event := range events {
 		if event.Kind != "X" || (event.Cat != "leader" && event.Cat != "client") {
 			continue
 		}
-		timing := langfuse.Interval{
+		timing := otel.Interval{
 			Begin: traceNS(event.Time),
 			End:   traceEnd(event),
 		}
@@ -109,10 +109,10 @@ func AnalyzeApplyConfirmation(timeline io.Reader) (ApplyConfirmation, error) {
 
 	result := ApplyConfirmation{
 		Confirmations: len(confirmations), PipelineWindows: len(pipeline), Tickets: len(tickets),
-		WorkerQueueInApply: langfuse.IntersectionMS(workerQueue, applyTimes), PeakInFlight: peakOverlaps(tickets),
+		WorkerQueueInApply: otel.IntersectionMS(workerQueue, applyTimes), PeakInFlight: peakOverlaps(tickets),
 	}
 	batchWrites := make(map[int]int)
-	postApply := make([]langfuse.Interval, 0, len(confirmations))
+	postApply := make([]otel.Interval, 0, len(confirmations))
 	delays := make([]int64, 0, len(confirmations))
 	for _, confirmation := range confirmations {
 		index := sort.Search(len(applies), func(i int) bool { return applies[i].last >= confirmation.last })
@@ -122,7 +122,7 @@ func AnalyzeApplyConfirmation(timeline io.Reader) (ApplyConfirmation, error) {
 		batchWrites[index]++
 		delay := confirmation.End - applies[index].End
 		delays = append(delays, delay)
-		postApply = append(postApply, langfuse.Interval{Begin: applies[index].End, End: confirmation.End})
+		postApply = append(postApply, otel.Interval{Begin: applies[index].End, End: confirmation.End})
 	}
 	if len(delays) == 0 {
 		return ApplyConfirmation{}, errors.New("no confirmations matched a completed apply range")
@@ -142,7 +142,7 @@ func AnalyzeApplyConfirmation(timeline io.Reader) (ApplyConfirmation, error) {
 		P50MS:   float64(delays[(len(delays)-1)/2]) / 1e6,
 		P95MS:   float64(delays[p95]) / 1e6,
 		MaxMS:   float64(delays[len(delays)-1]) / 1e6,
-		UnionMS: langfuse.UnionMS(postApply),
+		UnionMS: otel.UnionMS(postApply),
 		Over1MS: len(delays) - sort.Search(len(delays), func(i int) bool { return delays[i] > 1e6 }),
 	}
 	return result, nil
@@ -177,7 +177,7 @@ func (r *ApplyConfirmation) measurePipelineTails(pipeline, confirmations []offse
 	}
 }
 
-func peakOverlaps(intervals []langfuse.Interval) int {
+func peakOverlaps(intervals []otel.Interval) int {
 	var starts, ends []int64
 	for _, interval := range intervals {
 		if interval.Begin < interval.End {

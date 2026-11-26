@@ -47,6 +47,8 @@ export interface NodeProfile {
 }
 
 export interface DiagnosticSummary {
+  native?: boolean;
+  capture_id?: string;
   span_count: number;
   fsync_union_ms: number;
   nodes: Record<Role, NodeProfile>;
@@ -80,10 +82,12 @@ export function targetTitle(target?: Target) {
 export interface TargetComparison {
   target: Target;
   result?: { throughput_pct: number; p95_pct: number; target_throughput_pct: number };
+  warning?: string;
 }
 
 export interface Summary {
   experiment: ExperimentLabel;
+  harness_sha256: string;
   workload: Workload;
   variants: Partial<Record<Variant, { sha256: string; metrics: Metrics }>>;
   delta: { throughput_pct: number; p95_pct: number; paired_throughput_pct: number[] | null; paired_p95_pct?: number[] };

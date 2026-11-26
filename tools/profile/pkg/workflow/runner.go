@@ -107,8 +107,7 @@ func inputs(c Config) (map[string]string, string, error) {
 		return err
 	}
 	sources := []string{
-		"CMakeLists.txt", "src", "helio", "cmake", "tests/integration", "tools/raft-observability",
-		"tools/profile", "tools/raft-workflow",
+		"CMakeLists.txt", "src", "helio", "cmake", "tests/integration", "tools/profile",
 	}
 	for _, name := range sources {
 		path := filepath.Join(c.Repo, name)
@@ -142,15 +141,15 @@ func inputs(c Config) (map[string]string, string, error) {
 	paths = append(paths, filepath.Join(c.Release, "CMakeCache.txt"))
 	if c.Baseline != "" {
 		paths = append(paths, filepath.Join(c.Baseline, "dragonfly"), filepath.Join(c.Baseline, "raft_storage"))
+		if c.Diagnostics {
+			paths = append(paths, filepath.Join(c.Baseline, "CMakeCache.txt"))
+		}
 	}
 	for _, v := range c.Validation {
 		paths = append(paths, filepath.Join(v.Build, "CMakeCache.txt"))
 	}
 	if c.Diagnostics {
 		paths = append(paths, c.Profiler)
-		if c.Baseline != "" {
-			paths = append(paths, filepath.Join(c.BaselineProbe, "dragonfly"), filepath.Join(c.BaselineProbe, "sources.json"))
-		}
 	}
 	for _, path := range paths {
 		if err := add(path); err != nil {
@@ -352,10 +351,6 @@ func (r *Runner) validationLog(path string, env []string, args ...string) error 
 		return err
 	}
 	return errors.Join(r.commandTo(io.MultiWriter(r.Log, f), env, args...), f.Close())
-}
-
-func (r *Runner) python(script string, args ...string) error {
-	return r.command(nil, append([]string{"python3", filepath.Join(r.Config.Repo, script)}, args...)...)
 }
 
 func tail(path string) string {

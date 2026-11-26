@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strconv"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 type NodeDiagnostic struct {
@@ -27,6 +27,8 @@ type NodeDiagnostic struct {
 }
 
 type Diagnostic struct {
+	Native     bool                      `json:"native,omitempty"`
+	CaptureID  string                    `json:"capture_id,omitempty"`
 	ProbeSHA   string                    `json:"probe_sha256"`
 	Frequency  float64                   `json:"frequency_hz"`
 	SpanCount  int                       `json:"span_count"`
@@ -35,9 +37,15 @@ type Diagnostic struct {
 }
 
 // ReadDiagnostic reads the full trace once and returns compact statistics with the run result.
-func ReadDiagnostic(dir string, build BuildInfo, harness string) (Diagnostic, []langfuse.Stage, BenchRow, error) {
+func ReadDiagnostic(dir string, build BuildInfo, harness string) (Diagnostic, []otel.Stage, BenchRow, error) {
+	if report, err := ReadNativeDiagnostic(dir); err == nil {
+		d, row, err := readNativeDiagnostic(dir, report, build, harness)
+		return d, nil, row, err
+	} else if !os.IsNotExist(err) {
+		return Diagnostic{}, nil, BenchRow{}, err
+	}
 	var d Diagnostic
-	var report langfuse.Report
+	var report otel.Report
 	var empty BenchRow
 	if err := readJSON(filepath.Join(dir, "summary.json"), &report); err != nil {
 		return d, nil, empty, err
@@ -57,14 +65,14 @@ func ReadDiagnostic(dir string, build BuildInfo, harness string) (Diagnostic, []
 		return d, nil, row, errors.New("need complete trace and two profiled nodes")
 	}
 	d = Diagnostic{ProbeSHA: m.BinarySHA, Frequency: m.Frequency, SpanCount: report.Count, Nodes: map[string]NodeDiagnostic{}}
-	var events []langfuse.Span
+	var events []otel.Span
 	if err := readJSON(filepath.Join(dir, "spans.json"), &events); err != nil {
 		return d, nil, row, err
 	}
 	if len(events) != report.Count || len(events) == 0 {
 		return d, nil, row, errors.New("trace event count differs from report")
 	}
-	byNode := map[string]map[string][]langfuse.Interval{}
+	byNode := map[string]map[string][]otel.Interval{}
 	for _, span := range events {
 		role := m.Nodes[span.Node].Role
 		if span.Node == "client" {
@@ -74,11 +82,11 @@ func ReadDiagnostic(dir string, build BuildInfo, harness string) (Diagnostic, []
 			return d, nil, row, errors.New("trace event is outside the measurement window or has an invalid node")
 		}
 		if byNode[span.Node] == nil {
-			byNode[span.Node] = map[string][]langfuse.Interval{}
+			byNode[span.Node] = map[string][]otel.Interval{}
 		}
-		byNode[span.Node][span.Stage] = append(byNode[span.Node][span.Stage], langfuse.Interval{Begin: span.Start, End: span.End})
+		byNode[span.Node][span.Stage] = append(byNode[span.Node][span.Stage], otel.Interval{Begin: span.Start, End: span.End})
 	}
-	var allFsync []langfuse.Interval
+	var allFsync []otel.Interval
 	for node, info := range m.Nodes {
 		if n, err := strconv.Atoi(node); err != nil || n < 1 || strconv.Itoa(n) != node {
 			return d, nil, row, fmt.Errorf("invalid node id %q", node)
@@ -101,7 +109,7 @@ func ReadDiagnostic(dir string, build BuildInfo, harness string) (Diagnostic, []
 		if info.Role == "follower" {
 			work = "raft.log.append"
 		}
-		active := langfuse.Merged(fsync)
+		active := otel.Merged(fsync)
 		starts := 0
 		for _, v := range readings[work] {
 			i := sort.Search(len(active), func(i int) bool { return active[i].End > v.Begin })
@@ -112,10 +120,10 @@ func ReadDiagnostic(dir string, build BuildInfo, harness string) (Diagnostic, []
 		cpu := float64(samples) * 1000 / m.Frequency
 		d.Nodes[info.Role] = NodeDiagnostic{
 			Node: node, CPU: cpu, CPUPerMiB: cpu / float64(row.Payload), PeakRSS: info.After.Peak / 1024,
-			FsyncCount: len(fsync), FsyncAwait: langfuse.IntersectionMS(fsync, readings["raft.await_io"]),
-			WorkerQueue: langfuse.UnionMS(readings["raft.worker.queue"]), StartsDuringFsync: starts, Hotspots: top,
+			FsyncCount: len(fsync), FsyncAwait: otel.IntersectionMS(fsync, readings["raft.await_io"]),
+			WorkerQueue: otel.UnionMS(readings["raft.worker.queue"]), StartsDuringFsync: starts, Hotspots: top,
 		}
 	}
-	d.FsyncUnion = langfuse.UnionMS(allFsync)
-	return d, langfuse.Stages(events), row, nil
+	d.FsyncUnion = otel.UnionMS(allFsync)
+	return d, otel.Stages(events), row, nil
 }

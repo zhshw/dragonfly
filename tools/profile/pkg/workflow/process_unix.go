@@ -46,6 +46,14 @@ func executeIO(ctx context.Context, repo string, extra, args []string, input io.
 	values := map[string]string{}
 	for _, item := range os.Environ() {
 		k, v, _ := strings.Cut(item, "=")
+
+		// Diagnostics must be explicitly enabled for this subprocess.
+		// Keep a caller's trace/CPU environment out of formal measurements.
+		if strings.HasPrefix(k, "RAFT_TRACE_") || strings.HasPrefix(k, "OTEL_EXPORTER_") ||
+			strings.HasPrefix(k, "CPUPROFILE") || strings.HasPrefix(k, "PROFILE_DIAGNOSTIC_") ||
+			k == "PROFILE_CPU_PROFILER" || k == "LD_PRELOAD" || k == "RAFT_OBSERVE_DIR" {
+			continue
+		}
 		values[k] = v
 	}
 	values["PYTHONPATH"] = filepath.Join(repo, ".python-packages") + string(os.PathListSeparator) + values["PYTHONPATH"]

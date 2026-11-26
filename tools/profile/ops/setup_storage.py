@@ -1,4 +1,4 @@
-"""Install mount ordering and a boot service for this isolated observability stack."""
+"""Configure fstab mounts for the Profile data volume and ext4 storage image."""
 
 import argparse
 from datetime import datetime, timezone
@@ -8,7 +8,7 @@ import shutil
 import subprocess
 
 
-def install(device, storage, disk_image, compose, env_file):
+def install(device, storage, disk_image):
     if os.geteuid() != 0:
         raise PermissionError("Run setup_host.sh with sudo")
     uuid = subprocess.check_output(
@@ -36,30 +36,11 @@ def install(device, storage, disk_image, compose, env_file):
                 "\n# Dragonfly observability: existing NTFS volume and separate ext4 image.\n"
             )
             target.write("\n".join(entries.values()) + "\n")
-    command = f"/usr/bin/docker compose --env-file {env_file} -f {compose}"
-    unit = f"""[Unit]
-Description=Dragonfly Langfuse and profile artifacts
-Requires=docker.service
-After=docker.service
-RequiresMountsFor=/data {storage}
-ConditionPathIsMountPoint={storage}
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-TimeoutStartSec=900
-ExecStart={command} up -d --wait --wait-timeout 180
-ExecStop={command} stop
-
-[Install]
-WantedBy=multi-user.target
-"""
-    Path("/etc/systemd/system/dragonfly-observability.service").write_text(unit)
-    print("Installed fstab entries and dragonfly-observability.service")
+    print("Installed Profile storage mount entries in fstab")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("device", "storage", "disk-image", "compose", "env-file"):
+    for name in ("device", "storage", "disk-image"):
         parser.add_argument("--" + name, required=True)
     install(**vars(parser.parse_args()))

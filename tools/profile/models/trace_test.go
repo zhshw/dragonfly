@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 	"dragonflydb.io/profile/pkg/workflow"
 )
 
@@ -21,7 +21,7 @@ func TestTraceFiltersBeforeSortingAndPagination(t *testing.T) {
 			{ID: "benchmark-current-1", Kind: "benchmark", Variant: "current"},
 			{ID: "diagnostic-current", Kind: "diagnostic", Variant: "current"},
 		},
-		Observations: []Observation{{Variant: "current", Stages: []langfuse.Stage{
+		Observations: []Observation{{Variant: "current", Stages: []otel.Stage{
 			{Node: "12", Role: "follower", Name: "raft.fetch.small", Union: 4, P95: 1},
 			{Node: "12", Role: "follower", Name: "raft.fetch.first", Union: 35, P95: 20},
 			{Node: "12", Role: "follower", Name: "raft.fetch.second", Union: 40, P95: 10},

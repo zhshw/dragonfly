@@ -10,19 +10,19 @@ import (
 	"slices"
 	"strconv"
 
-	"dragonflydb.io/profile/pkg/langfuse"
+	"dragonflydb.io/profile/pkg/otel"
 )
 
 type FetchWait struct {
 	FetchRequest
-	IOMS          float64             `json:"io_ms"`
-	SyncOverlapMS float64             `json:"sync_overlap_ms"`
-	SyncOverlap   []langfuse.Interval `json:"sync_overlap_ns,omitempty"`
-	Offset        int64               `json:"offset,omitempty"`
-	ReplyGap      *ReplyGap           `json:"reply_gap,omitempty"`
-	LeaderWAL     *Event              `json:"leader_wal,omitempty"`
-	LeaderHW      *Event              `json:"leader_hw,omitempty"`
-	LeaderReply   *Event              `json:"leader_reply,omitempty"`
+	IOMS          float64         `json:"io_ms"`
+	SyncOverlapMS float64         `json:"sync_overlap_ms"`
+	SyncOverlap   []otel.Interval `json:"sync_overlap_ns,omitempty"`
+	Offset        int64           `json:"offset,omitempty"`
+	ReplyGap      *ReplyGap       `json:"reply_gap,omitempty"`
+	LeaderWAL     *Event          `json:"leader_wal,omitempty"`
+	LeaderHW      *Event          `json:"leader_hw,omitempty"`
+	LeaderReply   *Event          `json:"leader_reply,omitempty"`
 }
 
 type FetchWaitReport struct {
@@ -122,21 +122,21 @@ func replyGapNS(g *ReplyGap) int64 {
 }
 
 func (r *FetchWait) measureIO() {
-	var ioWaits, overlaps []langfuse.Interval
+	var ioWaits, overlaps []otel.Interval
 	for _, wait := range r.AwaitIO {
 		start := max(r.RPCReturnNS, traceNS(wait.Time))
 		end := min(r.ReceiveStartNS, traceEnd(wait))
-		ioWaits = append(ioWaits, langfuse.Interval{Begin: start, End: end})
+		ioWaits = append(ioWaits, otel.Interval{Begin: start, End: end})
 		for _, sync := range r.Fsync {
 			lo, hi := max(start, traceNS(sync.Time)), min(end, traceEnd(sync))
 			if lo < hi {
-				overlaps = append(overlaps, langfuse.Interval{Begin: lo, End: hi})
+				overlaps = append(overlaps, otel.Interval{Begin: lo, End: hi})
 			}
 		}
 	}
-	r.IOMS = langfuse.UnionMS(ioWaits)
-	r.SyncOverlap = langfuse.Merged(overlaps)
-	r.SyncOverlapMS = langfuse.UnionMS(r.SyncOverlap)
+	r.IOMS = otel.UnionMS(ioWaits)
+	r.SyncOverlap = otel.Merged(overlaps)
+	r.SyncOverlapMS = otel.UnionMS(r.SyncOverlap)
 }
 
 func (r *FetchWait) matchLeader(events []Event) {

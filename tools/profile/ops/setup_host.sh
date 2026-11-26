@@ -8,7 +8,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-profile_dir=$(cd -- "$script_dir/../profile" && pwd)
+profile_dir=$(cd -- "$script_dir/.." && pwd)
 compose=$profile_dir/compose.yaml
 task_user=zhangshenwang
 task_uid=$(id -u "$task_user")
@@ -74,11 +74,9 @@ if [[ ! -e $env_file ]]; then
     --env-file "$env_file" --storage-root "$storage/state"
 fi
 docker compose --env-file "$env_file" -f "$compose" config -q
-python3 "$script_dir/persist_host.py" --device "$device" --storage "$storage" \
-  --disk-image "$disk_image" --compose "$compose" --env-file "$env_file"
-systemctl daemon-reload
-systemctl enable dragonfly-observability.service
-systemctl start dragonfly-observability.service
+python3 "$script_dir/setup_storage.py" --device "$device" --storage "$storage" \
+  --disk-image "$disk_image"
+docker compose --env-file "$env_file" -f "$compose" up -d --wait --wait-timeout 180
 findmnt --mountpoint /data
 findmnt --mountpoint "$storage"
 echo "Langfuse: http://172.31.23.2:3007 ; profile artifacts: http://172.31.23.2:3137"

@@ -121,6 +121,7 @@ func (m *Manager) Start(ctx context.Context, draft models.Summary, restart bool)
 	}
 	config := m.config
 	config.Output = m.output(id, attempt)
+	config.Experiment = id
 	if err := os.MkdirAll(filepath.Dir(config.Output), 0750); err != nil {
 		return err
 	}

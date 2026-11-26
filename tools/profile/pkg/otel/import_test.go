@@ -1,7 +1,7 @@
 // Copyright 2026, DragonflyDB authors. All rights reserved.
 // See LICENSE for licensing terms.
 
-package langfuse
+package otel
 
 import (
 	"context"
@@ -112,7 +112,7 @@ func TestImportVerifiesEveryObservationAndSkipsExistingIDs(t *testing.T) {
 	}))
 	defer srv.Close()
 	for i := 0; i < 2; i++ {
-		receipt, err := Import(context.Background(), run, Config{URL: srv.URL, EnvFile: env})
+		receipt, err := Import(context.Background(), run, LangfuseConfig{URL: srv.URL, EnvFile: env})
 		if err != nil {
 			t.Fatal(err)
 		}

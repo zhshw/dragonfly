@@ -1,7 +1,7 @@
 // Copyright 2026, DragonflyDB authors. All rights reserved.
 // See LICENSE for licensing terms.
 
-package langfuse
+package otel
 
 import (
 	"context"
@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -156,27 +158,40 @@ func TestNativeRankingUsesExactMillisecondsAndExplicitIOIDs(t *testing.T) {
 	}
 }
 
+func nativeTestObservation(e NativeEvent) map[string]any {
+	metadata := map[string]any{}
+	for k, v := range e.Fields {
+		metadata[k] = v
+	}
+	metadata["start_ns"], metadata["end_ns"] = json.Number(e.Start), json.Number(e.End)
+	metadata["schema"], metadata["node_id"] = 3, 11
+	for k, v := range e.Values {
+		metadata["value."+k] = json.Number(v)
+	}
+	for k, v := range e.States {
+		metadata["state."+k] = v
+	}
+	return map[string]any{
+		"id": e.SpanID, "traceId": e.TraceID, "name": e.Name, "metadata": metadata,
+		"startTime": "2026-11-25T18:48:53.942Z", "endTime": "2026-11-25T18:49:05.932Z",
+	}
+}
+
+func nativeTestConfig(t *testing.T, server *httptest.Server) LangfuseConfig {
+	t.Helper()
+	t.Cleanup(server.Close)
+	credentials := filepath.Join(t.TempDir(), "env")
+	if err := os.WriteFile(credentials, []byte("LANGFUSE_PUBLIC_KEY=test\nLANGFUSE_SECRET_KEY=test\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return LangfuseConfig{URL: server.URL, EnvFile: credentials}
+}
+
 func TestNativeQueryReadsAllPagesAndPreservesMetadataPrecision(t *testing.T) {
 	root := nativeManifest(1)
 	e := nativeEvent("1", "raft.fetch", "1", 9007199254740993)
 	e.Values["raft.fetch.return_wait"] = "17.909001"
 	e.States["raft.fetch.return_wait"] = "Observed"
-	encode := func(e NativeEvent) map[string]any {
-		metadata := map[string]any{}
-		for k, v := range e.Fields {
-			metadata[k] = v
-		}
-		metadata["start_ns"], metadata["end_ns"] = json.Number(e.Start), json.Number(e.End)
-		metadata["schema"] = 3
-		metadata["node_id"] = 11
-		for k, v := range e.Values {
-			metadata["value."+k] = json.Number(v)
-		}
-		for k, v := range e.States {
-			metadata["state."+k] = v
-		}
-		return map[string]any{"id": e.SpanID, "traceId": e.TraceID, "name": e.Name, "metadata": metadata}
-	}
 	pages := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pages++
@@ -185,22 +200,90 @@ func TestNativeQueryReadsAllPagesAndPreservesMetadataPrecision(t *testing.T) {
 			t.Errorf("invalid capture filter: %v", filters)
 		}
 		if r.URL.Query().Get("cursor") == "" {
-			json.NewEncoder(w).Encode(map[string]any{"data": []any{encode(root)}, "meta": map[string]string{"cursor": "page2"}})
+			json.NewEncoder(w).Encode(map[string]any{"data": []any{nativeTestObservation(root)}, "meta": map[string]string{"cursor": "page2"}})
 		} else {
-			json.NewEncoder(w).Encode(map[string]any{"data": []any{encode(e)}})
+			json.NewEncoder(w).Encode(map[string]any{"data": []any{nativeTestObservation(e)}})
 		}
 	}))
-	defer server.Close()
-	credentials := filepath.Join(t.TempDir(), "env")
-	if err := os.WriteFile(credentials, []byte("LANGFUSE_PUBLIC_KEY=test\nLANGFUSE_SECRET_KEY=test\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	r, err := QueryNative(context.Background(), Config{URL: server.URL, EnvFile: credentials}, "v15", "capture", NativeQuery{Name: "raft.fetch", Attribute: "raft.fetch.return_wait", Limit: 10})
+	r, err := QueryNative(context.Background(), nativeTestConfig(t, server), "v15", "capture", NativeQuery{Name: "raft.fetch", Attribute: "raft.fetch.return_wait", Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if pages != 2 || !r.Complete || r.Rows[0].Start != "9007199254740993" || r.Rows[0].Values["raft.fetch.return_wait"] != "17.909001" {
 		t.Fatalf("native read changed values or skipped a page: %+v", r)
+	}
+}
+
+func TestNativeReaderReusesCaptureWithFullMetadata(t *testing.T) {
+	root := nativeTestObservation(nativeManifest(1))
+	tickets := strings.Repeat("1234,", 50) + "5678"
+	e := nativeEvent("1", "raft.fetch", "1", 100)
+	e.Fields["ticket_ids"] = tickets
+	full := nativeTestObservation(e)
+	e.Fields["ticket_ids"] = tickets[:200]
+	core := nativeTestObservation(e)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		q := r.URL.Query()
+		rows := []any{root}
+		if q.Get("name") == "raft.capture" {
+			if q.Get("fields") != "core" || q.Has("expandMetadata") {
+				t.Error("manifest request should only fetch core fields")
+			}
+		} else {
+			if q.Get("fromStartTime") != "2026-11-25T18:48:53.941Z" || q.Get("toStartTime") != "2026-11-25T18:49:05.933Z" {
+				t.Errorf("wrong capture bounds: %v", q)
+			}
+			if q.Get("expandMetadata") == "ticket_ids" {
+				rows = append(rows, full)
+			} else {
+				rows = append(rows, core)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": rows})
+	}))
+	reader := NewNativeReader(NativeConfig{Langfuse: nativeTestConfig(t, server)})
+	r, err := reader.Query(context.Background(), "v15", "capture", NativeQuery{Limit: 10})
+	if err != nil || !r.Complete || r.Total != 1 || r.Selected == nil || r.Selected.Fields["ticket_ids"] != tickets {
+		t.Fatalf("first query lost long metadata: %+v %v", r, err)
+	}
+	r, err = reader.Query(context.Background(), "v15", "capture", NativeQuery{Limit: 10, Name: "raft.fetch", Selected: "stream:1"})
+	if err != nil || !r.Complete || r.Selected == nil || r.Selected.Fields["ticket_ids"] != tickets || calls.Load() != 3 {
+		t.Fatalf("second query did not reuse the complete capture: %+v %v (calls %d)", r, err, calls.Load())
+	}
+}
+
+func TestNativeReaderRetriesIncompleteCapture(t *testing.T) {
+	root := nativeTestObservation(nativeManifest(1))
+	event := nativeTestObservation(nativeEvent("1", "raft.fetch", "1", 100))
+	var ready atomic.Bool
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		q := r.URL.Query()
+		rows := []any{root}
+		if q.Get("name") == "" && !q.Has("fromStartTime") {
+			if q.Get("expandMetadata") != "ticket_ids" {
+				t.Error("unbounded fallback should fetch original metadata")
+			}
+			if ready.Load() {
+				rows = append(rows, event)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": rows})
+	}))
+	reader := NewNativeReader(NativeConfig{Langfuse: nativeTestConfig(t, server)})
+	r, err := reader.Query(context.Background(), "v15", "capture", NativeQuery{Limit: 10})
+	if err != nil || r.Complete || calls.Load() != 3 {
+		t.Fatalf("expected an incomplete result after the unbounded retry: %+v %v (calls %d)", r, err, calls.Load())
+	}
+	ready.Store(true)
+	for i := 0; i < 2; i++ {
+		r, err = reader.Query(context.Background(), "v15", "capture", NativeQuery{Limit: 10})
+		if err != nil || !r.Complete || r.Total != 1 || calls.Load() != 6 {
+			t.Fatalf("expected a newly complete result to be cached: %+v %v (calls %d)", r, err, calls.Load())
+		}
 	}
 }
 
