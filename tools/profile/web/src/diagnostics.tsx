@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from 'react';
 import { ArrowDownToLine, ArrowUpRight, Flame, Search, Workflow } from 'lucide-react';
 import { api, artifactURL, endpoint, number, targetTitle } from './model';
 import type { DiagnosticCapture, DiagnosticComparison, DiagnosticSummary, ReferenceDiagnostics, Role, Stage } from './model';
+import { FlamegraphHotspots } from './flamegraph-hotspots';
 
 type Panel = { key: 'current' | 'previous' | 'reference'; title: string; id?: string; capture?: DiagnosticCapture; raft?: boolean };
 type EventSummary = {
@@ -14,9 +15,12 @@ export function DiagnosticsView({ id, view, referenceID }: { id: string; view: '
   const [comparison, setComparison] = useState<DiagnosticComparison>();
   const [reference, setReference] = useState<ReferenceDiagnostics>();
   const [role, setRole] = useState<Role>('leader');
+  const [flameTab, setFlameTab] = useState<'current' | 'previous'>('current');
   const [compareWith, setCompareWith] = useState<'previous' | 'reference'>('previous');
   const [request, setRequest] = useState(0);
   const [error, setError] = useState('');
+  const isCPU = view === 'flamegraphs';
+  const traceReferenceID = isCPU ? undefined : referenceID;
   useEffect(() => {
     const abort = new AbortController();
     setComparison(undefined);
@@ -24,17 +28,16 @@ export function DiagnosticsView({ id, view, referenceID }: { id: string; view: '
     setError('');
     Promise.all([
       api<DiagnosticComparison>(`${endpoint(id)}/diagnostic-comparison`, { signal: abort.signal }),
-      referenceID ? api<ReferenceDiagnostics>(`/api/v1/comparison-targets/${encodeURIComponent(referenceID)}/diagnostics`, { signal: abort.signal }) : Promise.resolve(undefined),
+      traceReferenceID ? api<ReferenceDiagnostics>(`/api/v1/comparison-targets/${encodeURIComponent(traceReferenceID)}/diagnostics`, { signal: abort.signal }) : Promise.resolve(undefined),
     ]).then(([comparison, reference]) => {
       if (abort.signal.aborted) return;
       setComparison(comparison);
       setReference(reference);
     }).catch((e) => { if (!abort.signal.aborted) setError(e.message); });
     return () => abort.abort();
-  }, [id, referenceID, request]);
+  }, [id, traceReferenceID, request]);
 
-  const isCPU = view === 'flamegraphs';
-  const showReference = !!reference && (compareWith === 'reference' || !comparison?.previous_id);
+  const showReference = !isCPU && !!reference && (compareWith === 'reference' || !comparison?.previous_id);
   const panels: Panel[] = [
     { key: 'current', title: '本轮', id, capture: comparison?.current },
     showReference && reference ? {
@@ -42,13 +45,14 @@ export function DiagnosticsView({ id, view, referenceID }: { id: string; view: '
       id: reference.target.id, capture: reference.capture, raft: reference.target.mode === 'raft',
     } : { key: 'previous', title: '上一轮', id: comparison?.previous_id, capture: comparison?.previous },
   ];
+  const activeFlame = panels[flameTab === 'previous' && comparison?.previous_id ? 1 : 0];
 
   return <div className={isCPU ? 'view-content' : 'view-content trace-view'}>
     <div className="section-toolbar">
-      <div><h2>{isCPU ? 'CPU 火焰图' : 'Trace'}</h2><p>{isCPU ? '按节点角色查看。火焰图支持点击缩放和搜索。' : 'Trace captures and aggregate event durations.'}</p></div>
+      <div><h2>{isCPU ? 'CPU 火焰图' : 'Trace'}</h2>{!isCPU && <p>Trace captures and aggregate event durations.</p>}</div>
       {isCPU && <NodeRolePicker role={role} setRole={setRole} />}
     </div>
-    {comparison?.previous_id && reference &&
+    {!isCPU && comparison?.previous_id && reference &&
       <div className="section-toolbar">
         <h3>对照</h3>
         <div className="segments" role="group" aria-label="诊断对照">
@@ -58,9 +62,25 @@ export function DiagnosticsView({ id, view, referenceID }: { id: string; view: '
       </div>}
     {error ? <div role="alert" className="notice">{error} <button className="text-link" onClick={() => { setError(''); setRequest((n) => n + 1); }}>重试</button></div> :
       !comparison ? <div className="panel inline-empty" role="status">正在读取诊断记录…</div> : <>
-        {isCPU ? <div className="diagnostic-columns">
-          {panels.map((panel) => <FlamegraphPanel key={panel.key} panel={panel} role={role} />)}
-        </div> : <TraceOverview panels={panels} />}
+        {isCPU ? <>
+          {comparison.previous_id && <div className="section-toolbar">
+            <div className="segments" role="tablist" aria-label="火焰图轮次" onKeyDown={(event) => {
+              const key = event.key;
+              if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(key)) return;
+              event.preventDefault();
+              const next = key === 'Home' ? 'current' : key === 'End' || activeFlame.key === 'current' ? 'previous' : 'current';
+              setFlameTab(next);
+              event.currentTarget.querySelector<HTMLButtonElement>(`#flame-tab-${next}`)?.focus();
+            }}>
+              {panels.map((panel) => <button key={panel.key} id={`flame-tab-${panel.key}`} role="tab" aria-controls="flame-tab-panel"
+                aria-selected={panel.key === activeFlame.key} tabIndex={panel.key === activeFlame.key ? 0 : -1}
+                onClick={() => setFlameTab(panel.key === 'previous' ? 'previous' : 'current')}>{panelTitle(panel)}</button>)}
+            </div>
+          </div>}
+          <div id="flame-tab-panel" className="capture-stack" role={comparison.previous_id ? 'tabpanel' : undefined} aria-labelledby={comparison.previous_id ? `flame-tab-${activeFlame.key}` : undefined}>
+            <FlamegraphPanel panel={activeFlame} role={role} />
+          </div>
+        </> : <TraceOverview panels={panels} />}
       </>}
   </div>;
 }
@@ -116,8 +136,8 @@ function FlamegraphPanel({ panel, role }: { panel: Panel; role: Role }) {
   const capture = panel.capture;
   const selected = capture?.observation.flamegraphs[role];
   const graph = capture && selected && artifactURL(capture.experiment_id, selected);
-  const profile = capture?.profile.nodes[role];
   return <div className="capture-stack">
+    {capture && selected && <FlamegraphHotspots key={graph} url={artifactURL(capture.experiment_id, `${selected}-folded`)} profile={capture.profile.nodes[role]} />}
     <section className="panel graph-panel">
       <div className="panel-heading">
         <SourceHeading panel={panel} />
@@ -125,12 +145,6 @@ function FlamegraphPanel({ panel, role }: { panel: Panel; role: Role }) {
       </div>
       {graph ? <iframe key={graph} title={`${panelTitle(panel)} ${role} CPU 火焰图`} src={graph} sandbox="allow-scripts" /> : <div className="inline-empty"><Flame size={22} /><p>{panel.key === 'previous' && !panel.id ? '暂无上一轮火焰图' : '此节点暂无火焰图'}</p></div>}
     </section>
-    {profile && <section className="panel data-panel">
-      <div className="panel-heading"><div><h2>CPU 热点</h2><p>按叶子函数的样本数排序</p></div><span className="count-label">{number(profile.cpu_ms, 0)} ms CPU</span></div>
-      <div className="table-scroll"><table className="data-table"><thead><tr><th>函数</th><th>样本</th><th>占比</th></tr></thead>
-        <tbody>{profile.hotspots.map((hotspot) => <tr key={hotspot.function}><td className="mono hotspot" title={hotspot.function}>{hotspot.function}</td><td className="mono">{hotspot.samples}</td><td className="mono">{number(hotspot.percent, 1)}%</td></tr>)}</tbody>
-      </table></div>
-    </section>}
   </div>;
 }
 

@@ -95,7 +95,11 @@ func (m *Manager) Start(ctx context.Context, draft models.Summary, restart bool)
 	if draft.Experiment.State != "draft" {
 		return ErrComplete
 	}
-	if err := draft.CheckWorkflow(m.config.Repo); err != nil {
+	config, err := m.config.ForExperiment(id)
+	if err != nil {
+		return fmt.Errorf("%w: %w", models.ErrInvalid, err)
+	}
+	if err := draft.CheckWorkflow(config.Repo); err != nil {
 		return err
 	}
 	last, err := m.store.Execution(ctx, id)
@@ -119,9 +123,7 @@ func (m *Manager) Start(ctx context.Context, draft models.Summary, restart bool)
 			attempt++
 		}
 	}
-	config := m.config
 	config.Output = m.output(id, attempt)
-	config.Experiment = id
 	if err := os.MkdirAll(filepath.Dir(config.Output), 0750); err != nil {
 		return err
 	}
@@ -224,7 +226,7 @@ func (m *Manager) run(id string, attempt int, config workflow.Config, resume boo
 	file, err := os.OpenFile(config.Output+".log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 	if err == nil {
 		defer file.Close()
-		fmt.Fprintf(file, "[%s] %s\n", time.Now().Format(time.RFC3339), id)
+		fmt.Fprintf(file, "[%s] %s\nSource: %s\n", time.Now().Format(time.RFC3339), id, config.Repo)
 		err = m.collectAndArchive(id, config, resume, file)
 	}
 	if err != nil {

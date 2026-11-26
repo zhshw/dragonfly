@@ -167,6 +167,27 @@ small { font-size: .85em; }
 .capture-stack { min-width: 0; display: grid; align-content: start; gap: 14px; }
 .graph-panel iframe { display: block; width: 100%; height: min(410px, 62vh); border: 0; border-top: 1px solid var(--border); border-radius: 0 0 12px 12px; background: #fffdf6; }
 .graph-panel .panel-heading { align-items: center; }
+.hotspot-ranking { min-width: 0; }
+.hotspot-controls { align-items: center; }
+.hotspot-status { padding: 8px 17px; color: var(--muted); font-size: 12px; }
+.hotspot-table { table-layout: fixed; }
+.hotspot-table th { vertical-align: top; }
+.hotspot-table :is(th, td):first-child { overflow: hidden; text-overflow: ellipsis; }
+.hotspot-table :is(th, td).hotspot-measure { width: clamp(58px, 12vw, 110px); text-align: right; font-variant-numeric: tabular-nums; }
+.hotspot-link { display: flex; gap: 6px; align-items: center; width: 100%; border: 0; padding: 2px 0; background: transparent; color: var(--ink); text-align: left; }
+.hotspot-link:hover, .hotspot-link[aria-expanded='true'] { color: var(--accent); }
+.hotspot-link[aria-expanded='true'] svg { transform: rotate(90deg); }
+.hotspot-link span, .hotspot-paths summary span { overflow: hidden; text-overflow: ellipsis; }
+.hotspot-table td.hotspot-expanded { background: #f8f9fc; white-space: normal; padding-block: 12px 15px; }
+.hotspot-paths { min-width: 0; }
+.hotspot-paths details + details { margin-top: 5px; }
+.hotspot-paths details { background: white; border: 1px solid var(--border); border-radius: 6px; }
+.hotspot-paths summary { display: flex; align-items: center; gap: 8px; padding: 7px; cursor: pointer; white-space: nowrap; }
+.hotspot-paths summary::before { content: '▸'; color: var(--muted); }
+.hotspot-paths details[open] summary::before { content: '▾'; }
+.hotspot-paths summary strong { font-size: 11px; }
+.hotspot-paths ol { margin: 0; border-top: 1px solid var(--border); padding: 7px 8px 8px 32px; overflow-wrap: anywhere; }
+.hotspot-paths li + li { margin-top: 4px; }
 .capture-trace-body { padding: 0 17px 16px; }
 .capture-trace-body strong { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .trace-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }

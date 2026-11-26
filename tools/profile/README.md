@@ -84,6 +84,8 @@ profile backfill -data "$experiment_data" -archive docs/cluster/benchmarks
 }
 ```
 
+Web 和 `profile run -id` 以 `repo` 为目录前缀。运行 `v18b` 时，执行机从 `~/workspace/db/dragonfly-io-uring-20261123-v18b` 读取源码，相对的 `release_build` 和 `validation[].build` 指向该目录下的构建。请先准备本轮源码，再为该目录配置 CMake。启动时检查每个 CMake cache 的源码和构建路径，运行日志记录源码目录，检查点保存源码指纹。独立运行 `profile run -config FILE` 时，`repo` 是完整的源码目录。
+
 构建目录须启用 `-DWITH_RAFT_OTEL=ON`（Raft 使用 Folly I/O）。workflow 不修改 CMake 配置；正式压测清除 Trace/CPU 采集环境，诊断才设置 capture 身份与凭据。Langfuse 默认使用本机 3007 和受保护的 `/data/dragonfly-observability/config/langfuse.env`，可用 `langfuse.url` / `langfuse.env_file` 覆盖。
 
 压测、集群管理、恢复校验和 CPU 采样控制由 `pkg/benchmark` 的 Go 实现完成，workflow 直接调用。Python 仅用于配置中选定的集成回归。Go 压测器使用独立的源码哈希；历史 Python 归档仍可选为对照，版本差异会显示在比较结果中。
@@ -122,7 +124,9 @@ profile delete -id v11
 
 已完成实验可在总览点击「配置对照」，或使用 `comparisons` 修改基准、上一轮和参照。CLI 未指定的字段保持原值，显式传空值可清除；不同压测版本仍展示历史数值和差值，并标明差异。配置仅更新对照关系，不重跑实验。
 
-Cluster 对照统一使用 `v0:cluster`；火焰图页可在上一轮和此参照之间切换。
+Cluster 对照统一使用 `v0:cluster`，从实验总览进入基准诊断。
+
+「火焰图」页分本轮和上一轮。在各轮原图上方可查看 CPU 热点排行，切换函数自身、包含子调用或完整调用栈，搜索函数或调用路径。点击「样本」表头切换顺序，点击热点查看调用来源。旧归档只保存叶子热点时，显示已有记录。
 
 `run -id` 等到入库后退出，失败后再次运行可继续。`show` 输出三轮指标。页面和 CLI 都能删除 PostgreSQL 实验及其平台归档。正在运行或被其他实验用作对照时，删除请求返回具体原因。对外发布的诊断由各自服务管理。
 
