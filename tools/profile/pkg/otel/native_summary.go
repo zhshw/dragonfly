@@ -15,32 +15,40 @@ import (
 // NativeSummary counts recorded events, including zero-duration points, excluding manifests.
 // Stages retains the archive response shape for comparisons with older captures.
 type NativeSummary struct {
-	Capture    string   `json:"capture_id"`
-	Complete   bool     `json:"complete"`
-	Issues     []string `json:"issues"`
-	Total      int      `json:"total"`
-	EventNames []string `json:"event_names"`
-	Stages     []Stage  `json:"stages"`
-	RoleStages []Stage  `json:"role_stages"`
-	Scope      string   `json:"scope"`
+	Capture              string   `json:"capture_id"`
+	Complete             bool     `json:"complete"`
+	Issues               []string `json:"issues"`
+	Total                int      `json:"total"`
+	EventNames           []string `json:"event_names"`
+	Stages               []Stage  `json:"stages"`
+	RoleStages           []Stage  `json:"role_stages"`
+	Scope                string   `json:"scope"`
+	ProtocolWaitsOmitted int      `json:"protocol_waits_omitted"`
 }
 
 // Summary uses the same validated capture and cache as Slow Path and Fetch delay queries.
 // It aggregates recorded span boundaries without deriving business wait attributes.
 func (r *NativeReader) Summary(ctx context.Context, experiment, capture string) (NativeSummary, error) {
-	return r.SummaryWindow(ctx, experiment, capture, Window{}, nil)
+	return r.SummaryWindow(ctx, experiment, capture, Window{}, nil, false)
 }
 
 // SummaryWindow clips intersecting spans to the same measurement bounds as archived traces.
-func (r *NativeReader) SummaryWindow(ctx context.Context, experiment, capture string, window Window, nodeRoles map[string]string) (NativeSummary, error) {
+func (r *NativeReader) SummaryWindow(ctx context.Context, experiment, capture string, window Window, nodeRoles map[string]string, excludeProtocolWaits bool) (NativeSummary, error) {
 	data, err := r.load(ctx, experiment, capture)
 	if err != nil {
 		return NativeSummary{}, err
 	}
-	return data.eventSummary(window, nodeRoles)
+	return data.eventSummary(window, nodeRoles, excludeProtocolWaits)
 }
 
-func (data *nativeCaptureData) eventSummary(window Window, nodeRoles map[string]string) (NativeSummary, error) {
+func clipToWindow(start, end int64, window Window) (Interval, bool) {
+	if end < window.Start || start > window.End || (end > start && (end == window.Start || start == window.End)) {
+		return Interval{}, false
+	}
+	return Interval{max(start, window.Start), min(end, window.End)}, true
+}
+
+func (data *nativeCaptureData) eventSummary(window Window, nodeRoles map[string]string, excludeProtocolWaits bool) (NativeSummary, error) {
 	r := NativeSummary{Capture: data.summary.Capture, Complete: data.summary.Complete,
 		Issues: data.summary.Issues, Scope: "capture"}
 	if window.Start != 0 || window.End != 0 {
@@ -78,10 +86,15 @@ func (data *nativeCaptureData) eventSummary(window Window, nodeRoles map[string]
 			return r, fmt.Errorf("invalid event boundaries for %s", e.Name)
 		}
 		if r.Scope == "measurement" {
-			if end < window.Start || start > window.End || (end > start && (end == window.Start || start == window.End)) {
+			interval, ok := clipToWindow(start, end, window)
+			if !ok {
 				continue
 			}
-			start, end = max(start, window.Start), min(end, window.End)
+			start, end = interval.Begin, interval.End
+		}
+		if excludeProtocolWaits && data.protocolWait(e) {
+			r.ProtocolWaitsOmitted++
+			continue
 		}
 		names[e.Name] = true
 		role := strings.ToLower(strings.Join(e.NodeRoles, " / "))

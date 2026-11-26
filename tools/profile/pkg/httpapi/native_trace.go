@@ -5,6 +5,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -22,18 +23,19 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 		}
 		return true
 	}
-	ready := func(w http.ResponseWriter, r *http.Request) bool {
+	readRecord := func(w http.ResponseWriter, r *http.Request) (models.Record, bool) {
 		if !configured(w) {
-			return false
+			return models.Record{}, false
 		}
-		if _, err := store.Get(r.PathValue("id")); err != nil {
+		record, err := store.Get(r.PathValue("id"))
+		if err != nil {
 			respondError(w, err)
-			return false
+			return models.Record{}, false
 		}
-		return true
+		return record, true
 	}
 	api.HandleFunc("GET /api/v1/experiments/{id}/captures", func(w http.ResponseWriter, r *http.Request) {
-		if !ready(w, r) {
+		if _, ok := readRecord(w, r); !ok {
 			return
 		}
 		captures, err := otel.NativeCaptures(r.Context(), config.Langfuse, r.PathValue("id"))
@@ -44,48 +46,39 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 		writeJSON(w, http.StatusOK, map[string]any{"captures": captures})
 	})
 	api.HandleFunc("GET /api/v1/experiments/{id}/event-summary", func(w http.ResponseWriter, r *http.Request) {
-		if !configured(w) {
+		record, ok := readRecord(w, r)
+		if !ok {
 			return
 		}
-		id := r.PathValue("id")
-		record, err := store.Get(id)
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		capture := r.URL.Query().Get("capture")
+		params := r.URL.Query()
+		capture := params.Get("capture")
 		if capture == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "capture is required"})
 			return
 		}
-		var window otel.Window
-		scope := r.URL.Query().Get("scope")
+		scope := params.Get("scope")
 		if scope != "" && scope != "measurement" && scope != "capture" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid scope"})
 			return
 		}
 		nodeRoles := map[string]string{}
-		for variant, diagnostic := range record.Summary.Diagnostics {
-			if diagnostic.CaptureID != capture {
-				continue
-			}
-			for role, info := range diagnostic.Nodes {
-				nodeRoles[info.Node] = role
-			}
-			if scope != "capture" {
-				data, err := store.Measurement(id, "diagnostic-"+variant)
-				if err != nil || json.Unmarshal(data, &window) != nil || window.Start <= 0 || window.End <= window.Start {
-					writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Capture has no valid measurement window"})
-					return
-				}
-			}
-			break
+		variant, diagnostic := nativeDiagnosticFor(record, capture)
+		for role, info := range diagnostic.Nodes {
+			nodeRoles[info.Node] = role
 		}
-		if scope != "capture" && window.Start == 0 {
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Capture is not linked to a diagnostic measurement; use scope=capture for the full capture"})
+		include := params.Get("include_protocol_waits")
+		if include != "" && include != "0" && include != "1" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid include_protocol_waits"})
 			return
 		}
-		report, err := reader.SummaryWindow(r.Context(), id, capture, window, nodeRoles)
+		id := r.PathValue("id")
+		window, err := nativeWindow(store, id, variant, scope)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+			return
+		}
+		exclude := include == "0" || (include == "" && scope != "capture")
+		report, err := reader.SummaryWindow(r.Context(), id, capture, window, nodeRoles, exclude)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
@@ -93,21 +86,27 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 		writeJSON(w, http.StatusOK, report)
 	})
 	query := func(w http.ResponseWriter, r *http.Request) {
-		if !ready(w, r) {
+		record, ok := readRecord(w, r)
+		if !ok {
 			return
 		}
 		p := r.URL.Query()
 		limit := 10
-		var err error
+		var limitErr error
 		if p.Has("limit") {
-			limit, err = strconv.Atoi(p.Get("limit"))
+			limit, limitErr = strconv.Atoi(p.Get("limit"))
+		}
+		offset, err := diagnosticInt(p, "offset", 0)
+		if err != nil {
+			respondError(w, err)
+			return
 		}
 		minimum := p.Get("min")
 		if minimum == "" {
 			minimum = "0"
 		}
 		value, valueErr := otel.NativeNumber(minimum)
-		if err != nil || limit < 1 || limit > 100 || valueErr != nil || value.Sign() < 0 || p.Has("min_ns") {
+		if limitErr != nil || limit < 1 || limit > 100 || valueErr != nil || value.Sign() < 0 || p.Has("min_ns") {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid limit or min; use the attribute unit (ms for durations)"})
 			return
 		}
@@ -116,6 +115,15 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 		if startErr != nil || endErr != nil || (end != 0 && start > end) || (p.Get("partial") != "" && p.Get("partial") != "0" && p.Get("partial") != "1") || p.Get("capture") == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid capture, partial or time range"})
 			return
+		}
+		scope, include := p.Get("scope"), p.Get("include_protocol_waits")
+		if (scope != "" && scope != "auto" && scope != "capture" && scope != "measurement") ||
+			(include != "" && include != "0" && include != "1") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid scope or include_protocol_waits"})
+			return
+		}
+		if scope == "" {
+			scope = "auto"
 		}
 		name, attribute := p.Get("name"), p.Get("attribute")
 		if strings.HasSuffix(r.URL.Path, "/requests") {
@@ -127,7 +135,18 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Event Slow Path ranks event duration; use name to filter events, or /requests for request attributes"})
 			return
 		}
-		report, err := reader.Query(r.Context(), r.PathValue("id"), p.Get("capture"), otel.NativeQuery{Name: name, Attribute: attribute, Node: p.Get("node"), Group: p.Get("group"), Outcome: p.Get("outcome"), Partial: p.Get("partial"), Minimum: minimum, Limit: limit, Selected: p.Get("selected"), Start: start, End: end})
+		id, capture := r.PathValue("id"), p.Get("capture")
+		variant, _ := nativeDiagnosticFor(record, capture)
+		window, err := nativeWindow(store, id, variant, scope)
+		if err != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error()})
+			return
+		}
+		report, err := reader.Query(r.Context(), id, capture, otel.NativeQuery{
+			Name: name, Attribute: attribute, Node: p.Get("node"), Group: p.Get("group"),
+			Outcome: p.Get("outcome"), Partial: p.Get("partial"), Minimum: minimum, Limit: limit, Offset: offset,
+			Selected: p.Get("selected"), Start: start, End: end, Window: window, ExcludeProtocolWaits: include != "1",
+		})
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 			return
@@ -136,4 +155,28 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 	}
 	api.HandleFunc("GET /api/v1/experiments/{id}/requests", query)
 	api.HandleFunc("GET /api/v1/experiments/{id}/events", query)
+}
+
+func nativeDiagnosticFor(record models.Record, capture string) (string, models.Diagnostic) {
+	for variant, diagnostic := range record.Summary.Diagnostics {
+		if diagnostic.CaptureID == capture {
+			return variant, diagnostic
+		}
+	}
+	return "", models.Diagnostic{}
+}
+
+func nativeWindow(store models.Repository, id, variant, scope string) (otel.Window, error) {
+	var window otel.Window
+	if scope == "capture" || (scope == "auto" && variant == "") {
+		return window, nil
+	}
+	if variant == "" {
+		return window, errors.New("capture is not linked to a diagnostic measurement")
+	}
+	data, err := store.Measurement(id, "diagnostic-"+variant)
+	if err != nil || json.Unmarshal(data, &window) != nil || window.Start <= 0 || window.End <= window.Start {
+		return window, errors.New("capture has no valid measurement window")
+	}
+	return window, nil
 }

@@ -89,4 +89,18 @@ func TestEventSummaryUsesNativeCapture(t *testing.T) {
 			}
 		}
 	}
+	const ranked = "/api/v1/experiments/v16/events?capture=capture&limit=1"
+	page := httptest.NewRecorder()
+	api.ServeHTTP(page, httptest.NewRequest(http.MethodGet, ranked+"&offset=1", nil))
+	var report otel.NativeReport
+	if err := json.Unmarshal(page.Body.Bytes(), &report); err != nil ||
+		page.Code != http.StatusOK || report.Total != 2 || report.Offset != 1 ||
+		len(report.Rows) != 1 || report.Rows[0].Name != "checkpoint" {
+		t.Fatalf("expected second page: %d %+v %v", page.Code, report, err)
+	}
+	invalid := httptest.NewRecorder()
+	api.ServeHTTP(invalid, httptest.NewRequest(http.MethodGet, ranked+"&offset=-1", nil))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("negative offset should fail: %d %s", invalid.Code, invalid.Body)
+	}
 }

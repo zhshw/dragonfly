@@ -19,16 +19,17 @@ import (
 // NodeRoles is display metadata resolved from recorded role or Fetch group/epoch evidence.
 // Millisecond attributes and original nanosecond timestamps remain decimal strings across JSON.
 type NativeEvent struct {
-	TraceID   string            `json:"trace_id"`
-	SpanID    string            `json:"span_id"`
-	Name      string            `json:"name"`
-	Start     string            `json:"start_ns"`
-	End       string            `json:"end_ns"`
-	Duration  string            `json:"duration_ms"`
-	Fields    map[string]string `json:"fields"`
-	Values    map[string]string `json:"values"`
-	States    map[string]string `json:"states"`
-	NodeRoles []string          `json:"node_roles"`
+	TraceID        string            `json:"trace_id"`
+	SpanID         string            `json:"span_id"`
+	Name           string            `json:"name"`
+	Start          string            `json:"start_ns"`
+	End            string            `json:"end_ns"`
+	Duration       string            `json:"duration_ms"`
+	WindowDuration string            `json:"window_duration_ms,omitempty"`
+	Fields         map[string]string `json:"fields"`
+	Values         map[string]string `json:"values"`
+	States         map[string]string `json:"states"`
+	NodeRoles      []string          `json:"node_roles"`
 }
 
 // NativeNode lists the roles evidenced for a node across the complete capture.
@@ -49,33 +50,39 @@ type NativeCapture struct {
 }
 
 type NativeQuery struct {
-	Name      string
-	Attribute string
-	Node      string
-	Group     string
-	Outcome   string
-	Partial   string
-	Minimum   string
-	Limit     int
-	Selected  string
-	Start     int64
-	End       int64
+	Name                 string
+	Attribute            string
+	Node                 string
+	Group                string
+	Outcome              string
+	Partial              string
+	Minimum              string
+	Limit                int
+	Offset               int
+	Selected             string
+	Start                int64
+	End                  int64
+	Window               Window
+	ExcludeProtocolWaits bool
 }
 
 type NativeReport struct {
-	Capture    string            `json:"capture_id"`
-	Complete   bool              `json:"complete"`
-	Issues     []string          `json:"issues"`
-	Total      int               `json:"total"`
-	Missing    int               `json:"missing"`
-	Sort       string            `json:"sort"`
-	Attribute  string            `json:"attribute,omitempty"`
-	Units      map[string]string `json:"units"`
-	Rows       []NativeEvent     `json:"rows"`
-	Selected   *NativeEvent      `json:"selected,omitempty"`
-	Events     []NativeEvent     `json:"events"`
-	Nodes      []NativeNode      `json:"nodes"`
-	EventNames []string          `json:"event_names"`
+	Capture              string            `json:"capture_id"`
+	Complete             bool              `json:"complete"`
+	Issues               []string          `json:"issues"`
+	Total                int               `json:"total"`
+	Offset               int               `json:"offset"`
+	Missing              int               `json:"missing"`
+	Sort                 string            `json:"sort"`
+	Attribute            string            `json:"attribute,omitempty"`
+	Units                map[string]string `json:"units"`
+	Rows                 []NativeEvent     `json:"rows"`
+	Selected             *NativeEvent      `json:"selected,omitempty"`
+	Events               []NativeEvent     `json:"events"`
+	Nodes                []NativeNode      `json:"nodes"`
+	EventNames           []string          `json:"event_names"`
+	Scope                string            `json:"scope"`
+	ProtocolWaitsOmitted int               `json:"protocol_waits_omitted"`
 }
 
 const maxNativeObservations = 250_000
@@ -214,8 +221,23 @@ func QueryNative(ctx context.Context, config LangfuseConfig, experiment, capture
 }
 
 type nativeCaptureData struct {
-	events  []NativeEvent
-	summary NativeReport
+	events       []NativeEvent
+	summary      NativeReport
+	emptyFetches map[[2]string]bool
+}
+
+func (data *nativeCaptureData) protocolWait(event NativeEvent) bool {
+	switch event.Name {
+	case "metadata.peer.backoff", "raft.peer.backoff":
+		return true
+	case "raft.fetch", "metadata.fetch":
+		return data.emptyFetches[[2]string{event.TraceID, event.Fields["event_id"]}]
+	case "raft.fetch.rpc", "metadata.fetch.rpc":
+		return event.Fields["outcome"] == "Success" &&
+			data.emptyFetches[[2]string{event.TraceID, event.Fields["request_id"]}]
+	default:
+		return false
+	}
 }
 
 func prepareNativeCapture(capture string, events []NativeEvent) (*nativeCaptureData, error) {
@@ -282,7 +304,18 @@ func prepareNativeCapture(capture string, events []NativeEvent) (*nativeCaptureD
 	r.Complete = len(r.Issues) == 0
 	events = append([]NativeEvent(nil), events...)
 	r.Nodes, r.EventNames = nativeOptions(events)
-	return &nativeCaptureData{events: events, summary: r}, nil
+	emptyFetches := map[[2]string]bool{}
+	for _, event := range events {
+		if event.Name != "raft.fetch" && event.Name != "metadata.fetch" {
+			continue
+		}
+		id, payload := event.Fields["event_id"], event.Name+".payload_bytes"
+		if id != "" && id != "0" && event.Fields["outcome"] == "Empty" &&
+			event.States[payload] == "Observed" && event.Values[payload] == "0" {
+			emptyFetches[[2]string{event.TraceID, id}] = true
+		}
+	}
+	return &nativeCaptureData{events: events, summary: r, emptyFetches: emptyFetches}, nil
 }
 
 // RankNative sorts every event by its own span duration unless a request attribute is selected.
@@ -298,6 +331,13 @@ func RankNative(capture string, events []NativeEvent, q NativeQuery) (NativeRepo
 func (data *nativeCaptureData) rank(q NativeQuery) (NativeReport, error) {
 	r := data.summary
 	r.Sort, r.Attribute = "duration", q.Attribute
+	r.Scope = "capture"
+	if q.Window != (Window{}) {
+		if q.Window.Start < 0 || q.Window.End <= q.Window.Start {
+			return r, errors.New("invalid measurement window")
+		}
+		r.Scope = "measurement"
+	}
 	r.Rows, r.Events = []NativeEvent{}, []NativeEvent{}
 	if q.Attribute != "" {
 		r.Sort = "attribute"
@@ -309,8 +349,8 @@ func (data *nativeCaptureData) rank(q NativeQuery) (NativeReport, error) {
 	if err != nil || minimum.Sign() < 0 {
 		return r, errors.New("invalid minimum value")
 	}
-	if q.Limit < 1 || q.Limit > 100 || (q.Partial != "" && q.Partial != "0" && q.Partial != "1") || q.Start < 0 || q.End < 0 || (q.End != 0 && q.Start > q.End) {
-		return r, errors.New("invalid native query: limit, partial or time range")
+	if q.Limit < 1 || q.Limit > 100 || q.Offset < 0 || (q.Partial != "" && q.Partial != "0" && q.Partial != "1") || q.Start < 0 || q.End < 0 || (q.End != 0 && q.Start > q.End) {
+		return r, errors.New("invalid native query: limit, offset, partial or time range")
 	}
 	if q.Attribute != "" && len(r.Units) > 0 && r.Units[q.Attribute] == "" {
 		return r, fmt.Errorf("unknown span attribute %q", q.Attribute)
@@ -328,10 +368,29 @@ func (data *nativeCaptureData) rank(q NativeQuery) (NativeReport, error) {
 		if (q.Start != 0 && start < q.Start) || (q.End != 0 && start > q.End) {
 			continue
 		}
-		if q.Partial != "" && e.Values["raft.fetch.partial"] != q.Partial {
-			continue
-		}
 		value := e.Duration
+		if r.Scope == "measurement" {
+			if q.Attribute == "" {
+				end, err := strconv.ParseInt(e.End, 10, 64)
+				if err != nil {
+					return r, errors.New("invalid native end")
+				}
+				interval, ok := clipToWindow(start, end, q.Window)
+				if !ok {
+					continue
+				}
+				value = milliseconds(interval.End - interval.Begin)
+				e.WindowDuration = value
+			} else if start < q.Window.Start || start >= q.Window.End {
+				continue
+			}
+		}
+		if q.Partial != "" {
+			payload, err := strconv.ParseUint(e.Values["raft.fetch.payload_bytes"], 10, 64)
+			if e.States["raft.fetch.partial"] != "Observed" || e.Values["raft.fetch.partial"] != q.Partial || err != nil || payload == 0 {
+				continue
+			}
+		}
 		if q.Attribute != "" {
 			var ok bool
 			value, ok = e.Values[q.Attribute]
@@ -349,6 +408,10 @@ func (data *nativeCaptureData) rank(q NativeQuery) (NativeReport, error) {
 		if n.Cmp(minimum) < 0 {
 			continue
 		}
+		if q.ExcludeProtocolWaits && (q.Attribute == "" || q.Attribute == "raft.fetch" || q.Attribute == "raft.fetch.rpc") && data.protocolWait(e) {
+			r.ProtocolWaitsOmitted++
+			continue
+		}
 		r.Rows = append(r.Rows, e)
 		values[e.TraceID+":"+e.SpanID] = n
 	}
@@ -360,10 +423,9 @@ func (data *nativeCaptureData) rank(q NativeQuery) (NativeReport, error) {
 		}
 		return r.Rows[i].TraceID+":"+r.Rows[i].SpanID < r.Rows[j].TraceID+":"+r.Rows[j].SpanID
 	})
-	r.Total = len(r.Rows)
-	if len(r.Rows) > q.Limit {
-		r.Rows = r.Rows[:q.Limit]
-	}
+	r.Total, r.Offset = len(r.Rows), q.Offset
+	first := min(r.Offset, r.Total)
+	r.Rows = r.Rows[first : first+min(q.Limit, r.Total-first)]
 	selected := q.Selected
 	if selected == "" && len(r.Rows) > 0 {
 		selected = r.Rows[0].TraceID + ":" + r.Rows[0].SpanID

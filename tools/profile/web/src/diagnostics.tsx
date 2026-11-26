@@ -7,6 +7,7 @@ type Panel = { key: 'current' | 'previous' | 'reference'; title: string; id?: st
 type EventSummary = {
   capture_id: string; complete: boolean; issues: string[]; total: number; event_names: string[];
   stages: Stage[]; role_stages?: Stage[]; scope: 'measurement' | 'capture';
+  protocol_waits_omitted?: number;
 };
 
 export function DiagnosticsView({ id, view, referenceID }: { id: string; view: 'flamegraphs' | 'trace'; referenceID?: string }) {
@@ -134,6 +135,7 @@ function FlamegraphPanel({ panel, role }: { panel: Panel; role: Role }) {
 }
 
 function TraceOverview({ panels }: { panels: Panel[] }) {
+  const [includeProtocolWaits, setIncludeProtocolWaits] = useState(false);
   const [summaries, setSummaries] = useState<Record<string, EventSummary>>({});
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -145,14 +147,15 @@ function TraceOverview({ panels }: { panels: Panel[] }) {
     setSummaries({}); setError(''); setLoading(captures.length > 0);
     Promise.all(captures.map(async (source) => {
       if (!source.capture) throw new Error(`${source.id}: missing capture ID`);
-      const summary = await api<EventSummary>(`${endpoint(source.id)}/event-summary?${new URLSearchParams({ capture: source.capture })}`, { signal: abort.signal });
+      const params = new URLSearchParams({ capture: source.capture, include_protocol_waits: includeProtocolWaits ? '1' : '0' });
+      const summary = await api<EventSummary>(`${endpoint(source.id)}/event-summary?${params}`, { signal: abort.signal });
       return [source.key, summary] as const;
     })).then((entries) => {
       if (!abort.signal.aborted) setSummaries(Object.fromEntries(entries));
     }).catch((e) => { if (!abort.signal.aborted) setError(e.message); })
       .finally(() => { if (!abort.signal.aborted) setLoading(false); });
     return () => abort.abort();
-  }, [sources]);
+  }, [sources, includeProtocolWaits]);
   const summaryFor = (panel: Panel) => {
     const summary = summaries[panel.key];
     return summary?.capture_id === panel.capture?.profile.capture_id ? summary : undefined;
@@ -163,7 +166,8 @@ function TraceOverview({ panels }: { panels: Panel[] }) {
     </div>
     {loading && <div role="status" className="notice">Loading event statistics…</div>}
     {error && <div role="alert" className="notice">Event statistics: {error}</div>}
-    {panels.some(({ capture }) => capture) && <TraceComparison panels={panels} summaries={panels.map(summaryFor)} />}
+    {panels.some(({ capture }) => capture) && <TraceComparison panels={panels} summaries={panels.map(summaryFor)}
+      includeProtocolWaits={includeProtocolWaits} setIncludeProtocolWaits={setIncludeProtocolWaits} />}
   </>;
 }
 
@@ -174,6 +178,7 @@ function TracePanel({ panel, summary }: { panel: Panel; summary?: EventSummary }
     {capture ? <div className="capture-trace-body">
       <div><strong>{capture.profile.native && !summary ? '—' : number(summary?.total ?? capture.profile.span_count, 0)}</strong> events{summary && ` · ${summary.event_names.length} event names`}</div>
       <p>{capture.profile.native ? `${summary?.scope === 'capture' ? 'Full capture' : 'Measurement window'} · OTEL` : 'Measurement window · archived trace'}</p>
+      {!!summary?.protocol_waits_omitted && <p>{number(summary.protocol_waits_omitted, 0)} protocol waits omitted</p>}
       {summary && !summary.complete && <p role="alert">Incomplete capture: {summary.issues.join('; ')}</p>}
       {capture.profile.trace_url && <p>Langfuse 已核验 {number(capture.profile.verified_observations ?? 0, 0)} 条展示样本</p>}
       <div className="trace-actions">
@@ -195,7 +200,12 @@ const waitMetrics: { label: string; value: (diagnostic: DiagnosticSummary) => st
 type StageMetrics = { count: number; union_ms: number; p95_ms?: number };
 type PhaseRow = { key: string; stage: string; role: string; values: (StageMetrics | undefined)[] };
 
-function TraceComparison({ panels, summaries }: { panels: Panel[]; summaries: (EventSummary | undefined)[] }) {
+function TraceComparison({ panels, summaries, includeProtocolWaits, setIncludeProtocolWaits }: {
+  panels: Panel[];
+  summaries: (EventSummary | undefined)[];
+  includeProtocolWaits: boolean;
+  setIncludeProtocolWaits: (include: boolean) => void;
+}) {
   const [query, setQuery] = useState('');
   const [role, setRole] = useState('all');
   const [showAll, setShowAll] = useState(false);
@@ -235,6 +245,7 @@ function TraceComparison({ panels, summaries }: { panels: Panel[]; summaries: (E
       <div className="panel-heading phase-heading">
         <div><h2>Event statistics</h2><p>Grouped by event and node role. {canCompare ? 'Sorted by the larger duration union. ' : 'Sorted by duration union. '}—: unavailable.</p></div>
         <div className="phase-controls">
+          {panels.some(({ capture }) => capture?.profile.native) && <label className="protocol-waits"><input type="checkbox" checked={includeProtocolWaits} onChange={(event) => { setIncludeProtocolWaits(event.target.checked); setShowAll(false); }} />Include protocol waits</label>}
           <select aria-label="Node role" value={role} onChange={(event) => { setRole(event.target.value); setShowAll(false); }}>
             <option value="all">All roles</option>{roles.map((value) => <option key={value} value={value}>{value}</option>)}
           </select>

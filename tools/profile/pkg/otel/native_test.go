@@ -40,6 +40,15 @@ func TestEventSlowPathRanksUnregisteredEventsWithoutAttributes(t *testing.T) {
 	if len(r.Events) != 2 || r.Events[0].SpanID != "1" || r.Events[1].SpanID != "3" {
 		t.Fatalf("expected selected event and explicit child, no temporal neighbours: %+v", r.Events)
 	}
+	second, err := RankNative("capture", rows, NativeQuery{Limit: 2, Offset: 2})
+	if err != nil || second.Total != 4 || second.Offset != 2 || len(second.Rows) != 2 ||
+		second.Rows[0].SpanID != "3" || second.Rows[1].SpanID != "4" || second.Selected == nil || second.Selected.SpanID != "3" {
+		t.Fatalf("page must follow ranking and select its first result: %+v %v", second, err)
+	}
+	pastEnd, err := RankNative("capture", rows, NativeQuery{Limit: 2, Offset: 10})
+	if err != nil || pastEnd.Total != 4 || pastEnd.Offset != 10 || len(pastEnd.Rows) != 0 || pastEnd.Selected != nil {
+		t.Fatalf("out-of-range page should retain the match count: %+v %v", pastEnd, err)
+	}
 	options, names := r.Nodes, r.EventNames
 	if len(options) != 1 || options[0].ID != "11" || !reflect.DeepEqual(names, []string{"another.operation", "arbitrary.child", "checkpoint", "custom.operation"}) {
 		t.Fatalf("incomplete filter options: %+v %v", options, names)
@@ -321,7 +330,7 @@ func TestNativeSummaryCountsPointsAndSeparatesProcessClocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := data.eventSummary(Window{}, nil)
+	r, err := data.eventSummary(Window{}, nil, false)
 	if err != nil || r.Total != 6 || r.Complete || len(r.Issues) == 0 || len(r.EventNames) != 2 || len(r.Stages) != 4 {
 		t.Fatalf("wrong counts or lost incomplete status: %+v %v", r, err)
 	}
@@ -345,7 +354,7 @@ func TestNativeSummaryCountsPointsAndSeparatesProcessClocks(t *testing.T) {
 			}
 		}
 	}
-	combined, err := data.eventSummary(Window{}, map[string]string{"11": "follower"})
+	combined, err := data.eventSummary(Window{}, map[string]string{"11": "follower"}, false)
 	if err != nil || len(combined.RoleStages) != 2 {
 		t.Fatalf("expected one row per event and benchmark role: %+v %v", combined.RoleStages, err)
 	}
@@ -355,13 +364,67 @@ func TestNativeSummaryCountsPointsAndSeparatesProcessClocks(t *testing.T) {
 			t.Fatalf("benchmark role aggregate must pool durations and merge within each clock: %+v", stage)
 		}
 	}
-	windowed, err := data.eventSummary(Window{Start: origin + 9_000_000, End: origin + 11_000_000}, nil)
+	windowed, err := data.eventSummary(Window{Start: origin + 9_000_000, End: origin + 11_000_000}, nil, false)
 	if err != nil || windowed.Scope != "measurement" || windowed.Total != 3 || len(windowed.Stages) != 1 {
 		t.Fatalf("incorrect window filtering: %+v %v", windowed, err)
 	}
 	s := windowed.Stages[0]
 	if s.Count != 3 || s.Union != 3 || s.Sum != 4 || s.P95 != 2 {
 		t.Fatalf("did not clip intervals at the measurement bounds: %+v", s)
+	}
+}
+
+func TestProtocolWaitsAndMeasurementWindow(t *testing.T) {
+	span := func(id, name, request string, start, end int64) NativeEvent {
+		e := nativeEvent(id, name, request, start)
+		e.End, e.Duration = strconv.FormatInt(end, 10), milliseconds(end-start)
+		return e
+	}
+	empty := span("1", "raft.fetch", "1", 110, 180)
+	empty.Fields["outcome"] = "Empty"
+	empty.Values["raft.fetch.payload_bytes"], empty.States["raft.fetch.payload_bytes"] = "0", "Observed"
+	empty.Values["raft.fetch.partial"], empty.States["raft.fetch.partial"] = "0", "Observed"
+	empty.Values["raft.fetch.return_wait"], empty.States["raft.fetch.return_wait"] = "0.000010", "Observed"
+	rpc := span("2", "raft.fetch.rpc", "1", 110, 160)
+	rpc.Fields["outcome"] = "Success"
+	postRPC := span("3", "raft.fetch.return_wait", "1", 160, 170)
+	backoff := span("4", "metadata.peer.backoff", "0", 120, 190)
+	otherRPC := span("5", "raft.fetch.rpc", "1", 110, 165)
+	otherRPC.TraceID, otherRPC.Fields["outcome"] = "other-stream", "Success"
+	outside := span("6", "client.pipeline", "0", 300, 900)
+	crossing := span("7", "raft.folly.fsync", "0", 90, 140)
+	rows := []NativeEvent{empty, rpc, postRPC, backoff, otherRPC, outside, crossing}
+	data, err := prepareNativeCapture("capture", rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window := Window{Start: 100, End: 200}
+	q := NativeQuery{Limit: 10, Window: window, ExcludeProtocolWaits: true}
+	focused, err := data.rank(q)
+	if err != nil || focused.Scope != "measurement" || focused.Total != 3 || focused.ProtocolWaitsOmitted != 3 {
+		t.Fatalf("focused ranking: %+v %v", focused, err)
+	}
+	if focused.Rows[0].SpanID != "5" || focused.Rows[1].WindowDuration != "0.000040" ||
+		focused.Rows[1].Duration != "0.000050" || focused.Rows[2].SpanID != "3" {
+		t.Fatalf("cross-stream request ID or post-RPC and clipped durations: %+v", focused.Rows)
+	}
+	summary, err := data.eventSummary(window, nil, true)
+	if err != nil || summary.Total != focused.Total || summary.ProtocolWaitsOmitted != focused.ProtocolWaitsOmitted {
+		t.Fatalf("summary should use the same event population: %+v %v", summary, err)
+	}
+	raw, err := data.rank(NativeQuery{Limit: 10})
+	if err != nil || raw.Total != 7 || raw.Rows[0].SpanID != "6" {
+		t.Fatalf("full ranking: %+v %v", raw, err)
+	}
+	q.Attribute = "raft.fetch.return_wait"
+	delays, err := data.rank(q)
+	if err != nil || delays.Total != 1 || delays.Rows[0].SpanID != "1" {
+		t.Fatalf("empty response can still have a real return wait: %+v %v", delays, err)
+	}
+	q.Partial = "0"
+	delays, err = data.rank(q)
+	if err != nil || delays.Total != 0 {
+		t.Fatalf("empty response is outside the complete payload filter: %+v %v", delays, err)
 	}
 }
 

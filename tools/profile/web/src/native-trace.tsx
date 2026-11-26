@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, endpoint } from './model';
 
-type NativeEvent = { trace_id: string; span_id: string; name: string; start_ns: string; end_ns: string; duration_ms: string; node_roles: string[]; fields: Record<string, string>; values: Record<string, string>; states: Record<string, string> };
+type NativeEvent = { trace_id: string; span_id: string; name: string; start_ns: string; end_ns: string; duration_ms: string; window_duration_ms?: string; node_roles: string[]; fields: Record<string, string>; values: Record<string, string>; states: Record<string, string> };
 type Capture = { id: string; release: string; binary_sha: string; workload: string; streams: number };
 type NodeOption = { id: string; roles: string[] };
-type Report = { nodes: NodeOption[]; event_names: string[]; complete: boolean; issues: string[]; total: number; missing: number; sort: 'duration' | 'attribute'; attribute?: string; units: Record<string, string>; rows: NativeEvent[]; selected?: NativeEvent; events: NativeEvent[] };
+type Report = { nodes: NodeOption[]; event_names: string[]; complete: boolean; issues: string[]; total: number; offset: number; missing: number; scope: 'measurement' | 'capture'; protocol_waits_omitted: number; sort: 'duration' | 'attribute'; attribute?: string; units: Record<string, string>; rows: NativeEvent[]; selected?: NativeEvent; events: NativeEvent[] };
+const pageSize = 10;
 const nodeLabel = (id: string, roles: string[]) => `${roles.length ? roles.join(' / ') : 'Unknown'} ${id}`;
 const eventNode = (event: NativeEvent) => nodeLabel(event.fields.node_id, event.node_roles);
 const keyOf = (e: NativeEvent) => `${e.trace_id}:${e.span_id}`;
@@ -26,6 +27,9 @@ export function SlowAnalysisView({ id, initialMode = 'events' }: { id: string; i
   const [name, setName] = useState('');
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
+  const [scope, setScope] = useState('auto');
+  const [includeProtocolWaits, setIncludeProtocolWaits] = useState(false);
+  const [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState('');
   const [report, setReport] = useState<Report>();
   const [options, setOptions] = useState<{ capture: string; nodes: NodeOption[]; names: string[] }>();
@@ -44,19 +48,21 @@ export function SlowAnalysisView({ id, initialMode = 'events' }: { id: string; i
     if (!capture) return;
     const abort = new AbortController();
     setBusy(true); setError('');
-    const query = new URLSearchParams({ capture, attribute: mode === 'requests' ? attribute : '', node, partial: mode === 'requests' ? partial : '', name: mode === 'events' ? name : '', min: minimum || '0', start_ns: start, end_ns: end, selected, limit: '10' });
+    const query = new URLSearchParams({ capture, attribute: mode === 'requests' ? attribute : '', node, partial: mode === 'requests' ? partial : '', name: mode === 'events' ? name : '', min: minimum || '0', start_ns: start, end_ns: end, scope, include_protocol_waits: includeProtocolWaits ? '1' : '0', selected, limit: String(pageSize), offset: String(offset) });
     api<Report>(`${endpoint(id)}/${mode}?${query}`, { signal: abort.signal })
       .then(data => { if (!abort.signal.aborted) { setReport(data); setOptions({ capture, nodes: data.nodes, names: data.event_names }); } })
       .catch(e => { if (!abort.signal.aborted) { setError(e.message); setReport(undefined); } })
       .finally(() => { if (!abort.signal.aborted) setBusy(false); });
     return () => abort.abort();
-  }, [id, capture, mode, attribute, node, partial, minimum, name, start, end, selected]);
-  const change = (callback: () => void) => { setSelected(''); setReport(undefined); callback(); };
+  }, [id, capture, mode, attribute, node, partial, minimum, name, start, end, scope, includeProtocolWaits, selected, offset]);
+  const change = (callback: () => void) => { setSelected(''); setOffset(0); setReport(undefined); callback(); };
+  const goToOffset = (next: number) => { setSelected(''); setOffset(next); };
+  const paging = !!report && report.offset !== offset;
   const filters = options?.capture === capture ? options : undefined;
   const current = captures?.find(c => c.id === capture);
   const attributes = useMemo(() => [...new Set([attribute, ...requestAttributes, ...Object.keys(report?.units ?? {})])], [attribute, report?.units]);
   return <div className="native-analysis">
-    <div className="section-toolbar"><div><h2>Slow analysis</h2><p>Rank slow events or inspect Fetch response delays, then open the timeline.</p></div><button className="button" onClick={() => setRevision(n => n + 1)}>Refresh captures</button></div>
+    <div className="section-toolbar"><div><h2>Slow analysis</h2><p>Rank slow events or inspect Fetch response delays, then open the timeline.</p></div><button className="button" onClick={() => change(() => setRevision(n => n + 1))}>Refresh captures</button></div>
     <div className="segments" role="tablist" aria-label="Analysis type">
       <button role="tab" aria-selected={mode === 'events'} aria-pressed={mode === 'events'} onClick={() => mode !== 'events' && change(() => { setMode('events'); setMinimum('0'); })}>Slow path</button>
       <button role="tab" aria-selected={mode === 'requests'} aria-pressed={mode === 'requests'} onClick={() => mode !== 'requests' && change(() => { setMode('requests'); setAttribute('raft.fetch.return_wait'); setMinimum('10'); })}>Fetch delay</button>
@@ -72,17 +78,45 @@ export function SlowAnalysisView({ id, initialMode = 'events' }: { id: string; i
         <label>Node<select aria-label="Node" value={node} disabled={!filters} onChange={e => change(() => setNode(e.target.value))}><option value="">All nodes</option>{filters?.nodes.map(n => <option key={n.id} value={n.id}>{nodeLabel(n.id, n.roles)}</option>)}</select></label>
         {mode === 'requests' ? <label>Response<select aria-label="Response" value={partial} onChange={e => change(() => setPartial(e.target.value))}><option value="">All responses</option><option value="1">Partial prefix</option><option value="0">Complete payload</option></select></label> : <label>Event name<select aria-label="Event name" value={name} disabled={!filters} onChange={e => change(() => setName(e.target.value))}><option value="">All events</option>{filters?.names.map(n => <option key={n} value={n}>{n}</option>)}</select></label>}
         <label>{mode === 'events' ? 'Minimum duration (ms)' : `Minimum (${report?.units[attribute] ?? 'ms'})`}<input aria-label="Minimum value" type="number" min="0" step="any" value={minimum} onChange={e => change(() => setMinimum(e.target.value))} /></label>
-        <details><summary>Measurement window</summary><label>Start (original ns)<input value={start} onChange={e => change(() => setStart(e.target.value))} /></label><label>End (original ns)<input value={end} onChange={e => change(() => setEnd(e.target.value))} /></label></details>
+        <label>Scope<select value={scope} onChange={e => change(() => setScope(e.target.value))}><option value="auto">Measurement when available</option><option value="capture">Full capture</option></select></label>
+        <details><summary>Event start range</summary><label>Start (original ns)<input value={start} onChange={e => change(() => setStart(e.target.value))} /></label><label>End (original ns)<input value={end} onChange={e => change(() => setEnd(e.target.value))} /></label></details>
+        {(mode === 'events' || attribute === 'raft.fetch' || attribute === 'raft.fetch.rpc') && <label className="protocol-waits"><input type="checkbox" checked={includeProtocolWaits} onChange={e => change(() => setIncludeProtocolWaits(e.target.checked))} />Include protocol waits</label>}
       </div>
       {busy && <p role="status">Reading complete capture…</p>}
       {report && <>
-        <div className={`native-completeness ${report.complete ? 'complete' : 'incomplete'}`}><strong>{report.complete ? 'Complete capture' : 'Incomplete capture'}</strong><span>{report.total} matches · {report.missing} missing values · Top 10 descending</span>{report.issues.map(issue => <p key={issue}>{issue}</p>)}</div>
-        <section className="panel data-panel native-ranking"><div className="panel-heading"><h2>{mode === 'requests' ? 'Fetch delay' : 'Slow path'}</h2><span>{mode === 'requests' ? attribute : 'Duration · ms'}</span></div>
-          <div className="table-scroll"><table className="data-table"><thead><tr><th>{mode === 'requests' ? 'Fetch' : '#'}</th><th>Node</th><th>{mode === 'requests' ? 'Offsets' : 'Event'}</th><th>{mode === 'requests' ? attribute : 'Duration'} ↓</th>{mode === 'requests' && <><th>RPC</th><th>Return wait</th><th>Gate wait</th><th>I/O wait</th><th>Append / payload</th></>}<th>Outcome</th></tr></thead><tbody>{report.rows.map((row, index) => <tr key={keyOf(row)} className={keyOf(row) === (report.selected && keyOf(report.selected)) ? 'selected' : ''}>
-            {mode === 'requests' ? <td><button className="text-link" aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>#{index + 1} · Fetch {row.fields.sequence}</button></td> : <td><button className="text-link mono" aria-label={`Open slow path ${index + 1}: ${row.name}`} aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>{index + 1}</button></td>}<td title="Role recorded for this event or its request; older events require an unambiguous interval in the same process.">{eventNode(row)}</td><td>{mode === 'requests' ? `${row.fields.first_offset ?? row.fields.requested_offset}–${row.fields.last_offset ?? '—'}` : <button className="text-link" aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>{row.name}</button>}</td><td className="mono strong">{mode === 'requests' ? valueText(row, attribute, report.units) : ms(row.duration_ms)}</td>{mode === 'requests' && <><td>{ms(row.values['raft.fetch.rpc'])}</td><td>{ms(row.values['raft.fetch.return_wait'])}</td><td>{ms(row.values['raft.fetch.await_flush'])}</td><td>{ms(row.values['raft.await_io'])}</td><td>{row.values['raft.fetch.appended_bytes'] ?? '—'} / {row.values['raft.fetch.payload_bytes'] ?? '—'}</td></>}<td>{row.fields.outcome}</td>
-          </tr>)}</tbody></table></div>{report.rows.length === 0 && <div className="inline-empty">No matching events.</div>}
+        <div className={`native-completeness ${report.complete ? 'complete' : 'incomplete'}`}><strong>{report.complete ? 'Complete capture' : 'Incomplete capture'}</strong><span>{report.scope === 'measurement' ? 'Measurement window' : 'Full capture'} · {report.total} matches · {report.missing} missing values{report.protocol_waits_omitted > 0 && ` · ${report.protocol_waits_omitted} protocol waits omitted`}</span>{report.issues.map(issue => <p key={issue}>{issue}</p>)}</div>
+        <section className="panel data-panel native-ranking" aria-busy={paging || busy}><div className="panel-heading"><h2>{mode === 'requests' ? 'Fetch delay' : 'Slow path'}</h2><span>{mode === 'requests' ? attribute : (report.scope === 'measurement' ? 'Duration in window · ms' : 'Duration · ms')}</span></div>
+          <div className="table-scroll"><table className="data-table"><thead><tr><th>{mode === 'requests' ? 'Fetch' : '#'}</th><th>Node</th><th>{mode === 'requests' ? 'Offsets' : 'Event'}</th><th>{mode === 'requests' ? attribute : 'Duration'} ↓</th>{mode === 'requests' && <><th>RPC</th><th>Return wait</th><th>Gate wait</th><th>I/O wait</th><th>Append / payload</th></>}<th>Outcome</th></tr></thead><tbody>{report.rows.map((row, index) => {
+            const rank = report.offset + index + 1;
+            const key = keyOf(row);
+            const active = !!report.selected && key === keyOf(report.selected);
+            return <tr key={key} className={active ? 'selected' : ''}>
+              <td><button className={mode === 'requests' ? 'text-link' : 'text-link mono'}
+                aria-label={mode === 'events' ? `Open slow path ${rank}: ${row.name}` : undefined}
+                aria-pressed={active} disabled={paging} onClick={() => setSelected(key)}>
+                {mode === 'requests' ? `#${rank} · Fetch ${row.fields.sequence}` : rank}
+              </button></td>
+              <td title="Role recorded for this event or its request; older events require an unambiguous interval in the same process.">{eventNode(row)}</td>
+              <td>{mode === 'requests' ? `${row.fields.first_offset ?? row.fields.requested_offset}–${row.fields.last_offset ?? '—'}` :
+                <button className="text-link" aria-pressed={active} disabled={paging} onClick={() => setSelected(key)}>{row.name}</button>}</td>
+              <td className="mono strong">{mode === 'requests' ? valueText(row, attribute, report.units) : ms(row.window_duration_ms ?? row.duration_ms)}</td>
+              {mode === 'requests' && <>
+                <td>{ms(row.values['raft.fetch.rpc'])}</td><td>{ms(row.values['raft.fetch.return_wait'])}</td>
+                <td>{ms(row.values['raft.fetch.await_flush'])}</td><td>{ms(row.values['raft.await_io'])}</td>
+                <td>{row.values['raft.fetch.appended_bytes'] ?? '—'} / {row.values['raft.fetch.payload_bytes'] ?? '—'}</td>
+              </>}
+              <td>{row.fields.outcome}</td>
+            </tr>;
+          })}</tbody></table></div>{report.rows.length === 0 && <div className="inline-empty">{report.total ? 'No events on this page.' : 'No matching events.'}</div>}
+          {(report.total > pageSize || report.offset > 0) && <nav className="native-pagination" aria-label="Event pages">
+            <button className="button" disabled={paging || busy || report.offset === 0}
+              onClick={() => goToOffset(Math.max(0, report.offset - pageSize))}>Previous page</button>
+            <span aria-live="polite">Page {Math.floor(report.offset / pageSize) + 1} / {Math.max(1, Math.ceil(report.total / pageSize))}</span>
+            <button className="button" disabled={paging || busy || report.offset + pageSize >= report.total}
+              onClick={() => goToOffset(report.offset + pageSize)}>Next page</button>
+          </nav>}
         </section>
-        {report.selected && <NativeDetail key={keyOf(report.selected)} report={report} mode={mode} />}
+        {report.selected && !paging && <NativeDetail key={keyOf(report.selected)} report={report} mode={mode} />}
       </>}
     </>}
   </div>;

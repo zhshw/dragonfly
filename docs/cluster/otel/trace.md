@@ -50,7 +50,7 @@ Raft C++ → 有界内存缓冲与延后定稿 → OTEL trace exporter → Langf
 
 不再采集无具体操作身份的 `raft.worker.operation`，保留 worker 排队和具体执行事件。`raft.fetch.response`、`raft.fetch.appended` 两个重复端点不再单独上报，其边界分别保留在 `raft.fetch.rpc` 和 `raft.log.append` 中；请求的字节、offset 和耗时属性不变。历史记录仍可查询。
 
-metadata observer 使用独立的 group 0 stream，事件与耗时属性沿用 `metadata.*`、ms；原始事件角色表示该组的实际角色。统计按节点分开计算，比较表的 Node 使用压测 data group 的角色与编号，对齐历史记录，不能把两个 metadata Follower 合并后与历史单节点比较。`input_lifetime` 在 group owner 释放输入时记录，不能用等待回复结束的 ticket 生命周期代替。client 使用独立 stream，恢复和回读校验成功后上报；新诊断轮缺少 client stream 不通过完整性验证。
+metadata observer 使用独立的 group 0 stream，事件与耗时属性沿用 `metadata.*`、ms。原始事件角色表示该组的实际角色；Trace 对比用压测 data group 的节点角色对齐两轮指标。`input_lifetime` 在 group owner 释放输入时记录。client 使用独立 stream，恢复和回读校验成功后上报；新诊断轮缺少 client stream 不通过完整性验证。
 
 ## 采集与完整性
 
@@ -62,9 +62,9 @@ metadata observer 使用独立的 group 0 stream，事件与耗时属性沿用 `
 
 ## 查询约定
 
-- **Slow path**：整轮所有事件按 duration 降序取 Top 10；event name、node、group 和 `-min-duration-ms` 均为可选过滤。点击编号或事件名展开关联时序。
-- **Fetch delay**：按已存 `raft.fetch.return_wait` 排序，展示 RPC、返回空档、gate 和 I/O 证据。页面初始过滤 ≥ 10 ms；CLI 使用 `-min-return-wait-ms`，默认 0。
-- **Trace 统计**：按各轮测量窗口裁剪相交事件，再计算数量、并集和分位数。Fetch RPC 包含正常的无数据长轮询（最多 100 ms），不能仅凭 RPC 耗时判定复制阻塞。
+- **Slow path** 默认按诊断测量窗口内的事件耗时降序排列，页面每页 10 条。选择事件可展开原始时序。CLI 用 `-limit`、`-offset` 翻页，用 `-scope capture` 查看整个采集。
+- **Fetch delay** 默认用测量窗口内发出的请求和已记录的 `raft.fetch.return_wait` 排序。页面初始阈值为 10 ms，CLI 的 `-min-return-wait-ms` 默认 0。筛选 Complete payload 时要求有正值 payload。
+- **Trace 统计** 按各轮测量窗口裁剪相交事件，再计算数量、并集和分位数。默认统计与耗时榜排除 peer 退避休眠，以及已经确认响应为 Empty、payload 为 0 的 Fetch 总耗时和同一 stream 内与其关联的成功 RPC。返回后的排队、处理和 I/O 等待仍单独可查。页面用 Include protocol waits，CLI 排名用 `-include-protocol-waits`，可查看原始协议等待。
 - `-capture` 固定轮次，`-selected TRACE_ID:SPAN_ID` 选择详情，`-json` 输出同一 API DTO。可复查命令集中在 [v16 文档](../profile/v16-wal-encode-overlap.md#1-分析查询)。
 - Node / Event name 下拉来自整轮 capture。下拉可列出节点经历过的角色，单个事件只归属一个角色：优先使用记录的角色或所属请求的 group/epoch；旧事件缺少身份时，须被同一进程内无冲突的角色时段完整覆盖，否则显示 `Unknown`。不将整轮角色集合填入事件，也不将 fsync 文件类型当节点角色。
 

@@ -31,6 +31,8 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 	partial := flags.String("partial", "", "partial response filter: 0 or 1")
 	start := flags.Int64("start-ns", 0, "minimum original request start time")
 	end := flags.Int64("end-ns", 0, "maximum original request start time")
+	scope := flags.String("scope", "auto", "auto, measurement, or capture")
+	includeProtocolWaits := flags.Bool("include-protocol-waits", false, "include empty Fetch RPCs and peer backoff in duration rankings")
 	minimum := "0"
 	thresholds := map[string]string{}
 	if command == "slow-path" {
@@ -56,6 +58,7 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 		}
 	}
 	limit := flags.Int("limit", 10, "maximum rows (1-100)")
+	offset := flags.Int("offset", 0, "skip this many matching rows")
 	selected := flags.String("selected", "", "trace_id:span_id for evidence detail")
 	asJSON := flags.Bool("json", false, "print response JSON")
 	if err := flags.Parse(args); err != nil {
@@ -115,6 +118,11 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 		*capture = result.Captures[0].ID
 	}
 	params := url.Values{"start_ns": {strconv.FormatInt(*start, 10)}, "end_ns": {strconv.FormatInt(*end, 10)}, "capture": {*capture}, "attribute": {*attribute}, "name": {*name}, "node": {*node}, "group": {*group}, "outcome": {*outcome}, "partial": {*partial}, "min": {minimum}, "limit": {strconv.Itoa(*limit)}, "selected": {*selected}}
+	params.Set("scope", *scope)
+	params.Set("offset", strconv.Itoa(*offset))
+	if *includeProtocolWaits {
+		params.Set("include_protocol_waits", "1")
+	}
 	endpoint := "/events"
 	if command == "fetch-delay" {
 		endpoint = "/requests"
@@ -126,7 +134,9 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 	if *asJSON {
 		return json.NewEncoder(os.Stdout).Encode(report)
 	}
-	fmt.Printf("%s  complete=%t  %d matching  %d missing %s\n", report.Capture, report.Complete, report.Total, report.Missing, cmp.Or(report.Attribute, "duration"))
+	fmt.Printf("%s  complete=%t  scope=%s  %d/%d matching at offset %d  %d missing %s  %d protocol waits omitted\n",
+		report.Capture, report.Complete, report.Scope, len(report.Rows), report.Total, report.Offset, report.Missing,
+		cmp.Or(report.Attribute, "duration"), report.ProtocolWaitsOmitted)
 	for _, issue := range report.Issues {
 		fmt.Println("Incomplete:", issue)
 	}
@@ -134,7 +144,7 @@ func nativeTraceCLI(ctx context.Context, command string, flags *flag.FlagSet, ar
 		label, value := report.Attribute, nativeValueText(row, report.Attribute, report.Units)
 		if report.Sort == "duration" {
 			label = "duration"
-			number, err := otel.NativeNumber(row.Duration)
+			number, err := otel.NativeNumber(cmp.Or(row.WindowDuration, row.Duration))
 			if err != nil {
 				return err
 			}
