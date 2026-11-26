@@ -1,6 +1,6 @@
 export type Variant = 'baseline' | 'current' | 'cluster';
 export type Role = 'leader' | 'follower';
-export type View = 'overview' | 'runs' | 'flamegraphs' | 'stages' | 'trace';
+export type View = 'overview' | 'runs' | 'flamegraphs' | 'slow' | 'trace';
 
 export const decisionNames = { retained: '已保留', reverted: '已回退', pending: '待评估' } as const;
 
@@ -37,6 +37,7 @@ export interface Workload {
 export interface Hotspot { function: string; samples: number; percent: number }
 
 export interface NodeProfile {
+  node?: string;
   cpu_ms: number;
   cpu_ms_per_mib: number;
   peak_rss_mib?: number;
@@ -73,10 +74,7 @@ export interface Target {
 }
 
 export function targetTitle(target?: Target) {
-  if (target?.experiment_id && (target.variant === 'current' || target.variant === 'candidate')) {
-    return `${target.experiment_id} · 本轮`;
-  }
-  return target?.title;
+  return target?.experiment_id ? target.id : target?.title;
 }
 
 export interface TargetComparison {
@@ -115,7 +113,7 @@ export interface Run {
 
 export interface Stage {
   node: string;
-  role: Role | 'client';
+  role: string;
   stage: string;
   count: number;
   union_ms: number;

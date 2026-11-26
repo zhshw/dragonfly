@@ -58,7 +58,7 @@ func DiagnosticsForTarget(store Repository, id string) (ReferenceDiagnostics, er
 		return ReferenceDiagnostics{}, err
 	}
 	for _, target := range targets {
-		if target.ID != id {
+		if target.ID != resolveTargetID(id, targets) {
 			continue
 		}
 		result := ReferenceDiagnostics{Target: target}

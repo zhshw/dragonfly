@@ -32,7 +32,7 @@ func comparisonFixture(t *testing.T, prefix string) (Store, string, ChoiceIDs) {
 			t.Fatal(err)
 		}
 	}
-	return store, prefix + "-current", ChoiceIDs{Cumulative: prefix + "-base:current", Previous: prefix + "-previous", Reference: prefix + "-base:cluster"}
+	return store, prefix + "-current", ChoiceIDs{Cumulative: prefix + "-base", Previous: prefix + "-previous", Reference: prefix + "-base:cluster"}
 }
 
 func checkComparisonUpdates(t *testing.T, repo Repository, id string, choices ChoiceIDs) {
@@ -106,7 +106,7 @@ func TestPostgresConfigureComparisons(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		for _, remove := range []string{id, choices.Previous, choices.Cumulative[:len(choices.Cumulative)-len(":current")]} {
+		for _, remove := range []string{id, choices.Previous, choices.Cumulative} {
 			if _, err := p.Delete(context.Background(), remove); err != nil {
 				t.Error(err)
 			}

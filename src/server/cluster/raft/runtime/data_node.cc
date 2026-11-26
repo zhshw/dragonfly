@@ -4,6 +4,7 @@
 
 #include "server/cluster/raft/runtime/data_node.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <absl/random/random.h>
 #include <absl/strings/str_cat.h>
 
@@ -163,6 +164,16 @@ struct AsyncPendingSet final : WatermarkWrite {
   }
 
   void ReleaseInput() {
+    if (local->trace) {
+      auto event =
+          local->trace->MakeEvent("raft.set.input_lifetime", queued_at, local->trace->Now());
+      event.attributes["node_role"] = "Leader";
+      event.attributes["epoch"] = to_string(proposal.epoch);
+      event.attributes["reserved_bytes"] = to_string(reservation.bytes());
+      event.attributes["input_heap_bytes"] = to_string(input.HeapMemory());
+      local->trace->Emit(std::move(event));
+    }
+
     // The drainer has finished all reads; cached effects now refer to the immutable WAL.
     proposal.effect.reset();
     proposal.key = {};
@@ -174,6 +185,7 @@ struct AsyncPendingSet final : WatermarkWrite {
 
   shared_ptr<LocalPartition> local;
   AdmissionBudget::Reservation reservation;
+  const trace::Time queued_at = local->trace ? local->trace->Now() : 0;
   cmn::BackedArguments input;
   string key;
   string value;
@@ -219,6 +231,8 @@ class DataNodeImpl final : public DataNode {
     if (!group.ok())
       return group.status();
     observer_ = *std::move(group);
+    if (trace_factory_)
+      observer_->SetTraceCapture(trace_factory_("0"));
 
     // The RESP and internal ports can open before this broker receives its slot assignment.
     RpcHandlers handlers;
@@ -276,6 +290,8 @@ class DataNodeImpl final : public DataNode {
   }
   void SetTraceFactory(TraceFactory factory) override {
     trace_factory_ = std::move(factory);
+    if (observer_)
+      observer_->SetTraceCapture(trace_factory_ ? trace_factory_("0") : nullptr);
   }
   shared_ptr<trace::Admission> NewAdmissionTrace(uint64_t connection) override {
     auto local = partition_.load();
@@ -393,8 +409,25 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
       if (auto s = replica->snapshots.Restore(log, hw, &replica->effects); !s.ok())
         return s;
       auto apply_sets = [&](span<const SetEffectView* const> effects, size_t* applied) {
+        auto trace = replica->trace ? replica->raft->NewTraceBatch() : nullptr;
+        const auto queued = trace ? trace->Now() : 0;
+        absl::Cleanup publish = [&] {
+          if (trace)
+            trace->Publish();
+        };
+
         // Re-enter once per bounded batch, preserving log order and the completed prefix.
         return owner_->Await([&] {
+          if (trace) {
+            trace->Record("raft.apply.owner_queue", queued, trace->Now());
+            replica->apply_executor.SetApplyObserver([trace](int64_t start, int64_t end) {
+              trace->Record("journal.apply", start, end);
+            });
+          }
+          absl::Cleanup observer = [&] {
+            if (trace)
+              replica->apply_executor.SetApplyObserver({});
+          };
           const auto deadline = steady_clock::now() + milliseconds(1);
           for (const auto* effect : effects) {
             if (auto s = ExecuteSetEffect(replica->apply_executor, *effect); !s.ok())
@@ -448,10 +481,23 @@ absl::Status DataNodeImpl::OpenPartition(const MetadataImage& image, const Broke
               return batch.status();
             if (*batch) {
               replica->applying = *batch;
-              CHECK(replica->apply_queue.TryAdd([replica, batch = *batch] {
+              auto trace = replica->raft->NewTraceBatch();
+              const auto queued = trace ? trace->Now() : 0;
+              CHECK(replica->apply_queue.TryAdd([replica, batch = *batch, trace, queued] {
+                const auto start = trace ? trace->Now() : 0;
+                if (trace)
+                  trace->Record("raft.apply.lane_queue", queued, start);
                 size_t completed = 0;
-                auto status = ExecuteSetBatch(replica->apply_executor, *batch, &completed);
-                replica->raft->CompleteApply([replica, batch, completed, status] {
+                auto status =
+                    ExecuteSetBatch(replica->apply_executor, *batch, trace.get(), &completed);
+                const auto finished = trace ? trace->Now() : 0;
+                if (trace)
+                  trace->Record("raft.apply.lane_run", start, finished);
+                replica->raft->CompleteApply([replica, batch, completed, status, trace, finished] {
+                  if (trace) {
+                    trace->Record("raft.apply.complete_queue", finished, trace->Now());
+                    trace->Publish();
+                  }
                   auto finish = replica->effects.FinishApply(*batch, completed);
                   replica->apply_status = finish.ok() ? status : finish;
                   replica->applying.reset();
@@ -695,6 +741,8 @@ shared_ptr<PendingDataWrite> DataNodeImpl::TrySetImpl(DbIndex db, string_view ke
   auto epoch = local->raft->LeaderEpoch();
   if (!epoch)
     return nullptr;
+  if (admission)
+    admission->SetEpoch(*epoch);
   auto reservation = local->budget.TryReserve(bytes);
   if (!reservation) {
     if (admission)
@@ -897,6 +945,13 @@ optional<steady_clock::time_point> DataNodeImpl::PumpSets(LocalPartition& local,
     lock_guard lock(local.batch_mu);
     shared_ptr<AsyncPendingSet> accepted;
     while (local.admissions.try_dequeue(accepted)) {
+      if (local.trace) {
+        auto event = local.trace->MakeEvent("raft.set.admission_queue", accepted->queued_at,
+                                            local.trace->Now());
+        event.attributes["node_role"] = "Leader";
+        event.attributes["epoch"] = to_string(accepted->proposal.epoch);
+        local.trace->Emit(std::move(event));
+      }
       local.ready_sets.push_back(&accepted->proposal);
       local.queued_bytes += accepted->reservation.bytes();
       ++local.queued_requests;

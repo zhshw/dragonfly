@@ -179,8 +179,29 @@ class RaftGroup::Impl {
   void SetTraceCapture(shared_ptr<trace::Capture> capture) {
     RunOnWorker([&] {
       capture_ = std::move(capture);
+      if (capture_)
+        capture_->SetEventPrefix(kind_ == Kind::kMetadata ? "metadata." : "raft.");
+      SyncTraceRole();
       log_->SetTraceCapture(capture_);
+      tracing_.store(bool(capture_), memory_order_release);
     });
+  }
+
+  void SyncTraceRole() {
+    if (!capture_)
+      return;
+    const auto& state = campaign_.state();
+    const char* role = state.role == QuorumRole::kLeader     ? "Leader"
+                       : state.role == QuorumRole::kFollower ? "Follower"
+                                                             : "Unknown";
+    capture_->SetNodeRole(role, state.election.epoch);
+  }
+
+  shared_ptr<trace::Batch> NewTraceBatch() {
+    if (!capture_)
+      return nullptr;
+    SyncTraceRole();
+    return make_shared<trace::Batch>(*capture_);
   }
 
   void SetDataDriver(DataDriver driver) {
@@ -210,7 +231,18 @@ class RaftGroup::Impl {
   void Encode(function<void()> work, function<void()> completion) {
     CHECK(!encoding_);
     encoding_ = true;
-    auto done = [this, completion = std::move(completion)] {
+    auto trace = NewTraceBatch();
+    if (trace) {
+      work = [trace, queued = trace->Now(), work = std::move(work)] {
+        const auto start = trace->Now();
+        trace->Record("raft.set.encode_queue", queued, start);
+        work();
+        trace->Record("raft.set.encode", start, trace->Now());
+      };
+    }
+    auto done = [this, trace, completion = std::move(completion)] {
+      if (trace)
+        trace->Publish();
       const auto before = CommitState();
       const auto end = log_->End();
       completion();
@@ -267,7 +299,15 @@ class RaftGroup::Impl {
                           data_only ? IoAccess::kData : IoAccess::kIdle);
       if (!status.ok() || done)
         return status;
+      auto trace = tracing_.load(memory_order_acquire)
+                       ? worker_.Await([&] { return NewTraceBatch(); })
+                       : nullptr;
+      const auto start = trace ? trace->Now() : 0;
       commit_changed_.wait_until(key.epoch(), deadline);
+      if (trace) {
+        trace->Record("raft.await_commit", start, trace->Now());
+        worker_.Await([&] { trace->Publish(); });
+      }
     }
     return absl::DeadlineExceededError("Timed out waiting for quorum commit");
   }
@@ -284,13 +324,27 @@ class RaftGroup::Impl {
       absl::FunctionRef<bool()> ready = [] { return true; },
       trace::FetchTrace* request_trace = nullptr) -> decltype(operation()) {
     util::detail::ResultMover<decltype(operation())> result;
+    shared_ptr<trace::Batch> waiting;
     while (true) {
       auto key = io_changed_.prepareWait();
+      const auto queued = tracing_.load(memory_order_acquire) ? trace::Capture::MonotonicNow() : 0;
       bool ran = worker_.Await([&] {
+        const auto start = capture_ ? capture_->Now() : 0;
+        if (waiting) {
+          waiting->Publish();
+          waiting.reset();
+        }
+        auto trace = NewTraceBatch();
+        if (trace && queued) {
+          trace->Record("raft.worker.queue", queued, start);
+          trace->Publish();
+        }
         if ((log_->AppendPending() && access != IoAccess::kFetch) ||
             ((log_->FlushPending() || encoding_ || (apply_busy_ && apply_busy_())) &&
              access == IoAccess::kIdle) ||
             !ready()) {
+          if (!request_trace)
+            waiting = NewTraceBatch();
           NotifyProgress(CommitState(), log_->End());
           return false;
         }
@@ -305,13 +359,17 @@ class RaftGroup::Impl {
         return std::move(result).get();
       if (request_trace)
         worker_.Await([&] { request_trace->BeginIoWait(request_trace->Now()); });
+      const auto wait_start = waiting ? waiting->Now() : 0;
       io_changed_.wait(key.epoch());
+      if (waiting)
+        waiting->Record("raft.await_io", wait_start, waiting->Now());
       if (request_trace)
         worker_.Await([&] { request_trace->EndIoWait(request_trace->Now()); });
     }
   }
 
   template <typename Commit> void NotifyProgress(const Commit& before, LogPosition end) {
+    SyncTraceRole();
     const auto hw = replication_.HighWatermark();
     if (capture_ && hw && hw != get<2>(before)) {
       const auto now = capture_->Now();
@@ -386,10 +444,21 @@ class RaftGroup::Impl {
 #if DFLY_RAFT_USE_FOLLY
 
     // The CQE is already on the serial group owner; no worker queue or epoll bridge is needed.
-    worker_.io().Submit(fd, offset, bytes, [this, done = std::move(done)](int result) {
-      CompleteIO(done, result);
-      return true;
-    });
+    auto trace = NewTraceBatch();
+    FollyIo::QueueObserver queued;
+    if (trace) {
+      queued = [trace](int64_t start, int64_t end) {
+        trace->Record("raft.folly.queue", start, end);
+        trace->Publish();
+      };
+    }
+    worker_.io().Submit(
+        fd, offset, bytes,
+        [this, done = std::move(done)](int result) {
+          CompleteIO(done, result);
+          return true;
+        },
+        std::move(queued));
 #else
     auto* proactor = static_cast<fb2::UringProactor*>(disk_pool_->at(0));
     auto completion = make_shared<PartitionLog::IoCallback>(std::move(done));
@@ -481,6 +550,7 @@ class RaftGroup::Impl {
   }
 
   absl::Status Synchronize() {
+    SyncTraceRole();
     auto status = replication_.SyncRole(WallMs());
     if (!status.ok())
       return status;
@@ -512,6 +582,14 @@ class RaftGroup::Impl {
       return absl::OkStatus();
     }
     if (auto hw = replication_.HighWatermark(); hw && apply_ && *hw != applied_) {
+      auto trace = NewTraceBatch();
+      const auto start = trace ? trace->Now() : 0;
+      absl::Cleanup record = [&] {
+        if (trace) {
+          trace->Record("raft.apply", start, trace->Now());
+          trace->Publish();
+        }
+      };
       if (auto s = apply_(*log_, *hw); !s.ok())
         return s;
       applied_ = *hw;
@@ -623,7 +701,16 @@ class RaftGroup::Impl {
             break;
         }
       }
+      auto trace = tracing_.load(memory_order_acquire) && kind_ == Kind::kMetadata
+                       ? worker_.Await([&] { return NewTraceBatch(); })
+                       : nullptr;
+      const auto start = trace ? trace->Now() : 0;
       ThisFiberSleep();
+      if (trace) {
+        trace->Record("raft.peer.backoff", start, trace->Now(),
+                      {{"peer_id", to_string(voter.key.id)}});
+        worker_.Await([&] { trace->Publish(); });
+      }
     }
     peer.Close();
   }
@@ -739,8 +826,16 @@ class RaftGroup::Impl {
         },
         request_trace.get());
     if (await_apply) {
+      auto trace = tracing_.load(memory_order_acquire)
+                       ? worker_.Await([&] { return NewTraceBatch(); })
+                       : nullptr;
+      const auto start = trace ? trace->Now() : 0;
       commit_changed_.wait_until(applied.epoch(),
                                  steady_clock::now() + milliseconds(kRequestTimeoutMs));
+      if (trace) {
+        trace->Record("raft.fetch.await_local_apply", start, trace->Now());
+        worker_.Await([&] { trace->Publish(); });
+      }
     }
     return progressed;
   }
@@ -820,6 +915,7 @@ class RaftGroup::Impl {
   function<bool()> apply_busy_;
   DataDriver data_driver_;
   atomic_bool data_wake_queued_{false};
+  atomic_bool tracing_{false};
   optional<steady_clock::time_point> data_deadline_;
   bool encoding_ = false;
   fb2::EventCount fetch_changed_;
@@ -978,7 +1074,15 @@ error_code RaftGroup::Impl::Fetch(int16_t version, const FetchRequest& request,
           IoAccess::kFetch);
       if (result != errc::resource_unavailable_try_again)
         return result;
+      shared_ptr<trace::Batch> trace;
+      if (tracing_.load(memory_order_acquire))
+        trace = worker_.Await([&] { return NewTraceBatch(); });
+      const auto start = trace ? trace->Now() : 0;
       io_changed_.wait(io_key.epoch());
+      if (trace) {
+        trace->Record("raft.await_io", start, trace->Now());
+        worker_.Await([&] { trace->Publish(); });
+      }
     }
   };
   if (auto ec = respond(true); ec || !can_wait || steady_clock::now() >= deadline)
@@ -1058,6 +1162,10 @@ optional<int32_t> RaftGroup::LeaderEpoch() const {
 
 void RaftGroup::SetTraceCapture(shared_ptr<trace::Capture> capture) {
   impl_->SetTraceCapture(std::move(capture));
+}
+
+shared_ptr<trace::Batch> RaftGroup::NewTraceBatch() {
+  return impl_->NewTraceBatch();
 }
 
 void RaftGroup::SetDataDriver(DataDriver driver) {

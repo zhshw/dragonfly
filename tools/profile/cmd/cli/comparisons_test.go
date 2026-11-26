@@ -45,7 +45,7 @@ func TestCLIConfiguresComparisonsThroughWebAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	summary, err := store.Summary("v16")
-	if err != nil || summary.Comparisons.Previous.Target.ID != "v15:current" || summary.Comparisons.Previous.Warning == "" {
+	if err != nil || summary.Comparisons.Previous.Target.ID != "v15" || summary.Comparisons.Previous.Warning == "" {
 		t.Fatalf("CLI did not save historical choices: %+v %v", summary, err)
 	}
 	if err := cli(context.Background(), append(args, "-previous", "")); err != nil {

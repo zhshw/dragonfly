@@ -41,7 +41,7 @@ func (p *Postgres) RefreshCurrent(ctx context.Context, id, output string) (Summa
 		return empty, fmt.Errorf("%w: rerun requires a completed archive", ErrInvalid)
 	}
 	var dependent sql.NullString
-	if err := tx.Model(&comparisonRow{}).Select("min(experiment_id)").Where("target_id IN ?", []string{id + ":current", id + ":candidate"}).
+	if err := tx.Model(&comparisonRow{}).Select("min(experiment_id)").Where("target_id IN ?", []string{id, id + ":current", id + ":candidate"}).
 		Row().Scan(&dependent); err != nil {
 		return empty, err
 	}

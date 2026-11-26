@@ -21,6 +21,7 @@ class AdmissionBudget {
   struct Ticket {
     uint64_t id;
     size_t bytes;
+    int32_t epoch = -1;
     trace::Capture::Clock clock;
     std::atomic<trace::Time> retired{-1};
   };
@@ -105,6 +106,7 @@ class Admission {
   Admission(std::shared_ptr<Capture> capture, uint64_t connection,
             std::shared_ptr<AdmissionBudget::Progress> progress);
   ~Admission();
+  void SetEpoch(int32_t epoch);
   void Attempt(const void* command);
   void Rejected(const void* command, size_t bytes, const AdmissionBudget& budget);
   void Admitted(const void* command, AdmissionBudget::Reservation* reservation);
@@ -114,6 +116,7 @@ class Admission {
   void Finish(std::string_view outcome);
   std::shared_ptr<Capture> capture_;
   const uint64_t connection_;
+  int32_t epoch_ = -1;
   std::shared_ptr<AdmissionBudget::Progress> progress_;
   std::vector<std::shared_ptr<AdmissionBudget::Ticket>> tickets_;
   std::vector<std::shared_ptr<AdmissionBudget::Ticket>> wave_;

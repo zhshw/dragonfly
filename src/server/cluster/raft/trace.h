@@ -87,6 +87,7 @@ struct Event {
 };
 
 class FetchTrace;
+class Batch;
 
 // One capture per serial owner, never shared implicitly through thread-local state.
 // The caller must drain requests/I/O before destroying it. Recording does no network or file I/O.
@@ -109,6 +110,13 @@ class Capture {
   Event MakePoint(std::string_view name, uint64_t request = 0);
   Event MakeEvent(std::string_view name, Time start, Time end, uint64_t request = 0);
   std::map<std::string, std::string> Labels() const;
+
+  // Configure before recording: data events keep raft.*, metadata events use metadata.*.
+  void SetEventPrefix(std::string_view prefix);
+  std::string EventName(std::string_view name) const;
+
+  // Set on the serial owner before recording; an event retains its creation-time identity.
+  void SetNodeRole(std::string_view role, int32_t epoch);
   void Emit(Event event);
   uint64_t BeginFsync(uint64_t flush, std::string_view role);
   void EndFsync(uint64_t id, int result);
@@ -139,6 +147,7 @@ class Capture {
 
  private:
   friend class FetchTrace;
+  friend class Batch;
   bool Register(FetchTrace* request);
   void Unregister(FetchTrace* request);
   void Advance(Time now);
@@ -147,6 +156,8 @@ class Capture {
   const int32_t node_;
   const size_t byte_limit_;
   std::string stream_id_;
+  std::string node_role_, epoch_;
+  std::string event_prefix_ = "raft.";
   Time wall_offset_ns_ = 0;
   size_t bytes_ = 0;
   size_t dropped_ = 0;
@@ -154,6 +165,24 @@ class Capture {
   std::vector<Event> events_;
   std::vector<FetchTrace*> requests_;
   std::map<uint64_t, Event> io_;
+};
+
+// A bounded handoff of timings from a synchronous operation on another executor. Only one
+// execution owner may access it at a time; Publish must run on the capture's serial owner.
+// IDs and capture storage are touched only at publication, never on the remote executor.
+class Batch {
+ public:
+  explicit Batch(Capture& capture, std::map<std::string, std::string> labels = {});
+  Time Now() const;
+  void Record(std::string_view name, Time start, Time end,
+              std::map<std::string, std::string> labels = {});
+  void Publish();
+
+ private:
+  Capture& capture_;
+  std::map<std::string, std::string> labels_;
+  std::vector<Event> events_;
+  size_t dropped_ = 0;
 };
 
 // Explicit context carried from RPC through the worker's gate, wait, receive and append.
@@ -182,6 +211,7 @@ class FetchTrace {
   friend class Capture;
   void Advance(Time now);
   void LinkIo(uint64_t io, uint64_t flush, bool dependency);
+  Event MakeEvent(std::string_view name, Time start, Time end);
   void EmitEvent(std::string_view name, Time start, Time end,
                  std::string_view outcome = "Observed");
   Capture& capture_;

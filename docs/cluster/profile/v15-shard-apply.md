@@ -1,6 +1,6 @@
 # v15 已提交 SET 的 shard 合批
 
-v15 在 `cluster_mode=raft` 的 ApplyLane 上合并相邻、同 shard 的 SET。上一轮选用 v14b，沿用累计基线 `v3:current` 和原 cluster 参照 `v10:cluster`。 [实验平台](http://172.31.23.2:8787/#/v15/overview) · [v14b 计划](v14b-batch-progress.md#下一步批次传递到-shard)
+v15 在 `cluster_mode=raft` 的 ApplyLane 上合并相邻、同 shard 的 SET。上一轮选用 v14b，沿用累计基线 `v3` 和原 cluster 参照 `v0:cluster`。 [实验平台](http://172.31.23.2:8787/#/v15/overview) · [v14b 计划](v14b-batch-progress.md#下一步批次传递到-shard)
 
 标准负载逐笔交替访问两个 shard，实测均为单笔段。宿主机复测及多笔合批诊断见对应小节。 [8 MiB 复测](#8-mib-复测) · [shard 诊断](#shard-诊断与收益边界)
 
@@ -65,10 +65,10 @@ Raft memory、1 连接、pipeline 64、256 MiB、256 KiB/value。与 v14b 使用
 
 | 归档 | 含 `WAIT 1` 吞吐（MiB/s） | SET 批次 P95（ms） |
 | --- | ---: | ---: |
-| v3 首版 `v3:current` | 169.56 | 113.75 |
+| v3 首版 `v3` | 169.56 | 113.75 |
 | v14b | 499.85 | 38.21 |
 | v15 宿主机复测（8 MiB 准入） | **515.03** | **33.59** |
-| 原 cluster `v10:cluster` | 605.47 | 34.63 |
+| 原 cluster `v0:cluster` | 605.47 | 34.63 |
 
 第二轮最慢批次为 **61.55 ms**，另两轮都在 **34 ms** 内。首次和这次宿主机复测的 P95 中位数相差 **1.11 ms**，逐轮波动更大。后续候选使用同宿主机交替 A/B 判断收益。 [平台宿主机复测](http://172.31.23.2:8787/#/v15/runs)
 

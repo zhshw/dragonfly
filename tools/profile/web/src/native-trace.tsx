@@ -15,14 +15,14 @@ const compare = (a: bigint, b: bigint) => a < b ? -1 : a > b ? 1 : 0;
 const requestAttributes = ['raft.fetch.return_wait', 'raft.fetch', 'raft.fetch.rpc', 'raft.fetch.await_flush', 'raft.await_io', 'raft.fetch.fsync_overlap'];
 const valueText = (e: NativeEvent, name: string, units: Report['units']) => e.states[name] !== 'Observed' ? (e.states[name] || 'Missing') : units[name] === 'ms' ? ms(e.values[name]) : `${e.values[name]} ${units[name] ?? ''}`;
 
-export function NativeTraceView({ id }: { id: string }) {
+export function SlowAnalysisView({ id, initialMode = 'events' }: { id: string; initialMode?: 'events' | 'requests' }) {
   const [captures, setCaptures] = useState<Capture[]>();
   const [capture, setCapture] = useState('');
-  const [mode, setMode] = useState<'requests' | 'events'>('requests');
+  const [mode, setMode] = useState(initialMode);
   const [attribute, setAttribute] = useState('raft.fetch.return_wait');
   const [node, setNode] = useState('');
   const [partial, setPartial] = useState('');
-  const [minimum, setMinimum] = useState('10');
+  const [minimum, setMinimum] = useState(initialMode === 'requests' ? '10' : '0');
   const [name, setName] = useState('');
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
@@ -56,9 +56,9 @@ export function NativeTraceView({ id }: { id: string }) {
   const current = captures?.find(c => c.id === capture);
   const attributes = useMemo(() => [...new Set([attribute, ...requestAttributes, ...Object.keys(report?.units ?? {})])], [attribute, report?.units]);
   return <div className="native-analysis">
-    <div className="section-toolbar"><div><h2>Stage analysis</h2><p>Rank slow events or inspect Fetch response delays, then open the timeline.</p></div><button className="button" onClick={() => setRevision(n => n + 1)}>Refresh captures</button></div>
+    <div className="section-toolbar"><div><h2>Slow analysis</h2><p>Rank slow events or inspect Fetch response delays, then open the timeline.</p></div><button className="button" onClick={() => setRevision(n => n + 1)}>Refresh captures</button></div>
     <div className="segments" role="tablist" aria-label="Analysis type">
-      <button role="tab" aria-selected={mode === 'events'} aria-pressed={mode === 'events'} onClick={() => mode !== 'events' && change(() => { setMode('events'); setMinimum('0'); })}>Event Slow Path</button>
+      <button role="tab" aria-selected={mode === 'events'} aria-pressed={mode === 'events'} onClick={() => mode !== 'events' && change(() => { setMode('events'); setMinimum('0'); })}>Slow path</button>
       <button role="tab" aria-selected={mode === 'requests'} aria-pressed={mode === 'requests'} onClick={() => mode !== 'requests' && change(() => { setMode('requests'); setAttribute('raft.fetch.return_wait'); setMinimum('10'); })}>Fetch delay</button>
     </div>
     <div className="native-captures segments" role="tablist" aria-label="Capture rounds">{captures?.map(c => <button key={c.id} role="tab" aria-selected={capture === c.id} aria-pressed={capture === c.id} onClick={() => capture !== c.id && change(() => { setCapture(c.id); setNode(''); setName(''); })}>{c.id}</button>)}</div>
@@ -79,7 +79,7 @@ export function NativeTraceView({ id }: { id: string }) {
         <div className={`native-completeness ${report.complete ? 'complete' : 'incomplete'}`}><strong>{report.complete ? 'Complete capture' : 'Incomplete capture'}</strong><span>{report.total} matches · {report.missing} missing values · Top 10 descending</span>{report.issues.map(issue => <p key={issue}>{issue}</p>)}</div>
         <section className="panel data-panel native-ranking"><div className="panel-heading"><h2>{mode === 'requests' ? 'Fetch delay' : 'Slow path'}</h2><span>{mode === 'requests' ? attribute : 'Duration · ms'}</span></div>
           <div className="table-scroll"><table className="data-table"><thead><tr><th>{mode === 'requests' ? 'Fetch' : '#'}</th><th>Node</th><th>{mode === 'requests' ? 'Offsets' : 'Event'}</th><th>{mode === 'requests' ? attribute : 'Duration'} ↓</th>{mode === 'requests' && <><th>RPC</th><th>Return wait</th><th>Gate wait</th><th>I/O wait</th><th>Append / payload</th></>}<th>Outcome</th></tr></thead><tbody>{report.rows.map((row, index) => <tr key={keyOf(row)} className={keyOf(row) === (report.selected && keyOf(report.selected)) ? 'selected' : ''}>
-            {mode === 'requests' ? <td><button className="text-link" aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>#{index + 1} · Fetch {row.fields.sequence}</button></td> : <td><button className="text-link mono" aria-label={`Open slow path ${index + 1}: ${row.name}`} aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>{index + 1}</button></td>}<td title="Roles evidenced in this capture; events with an epoch use that epoch's role.">{eventNode(row)}</td><td>{mode === 'requests' ? `${row.fields.first_offset ?? row.fields.requested_offset}–${row.fields.last_offset ?? '—'}` : <button className="text-link" aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>{row.name}</button>}</td><td className="mono strong">{mode === 'requests' ? valueText(row, attribute, report.units) : ms(row.duration_ms)}</td>{mode === 'requests' && <><td>{ms(row.values['raft.fetch.rpc'])}</td><td>{ms(row.values['raft.fetch.return_wait'])}</td><td>{ms(row.values['raft.fetch.await_flush'])}</td><td>{ms(row.values['raft.await_io'])}</td><td>{row.values['raft.fetch.appended_bytes'] ?? '—'} / {row.values['raft.fetch.payload_bytes'] ?? '—'}</td></>}<td>{row.fields.outcome}</td>
+            {mode === 'requests' ? <td><button className="text-link" aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>#{index + 1} · Fetch {row.fields.sequence}</button></td> : <td><button className="text-link mono" aria-label={`Open slow path ${index + 1}: ${row.name}`} aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>{index + 1}</button></td>}<td title="Role recorded for this event or its request; older events require an unambiguous interval in the same process.">{eventNode(row)}</td><td>{mode === 'requests' ? `${row.fields.first_offset ?? row.fields.requested_offset}–${row.fields.last_offset ?? '—'}` : <button className="text-link" aria-pressed={keyOf(row) === (report.selected && keyOf(report.selected))} onClick={() => setSelected(keyOf(row))}>{row.name}</button>}</td><td className="mono strong">{mode === 'requests' ? valueText(row, attribute, report.units) : ms(row.duration_ms)}</td>{mode === 'requests' && <><td>{ms(row.values['raft.fetch.rpc'])}</td><td>{ms(row.values['raft.fetch.return_wait'])}</td><td>{ms(row.values['raft.fetch.await_flush'])}</td><td>{ms(row.values['raft.await_io'])}</td><td>{row.values['raft.fetch.appended_bytes'] ?? '—'} / {row.values['raft.fetch.payload_bytes'] ?? '—'}</td></>}<td>{row.fields.outcome}</td>
           </tr>)}</tbody></table></div>{report.rows.length === 0 && <div className="inline-empty">No matching events.</div>}
         </section>
         {report.selected && <NativeDetail key={keyOf(report.selected)} report={report} mode={mode} />}

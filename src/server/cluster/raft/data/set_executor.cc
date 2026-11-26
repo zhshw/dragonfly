@@ -4,7 +4,10 @@
 
 #include "server/cluster/raft/data/set_executor.h"
 
+#include <absl/cleanup/cleanup.h>
+
 #include "facade/reply_capture.h"
+#include "server/cluster/raft/trace.h"
 #include "server/cluster_support.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
@@ -31,6 +34,19 @@ absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffectView& ef
 
 absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::ApplyBatch& batch,
                              size_t* completed) {
+  return ExecuteSetBatch(executor, batch, nullptr, completed);
+}
+
+absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::ApplyBatch& batch,
+                             trace::Batch* trace, size_t* completed) {
+  if (trace) {
+    executor.SetApplyObserver(
+        [trace](int64_t start, int64_t end) { trace->Record("journal.apply", start, end); });
+  }
+  absl::Cleanup observer = [&] {
+    if (trace)
+      executor.SetApplyObserver({});
+  };
   *completed = 0;
   const auto shard_count = shard_set->size();
   while (*completed < batch.size()) {
@@ -42,6 +58,13 @@ absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::
 
     // The owning ApplyLane waits before starting the next run, even if it targets another shard.
     auto apply_run = [&] {
+      const auto start = trace ? trace->Now() : 0;
+      absl::Cleanup record = [&] {
+        if (trace)
+          trace->Record(
+              "raft.apply.shard_run", start, trace->Now(),
+              {{"shard_id", std::to_string(sid)}, {"records", std::to_string(end - begin)}});
+      };
       auto apply = [&] {
         for (; *completed < end; ++*completed) {
           if (auto status = ExecuteSetEffect(executor, batch.View(*completed)); !status.ok())
@@ -57,7 +80,11 @@ absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::
     } else {
       // A contended transaction may itself wait on the primary shard queue.
       util::fb2::FiberBlockingCounter done(1);
+      const auto queued = trace ? trace->Now() : 0;
       shard_set->AddL2(sid, [&, done]() mutable {
+        if (trace)
+          trace->Record("raft.apply.shard_queue", queued, trace->Now(),
+                        {{"shard_id", std::to_string(sid)}});
         status = apply_run();
         std::move(done).Release();
       });

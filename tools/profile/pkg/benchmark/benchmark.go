@@ -59,7 +59,17 @@ type Config struct {
 	Settle                          time.Duration
 	Profiler                        string
 	TraceEnvironment                []string
+	Observe                         func([]ClientEvent, int64) error
 	Log                             io.Writer
+}
+
+// ClientEvent retains the actual pipeline and final WAIT boundaries of a diagnostic run.
+type ClientEvent struct {
+	Name       string
+	Start, End int64
+	Client     int
+	Writes     int
+	Bytes      int
 }
 
 // Result keeps the archived measurement schema used by the CLI and Web.
@@ -98,6 +108,7 @@ type record struct{ key, value []byte }
 type sample struct {
 	start, end int64
 	latencies  []float64
+	events     []ClientEvent
 	err        error
 }
 
@@ -116,7 +127,7 @@ func percentile(v []float64, fraction float64) float64 {
 	return v[int(math.Ceil(float64(len(v))*fraction))-1]
 }
 
-func writeSlice(c *connection, records []record, depth int, start <-chan struct{}) sample {
+func writeSlice(c *connection, records []record, depth int, start <-chan struct{}, observe bool) sample {
 	s := sample{}
 	<-start
 	s.start = mono()
@@ -141,11 +152,22 @@ func writeSlice(c *connection, records []record, depth int, start <-chan struct{
 		}
 		s.end = mono()
 		s.latencies = append(s.latencies, float64(s.end-sent)/1e6)
+		if observe {
+			if len(s.events) >= 8192 {
+				s.err = errors.New("client trace buffer is full")
+				return s
+			}
+			event := ClientEvent{Name: "client.pipeline", Start: sent, End: s.end, Writes: len(chunk)}
+			for _, record := range chunk {
+				event.Bytes += len(record.value)
+			}
+			s.events = append(s.events, event)
+		}
 	}
 	return s
 }
 
-func writeBatch(writers []*connection, data []record, depth int) ([]sample, error) {
+func writeBatch(writers []*connection, data []record, depth int, observe ...bool) ([]sample, error) {
 	active := min(len(writers), len(data))
 	samples := make([]sample, active)
 	start := make(chan struct{})
@@ -160,7 +182,10 @@ func writeBatch(writers []*connection, data []record, depth int) ([]sample, erro
 				records = append(records, data[j])
 			}
 			ready.Done()
-			samples[i] = writeSlice(writers[i], records, depth, start)
+			samples[i] = writeSlice(writers[i], records, depth, start, len(observe) > 0 && observe[0])
+			for j := range samples[i].events {
+				samples[i].events[j].Client = i
+			}
 		}(i)
 	}
 	ready.Wait()
@@ -193,7 +218,7 @@ func Run(ctx context.Context, c Config) (result Result, err error) {
 	if (c.Mode != "raft" && c.Mode != "yes") || (c.Mode == "raft" && c.Ack != "memory" && c.Ack != "flush") || c.Payload < 1 || c.Depth < 1 || c.Clients < 1 || c.Clients > min(1024, c.Payload*4) || c.Warmup < 0 || c.Settle < 0 {
 		return result, errors.New("invalid benchmark configuration")
 	}
-	if c.Profiler == "" && len(c.TraceEnvironment) != 0 {
+	if c.Profiler == "" && (len(c.TraceEnvironment) != 0 || c.Observe != nil) {
 		return result, errors.New("trace environment requires an independent diagnostic run")
 	}
 	if c.Log == nil {
@@ -220,8 +245,16 @@ func Run(ctx context.Context, c Config) (result Result, err error) {
 		return result, errors.New("benchmark output already contains node logs")
 	}
 	f := &fixture{ctx: ctx, config: c}
+	var clientEvents []ClientEvent
+	var wallOffset int64
+	if c.Observe != nil {
+		wallOffset = time.Now().UnixNano() - mono()
+	}
 	defer func() {
 		err = errors.Join(err, f.close())
+		if err == nil && c.Observe != nil {
+			err = c.Observe(clientEvents, wallOffset)
+		}
 		if err == nil {
 			err = os.RemoveAll(f.root)
 		}
@@ -306,7 +339,7 @@ func Run(ctx context.Context, c Config) (result Result, err error) {
 			return result, err
 		}
 	}
-	samples, err := writeBatch(writers, data, c.Depth)
+	samples, err := writeBatch(writers, data, c.Depth, c.Observe != nil)
 	if err != nil {
 		return result, err
 	}
@@ -320,6 +353,12 @@ func Run(ctx context.Context, c Config) (result Result, err error) {
 		}
 	}
 	result = summarize(c, samples, end)
+	if c.Observe != nil {
+		for _, sample := range samples {
+			clientEvents = append(clientEvents, sample.events...)
+		}
+		clientEvents = append(clientEvents, ClientEvent{Name: "client.final_wait", Start: result.WriteEnd, End: end})
+	}
 	recovery := mono()
 	if err = f.start(13); err != nil {
 		return result, err

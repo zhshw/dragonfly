@@ -46,6 +46,8 @@ TEST(TraceExporterTest, PreservesIdentityBoundariesMissingValuesAndEvidence) {
   ASSERT_EQ(spans.size(), capture.events().size());
   bool found = false, dependency = false, blocked = false, ready = false, fsync = false;
   for (const auto& span : spans) {
+    EXPECT_NE(span.name(), "raft.fetch.response");
+    EXPECT_NE(span.name(), "raft.fetch.appended");
     const auto attrs = Attributes(span);
     blocked |= span.name() == "raft.fetch.flush_gate.blocked";
     ready |= span.name() == "raft.fetch.flush_gate.ready";
@@ -117,6 +119,59 @@ TEST(TraceExporterTest, PublishesManifestLastAndNeverMasksDroppedOrFailedBatches
   auto attrs = Attributes(request.resource_spans(0).scope_spans(0).spans(0));
   EXPECT_EQ(attrs.at("langfuse.observation.metadata.outcome"), "Incomplete");
   EXPECT_EQ(attrs.at("langfuse.observation.metadata.dropped"), "1");
+}
+
+TEST(TraceExporterTest, MetadataKeepsItsOwnEventNamesUnitsAndDeferredIoEvidence) {
+  trace::Time now = 1;
+  trace::Capture capture("unit", "process", "0", 11, 1U << 20, [&] { return now; });
+  capture.SetEventPrefix("metadata.");
+  capture.SetNodeRole("Follower", 3);
+  trace::Batch queued(capture);
+  queued.Record("raft.worker.queue", 1, 2);
+  queued.Publish();
+  trace::FetchTrace fetch(capture, 1, 3, 7, 218);
+  fetch.RpcStarted(now);
+  now = 2;
+  const auto io = capture.BeginFsync(123, "Log");
+  now = 6;
+  capture.EndFsync(io, 0);
+
+  // The transport returned at 3; its notification reaches the owner after the fsync finished.
+  now = 9;
+  fetch.RpcReturned(3, 0, true);
+  fetch.CheckGate(trace::Gate::kAllowed, 0);
+  fetch.ReceiveStarted();
+  fetch.Finish("Empty");
+  Request request;
+  ASSERT_TRUE(request.ParseFromString(EncodeTraceBatch(capture, {}, 0, capture.events().size())));
+  bool queue = false, rpc = false, request_found = false, overlap = false;
+  for (const auto& span : request.resource_spans(0).scope_spans(0).spans()) {
+    EXPECT_TRUE(span.name().starts_with("metadata."));
+    const auto attrs = Attributes(span);
+    EXPECT_EQ(attrs.at("langfuse.observation.metadata.group_id"), "0");
+    EXPECT_EQ(attrs.at("langfuse.observation.metadata.node_role"), "Follower");
+    queue |= span.name() == "metadata.worker.queue";
+    rpc |= span.name() == "metadata.fetch.rpc";
+    if (span.name() == "metadata.fetch") {
+      request_found = true;
+      EXPECT_EQ(attrs.at("langfuse.observation.metadata.value.metadata.fetch.rpc"), "0.000002");
+      EXPECT_EQ(attrs.at("langfuse.observation.metadata.value.metadata.fetch.fsync_overlap"),
+                "0.000003");
+      EXPECT_FALSE(attrs.contains("langfuse.observation.metadata.value.raft.fetch.rpc"));
+    }
+    if (span.name() == "metadata.fetch.io_overlap") {
+      overlap = true;
+      EXPECT_EQ(attrs.at("langfuse.observation.metadata.io_id"), to_string(io));
+    }
+  }
+  EXPECT_TRUE(queue && rpc && request_found && overlap);
+  Request manifest;
+  ASSERT_TRUE(manifest.ParseFromString(EncodeTraceBatch(capture, {}, capture.events().size(), 0)));
+  const auto& root = manifest.resource_spans(0).scope_spans(0).spans(0);
+  EXPECT_EQ(root.name(), "raft.capture");
+  const auto attrs = Attributes(root);
+  EXPECT_EQ(attrs.at("langfuse.observation.metadata.unit.metadata.fetch.rpc"), "ms");
+  EXPECT_FALSE(attrs.contains("langfuse.observation.metadata.unit.raft.fetch.rpc"));
 }
 
 }  // namespace

@@ -16,6 +16,9 @@ namespace dfly {
 class JournalExecutor;
 
 namespace cluster::raft {
+namespace trace {
+class Batch;
+}
 
 // Apply on a server proactor through the same synchronous transaction used by journal replay.
 absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffectView& effect);
@@ -24,6 +27,8 @@ absl::Status ExecuteSetEffect(JournalExecutor& executor, const SetEffectView& ef
 // record and no later record has executed. The batch owns all borrowed key/value bytes.
 absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::ApplyBatch& batch,
                              size_t* completed);
+absl::Status ExecuteSetBatch(JournalExecutor& executor, const CommittedEffects::ApplyBatch& batch,
+                             trace::Batch* trace, size_t* completed);
 
 // Inspect a committed key through the normal shard transaction while the group's proposals
 // are serialized. EXISTS accepts every Redis value type.

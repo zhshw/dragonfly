@@ -45,6 +45,7 @@ TEST(RaftTraceTest, ClipsFsyncUnionAndAccountsForDeliveryAcrossOwners) {
   now = 12;
   request.EndIoWait(now);
   now = 15;
+  request.CheckGate(Gate::kAllowed, 0);
   request.ReceiveStarted();
   now = 16;
   request.Finish("Empty");
@@ -57,6 +58,10 @@ TEST(RaftTraceTest, ClipsFsyncUnionAndAccountsForDeliveryAcrossOwners) {
   EXPECT_EQ(ValueOf(capture, Attribute::kIoWait), 3);
   EXPECT_EQ(ValueOf(capture, Attribute::kIoFsyncOverlap), 2);
   EXPECT_EQ(ValueOf(capture, Attribute::kGateRejections), 0);
+  for (const auto& event : capture.events()) {
+    EXPECT_NE(event.name, "raft.fetch.response");
+    EXPECT_NE(event.name, "raft.fetch.flush_gate.ready");
+  }
 }
 
 TEST(RaftTraceTest, ErrorCancellationAndOverflowNeverBecomeEmptySuccess) {
@@ -93,6 +98,8 @@ TEST(RaftTraceTest, AdmissionCountsOnlyItsConnectionAndRequiresWalEvidence) {
   auto capture = make_shared<Capture>("test", "process", "10", 1, 1U << 20, [&] { return now; });
   AdmissionBudget budget(100, 2);
   Admission first(capture, 1, budget.progress()), second(capture, 2, budget.progress());
+  first.SetEpoch(7);
+  second.SetEpoch(7);
   int a, b, blocked;
   auto ticket_a = budget.TryReserve(10);
   auto ticket_b = budget.TryReserve(10);
@@ -112,6 +119,14 @@ TEST(RaftTraceTest, AdmissionCountsOnlyItsConnectionAndRequiresWalEvidence) {
   EXPECT_EQ(ValueOf(*capture, Attribute::kRetiredTickets), 0);
   EXPECT_EQ(ValueOf(*capture, Attribute::kFullWaveRetired), 0);
   EXPECT_FALSE(ValueOf(*capture, Attribute::kWalIdle));
+  now = 6;
+  first.SetEpoch(8);
+  ticket_a.reset();
+  first.Refresh();
+  for (const auto& event : capture->events()) {
+    EXPECT_EQ(event.attributes.at("node_role"), "Leader");
+    EXPECT_EQ(event.attributes.at("epoch"), "7");
+  }
 }
 
 TEST(RaftTraceTest, PointEventsReadTheClockOnceAndInvalidBoundariesInvalidateCapture) {
@@ -133,11 +148,46 @@ TEST(RaftTraceTest, PointEventsReadTheClockOnceAndInvalidBoundariesInvalidateCap
   fetch.Finish("Cancelled");
   for (const auto& event : capture->events()) {
     EXPECT_GE(event.end, event.start) << event.name;
-    if (event.name == "raft.fetch.io_dependency" || event.name == "raft.fetch.io_overlap")
+    if (event.name == "raft.fetch.io_dependency" || event.name == "raft.fetch.io_overlap") {
       EXPECT_EQ(event.start, event.end);
+    }
   }
   capture->Emit(capture->MakeEvent("invalid", 2, 1));
   EXPECT_EQ(capture->dropped(), 1u);
+}
+
+TEST(RaftTraceTest, DeferredQueueTimingsKeepOriginalBoundsAndRole) {
+  Time now = 1;
+  Capture capture("test", "process", "10", 11, 16U << 20, [&] { return now; });
+  capture.SetNodeRole("Follower", 7);
+  Batch batch(capture);
+  const auto queued = batch.Now();
+  now = 10;
+  batch.Record("raft.apply.lane_queue", queued, batch.Now());
+  now = 20;
+  batch.Record("journal.apply", 10, batch.Now());
+  const auto io = capture.BeginFsync(1, "Log");
+  now = 1000;
+  capture.SetNodeRole("Leader", 8);
+  EXPECT_TRUE(capture.events().empty());
+  batch.Publish();
+  ASSERT_EQ(capture.events().size(), 2u);
+  EXPECT_EQ(capture.events()[0].start, 1);
+  EXPECT_EQ(capture.events()[0].end, 10);
+  EXPECT_EQ(capture.events()[1].start, 10);
+  EXPECT_EQ(capture.events()[1].end, 20);
+  EXPECT_EQ(capture.events()[1].attributes.at("epoch"), "7");
+  EXPECT_EQ(capture.events()[1].attributes.at("node_role"), "Follower");
+  batch.Publish();
+  EXPECT_EQ(capture.events().size(), 2u);
+  capture.EndFsync(io, 0);
+  EXPECT_EQ(capture.events().back().attributes.at("node_role"), "Follower");
+  EXPECT_EQ(capture.events().back().attributes.at("epoch"), "7");
+  EXPECT_EQ(capture.MakePoint("later").attributes.at("node_role"), "Leader");
+  for (size_t i = 0; i < 8193; ++i)
+    batch.Record("queue", 1, 2);
+  batch.Publish();
+  EXPECT_EQ(capture.dropped(), 1u);
 }
 
 }  // namespace

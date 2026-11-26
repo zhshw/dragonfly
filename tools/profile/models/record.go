@@ -160,6 +160,23 @@ var slug = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
 // Get loads the saved experiment without reading the raw measurements.
 func (s Store) Get(id string) (Record, error) {
+	record, err := s.readRecord(id)
+	record.Summary.Comparisons.canonicalize()
+	if err == nil {
+		// The shared Cluster reference is owned by the v10 archive.
+		source, sourceErr := s.readRecord("v10")
+		if sourceErr != nil && !os.IsNotExist(sourceErr) {
+			return record, sourceErr
+		}
+		if reference, ok := clusterReference(targetsFrom(source.Summary)); ok {
+			useClusterReference(&record.Summary, reference)
+		}
+	}
+	return record, err
+}
+
+// readRecord preserves the original manifest for idempotent PostgreSQL synchronization.
+func (s Store) readRecord(id string) (Record, error) {
 	var rec Record
 	if !slug.MatchString(id) {
 		return rec, os.ErrNotExist
@@ -214,7 +231,7 @@ func (s Store) records() ([]Record, error) {
 		if !entry.IsDir() || !slug.MatchString(entry.Name()) {
 			continue
 		}
-		record, err := s.Get(entry.Name())
+		record, err := s.readRecord(entry.Name())
 		if os.IsNotExist(err) {
 			continue
 		}

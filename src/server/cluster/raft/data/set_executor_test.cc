@@ -7,6 +7,7 @@
 #include "base/gtest.h"
 #include "facade/facade_test.h"
 #include "server/cluster/raft/data/set_effect.h"
+#include "server/cluster/raft/trace.h"
 #include "server/cluster_support.h"
 #include "server/engine_shard_set.h"
 #include "server/journal/executor.h"
@@ -117,15 +118,37 @@ TEST_F(SetExecutorTest, DetachedBatchStopsAtFirstFailureAcrossShardRuns) {
   auto suspended = ExpectUsedKeys({keys[1]});
   pp_->at(0)->Await([&] {
     JournalExecutor executor(service_.get());
+    trace::Capture capture("apply", "process", "10", 11);
+    trace::Batch timings(capture, {{"node_role", "Follower"}, {"epoch", "7"}});
     size_t completed = 0;
-    auto status = ExecuteSetBatch(executor, *batch, &completed);
+    auto status = ExecuteSetBatch(executor, *batch, &timings, &completed);
     EXPECT_FALSE(status.ok());
     ASSERT_EQ(completed, 4u);
+    EXPECT_TRUE(capture.events().empty());
+    timings.Publish();
+    size_t journal = 0, queued = 0, runs = 0;
+    for (const auto& event : capture.events()) {
+      EXPECT_GE(event.end, event.start);
+      EXPECT_EQ(event.attributes.at("node_role"), "Follower");
+      EXPECT_EQ(event.attributes.at("epoch"), "7");
+      if (event.name == "journal.apply")
+        ++journal;
+      else if (event.name == "raft.apply.shard_queue")
+        ++queued;
+      else if (event.name == "raft.apply.shard_run")
+        ++runs;
+    }
+    EXPECT_EQ(journal, 4u);
+    EXPECT_GT(queued, 0u);
+    EXPECT_EQ(runs, 3u);
     EXPECT_TRUE(state.FinishApply(*batch, completed).ok());
     EXPECT_EQ(state.applied_offset(), 4);
     EXPECT_EQ(ReadCommittedValue(executor, 0, keys[0]).value(), "local");
     EXPECT_EQ(ReadCommittedValue(executor, 0, keys[1]).value(), "last");
     EXPECT_EQ(ReadCommittedValue(executor, 2, keys[1]).value(), "other db");
+    const auto recorded = capture.events().size();
+    timings.Publish();
+    EXPECT_EQ(capture.events().size(), recorded);
   });
   suspended.Join();
 }

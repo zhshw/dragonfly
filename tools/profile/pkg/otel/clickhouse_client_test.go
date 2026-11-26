@@ -98,6 +98,10 @@ func TestNativeReaderClickHouse(t *testing.T) {
 					t.Fatal("ClickHouse lost long metadata or changed the value")
 				}
 			}
+			summary, err := reader.Summary(context.Background(), "v15", "capture")
+			if err != nil || !summary.Complete || summary.Total != 1 || len(summary.Stages) != 1 || summary.Stages[0].Count != 1 || summary.Stages[0].P95 != .000001 {
+				t.Fatalf("summary differs from native events: %+v %v", summary, err)
+			}
 			if apiCalls.Load() != tc.apiCalls || databaseCalls.Load() != tc.databaseCalls {
 				t.Fatalf("unexpected query counts after two report requests: API=%d ClickHouse=%d", apiCalls.Load(), databaseCalls.Load())
 			}

@@ -25,7 +25,9 @@ class FollyIo {
   // owner for its state machine can advance its serialized state directly from the callback.
   // Return false when the recipient queue is full; Folly retries delivery in a later loop.
   // A retry delivers the same result and never repeats the I/O operation.
-  void Submit(int fd, int64_t offset, std::string_view bytes, std::function<bool(int)> done);
+  using QueueObserver = std::function<void(int64_t, int64_t)>;
+  void Submit(int fd, int64_t offset, std::string_view bytes, std::function<bool(int)> done,
+              QueueObserver queued = {});
 
   void Run(std::function<void()> task);
   void Drain();

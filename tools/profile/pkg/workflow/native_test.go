@@ -117,6 +117,13 @@ func TestVerifyNativeCapture(t *testing.T) {
 	if err != nil || !got.Complete || got.Events != 2 || got.Streams != 2 || calls.Load() < 3 {
 		t.Fatalf("got %+v: %v", got, err)
 	}
+	want.Client = true
+	clientContext, clientCancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer clientCancel()
+	if _, err := verifyNative(clientContext, config, want, time.Millisecond); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("missing required client stream accepted")
+	}
+	want.Client = false
 	want.BinarySHA = strings.Repeat("b", 64)
 	if _, err := verifyNative(ctx, config, want, time.Millisecond); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
 		t.Fatalf("accepted another binary: %v", err)

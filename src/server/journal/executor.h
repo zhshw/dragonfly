@@ -8,6 +8,8 @@
 #include <absl/status/status.h>
 #include <absl/types/span.h>
 
+#include <functional>
+
 #include "facade/service_interface.h"
 #include "server/cluster/cluster_defs.h"
 #include "server/conn_context.h"
@@ -45,6 +47,13 @@ class JournalExecutor {
   // the target shard and must wait for the callback before using this executor again.
   absl::Status WithShardLocalTransaction(absl::FunctionRef<absl::Status()> run);
 
+  // Observe synchronous dispatch boundaries on its execution thread, excluding shard enqueue.
+  // The caller owns the observer lifetime and serializes all use of this executor.
+  using ApplyObserver = std::function<void(int64_t, int64_t)>;
+  void SetApplyObserver(ApplyObserver observer) {
+    apply_observer_ = std::move(observer);
+  }
+
   void FlushAll();  // Execute FLUSHALL.
   void FlushSlots(const cluster::SlotRange& slot_range);
 
@@ -59,6 +68,7 @@ class JournalExecutor {
   ConnectionContext conn_context_;
 
   std::vector<bool> ensured_dbs_;
+  ApplyObserver apply_observer_;
 };
 
 }  // namespace dfly

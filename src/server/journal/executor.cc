@@ -9,6 +9,7 @@
 #include <absl/strings/str_split.h>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 
 #include "base/flags.h"
@@ -111,7 +112,18 @@ void JournalExecutor::FlushSlots(const cluster::SlotRange& slot_range) {
 }
 
 facade::DispatchResult JournalExecutor::Execute(facade::ParsedArgs args, CommandContext* cmd_cntx) {
-  return service_->DispatchCommand(args, cmd_cntx, facade::AsyncPreference::ONLY_SYNC, nullptr);
+  if (!apply_observer_)
+    return service_->DispatchCommand(args, cmd_cntx, facade::AsyncPreference::ONLY_SYNC, nullptr);
+  auto now = [] {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  const auto start = now();
+  auto result =
+      service_->DispatchCommand(args, cmd_cntx, facade::AsyncPreference::ONLY_SYNC, nullptr);
+  apply_observer_(start, now());
+  return result;
 }
 
 bool JournalExecutor::SelectDb(DbIndex dbid) {

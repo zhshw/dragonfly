@@ -164,13 +164,17 @@ func (c langfuseClient) observed(ctx context.Context, traceID string, begin, end
 }
 
 func (c langfuseClient) send(ctx context.Context, batch []otlpSpan) error {
+	return c.sendTrace(ctx, batch, "dragonfly-replication-profile", "dragonfly.raft.observe", "1")
+}
+
+func (c langfuseClient) sendTrace(ctx context.Context, batch []otlpSpan, serviceName, scopeName, version string) error {
 	var result struct {
 		Partial struct {
 			Rejected json.RawMessage `json:"rejectedSpans"`
 		} `json:"partialSuccess"`
 	}
-	service := map[string]any{"attributes": attributes(map[string]any{"service.name": "dragonfly-replication-profile"})}
-	scope := map[string]any{"name": "dragonfly.raft.observe", "version": "1"}
+	service := map[string]any{"attributes": attributes(map[string]any{"service.name": serviceName})}
+	scope := map[string]any{"name": scopeName, "version": version}
 	group := map[string]any{"scope": scope, "spans": batch}
 	resource := map[string]any{"resource": service, "scopeSpans": []any{group}}
 	payload := map[string]any{"resourceSpans": []any{resource}}

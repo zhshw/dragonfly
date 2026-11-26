@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -83,6 +84,7 @@ func (r *Runner) observe(rec *Record, variant string) ([]string, error) {
 		}
 	}
 	var env []string
+	var capture otel.NativeCapture
 	if variant != "cluster" {
 		auth, err := otel.TraceEnvironment(traceConfig(r.Config))
 		if err != nil {
@@ -96,8 +98,9 @@ func (r *Runner) observe(rec *Record, variant string) ([]string, error) {
 		if _, err := rand.Read(nonce[:]); err != nil {
 			return nil, err
 		}
-		capture := otel.NativeCapture{
+		capture = otel.NativeCapture{
 			ID: fmt.Sprintf("%s-%x", filepath.Base(run), nonce), Experiment: experiment, Release: sha, BinarySHA: sha, Workload: nativeWorkload,
+			Client: true,
 		}
 		if err := atomicJSON(filepath.Join(run, "capture.json"), capture); err != nil {
 			return nil, err
@@ -115,6 +118,19 @@ func (r *Runner) observe(rec *Record, variant string) ([]string, error) {
 	config.Profiler, config.TraceEnvironment = r.Config.Profiler, env
 	ctx, cancel := context.WithTimeout(r.Ctx, time.Duration(r.Config.Timeout)*time.Minute)
 	defer cancel()
+	if capture.Client {
+		process := fmt.Sprintf("client:%d:%d", os.Getpid(), time.Now().UnixNano())
+		config.Observe = func(events []benchmark.ClientEvent, wallOffset int64) error {
+			recorded := make([]otel.RecordedEvent, 0, len(events))
+			for _, event := range events {
+				recorded = append(recorded, otel.RecordedEvent{Name: event.Name, Start: event.Start, End: event.End,
+					Fields: map[string]string{"client_id": strconv.Itoa(event.Client), "writes": strconv.Itoa(event.Writes), "payload_bytes": strconv.Itoa(event.Bytes)}})
+			}
+			return otel.ExportNativeStream(ctx, traceConfig(r.Config), otel.NativeStream{Capture: capture,
+				Node: "client", Role: "Client", Group: "client", Process: process, WallOffset: wallOffset,
+				ExpectedNodes: []string{"11", "12", "client"}}, recorded)
+		}
+	}
 	row, err := benchmark.Run(ctx, config)
 	err = errors.Join(err, file.Close())
 	if err != nil {
@@ -150,12 +166,15 @@ func verifyNative(ctx context.Context, config otel.LangfuseConfig, want otel.Nat
 				for _, n := range report.Nodes {
 					nodes = append(nodes, n.ID)
 				}
-				if !reflect.DeepEqual(nodes, []string{"11", "12"}) || report.Total == 0 {
-					return CaptureReceipt{}, errors.New("native capture needs events from nodes 11 and 12")
+				if !reflect.DeepEqual(nodes, captureNodes(want)) || got.Client != want.Client || report.Total == 0 {
+					err = fmt.Errorf("native capture needs events from %v", captureNodes(want))
+					break
 				}
 				return CaptureReceipt{NativeCapture: got, Complete: true, Events: report.Total, Nodes: nodes}, nil
 			}
-			err = errors.New("capture manifest not yet visible")
+			if err == nil {
+				err = errors.New("capture manifest not yet visible")
+			}
 		} else if err == nil {
 			err = fmt.Errorf("incomplete native capture: %s", strings.Join(report.Issues, "; "))
 		}
@@ -168,6 +187,14 @@ func verifyNative(ctx context.Context, config otel.LangfuseConfig, want otel.Nat
 		case <-timer.C:
 		}
 	}
+}
+
+func captureNodes(c otel.NativeCapture) []string {
+	nodes := []string{"11", "12"}
+	if c.Client {
+		nodes = append(nodes, "client")
+	}
+	return nodes
 }
 
 func nativeReport(ctx context.Context, c Config, run, out string, log io.Writer) error {
@@ -248,7 +275,7 @@ func readNativeDiagnostic(dir string, report NativeDiagnostic, build BuildInfo, 
 		c := report.Capture
 		if build.Ack != "memory" || m.Mode != "raft.memory" || c == nil || !c.Complete || c.Events < 1 || c.Streams < 2 ||
 			c.ID == "" || c.Experiment == "" || c.BinarySHA != build.SHA || c.Release != build.SHA ||
-			c.Workload != nativeWorkload || !reflect.DeepEqual(c.Nodes, []string{"11", "12"}) {
+			c.Workload != nativeWorkload || !reflect.DeepEqual(c.Nodes, captureNodes(c.NativeCapture)) {
 			return d, row, errors.New("missing or incompatible native capture receipt")
 		}
 		d.CaptureID, d.SpanCount = c.ID, c.Events

@@ -95,20 +95,30 @@ class FollyIo::Impl {
     }
   }
 
-  void Submit(int fd, int64_t offset, std::string_view bytes, std::function<bool(int)> done) {
+  void Submit(int fd, int64_t offset, std::string_view bytes, std::function<bool(int)> done,
+              QueueObserver queued) {
+    auto now = [] {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+    };
+    const auto submitted = queued ? now() : 0;
     auto* event_base = thread_.getEventBase();
-    event_base->runInEventBaseThread(
-        [event_base, fd, offset, bytes, done = std::move(done)]() mutable {
-          auto* backend = static_cast<folly::IoUringBackend*>(event_base->getBackend());
-          auto completion = [event_base, done = std::move(done)](int result) mutable {
-            if (!done(result))
-              new CompletionRetry(event_base, result, std::move(done));
-          };
-          if (offset < 0)
-            backend->queueFsync(fd, std::move(completion));
-          else
-            backend->queueWrite(fd, bytes.data(), bytes.size(), offset, std::move(completion));
-        });
+    event_base->runInEventBaseThread([event_base, fd, offset, bytes, now, submitted,
+                                      queued = std::move(queued),
+                                      done = std::move(done)]() mutable {
+      if (queued)
+        queued(submitted, now());
+      auto* backend = static_cast<folly::IoUringBackend*>(event_base->getBackend());
+      auto completion = [event_base, done = std::move(done)](int result) mutable {
+        if (!done(result))
+          new CompletionRetry(event_base, result, std::move(done));
+      };
+      if (offset < 0)
+        backend->queueFsync(fd, std::move(completion));
+      else
+        backend->queueWrite(fd, bytes.data(), bytes.size(), offset, std::move(completion));
+    });
   }
 
  private:
@@ -122,9 +132,9 @@ FollyIo::FollyIo() : impl_(std::make_unique<Impl>()) {
 
 FollyIo::~FollyIo() = default;
 
-void FollyIo::Submit(int fd, int64_t offset, std::string_view bytes,
-                     std::function<bool(int)> done) {
-  impl_->Submit(fd, offset, bytes, std::move(done));
+void FollyIo::Submit(int fd, int64_t offset, std::string_view bytes, std::function<bool(int)> done,
+                     QueueObserver queued) {
+  impl_->Submit(fd, offset, bytes, std::move(done), std::move(queued));
 }
 
 void FollyIo::Run(std::function<void()> task) {

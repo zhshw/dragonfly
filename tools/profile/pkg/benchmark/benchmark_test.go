@@ -67,12 +67,20 @@ func TestPipelineAndWaitShareSocket(t *testing.T) {
 		done <- e
 	}()
 	data := []record{{[]byte("key0"), []byte{0, 1, 255}}, {[]byte("key1"), []byte("value")}}
-	samples, e := writeBatch([]*connection{c}, data, 2)
+	samples, e := writeBatch([]*connection{c}, data, 2, true)
 	if e != nil {
 		t.Fatal(e)
 	}
 	if len(samples) != 1 || len(samples[0].latencies) != 1 {
 		t.Fatalf("wrong batch count: %+v", samples)
+	}
+	if len(samples[0].events) != 1 {
+		t.Fatalf("pipeline event missing: %+v", samples)
+	}
+	event := samples[0].events[0]
+	if event.Name != "client.pipeline" || event.Start < samples[0].start || event.End != samples[0].end ||
+		float64(event.End-event.Start)/1e6 != samples[0].latencies[0] || event.Writes != 2 || event.Bytes != 8 {
+		t.Fatalf("pipeline trace differs from measured batch: %+v", event)
 	}
 	if e = confirm([]*connection{c}, 1, 5000); e != nil {
 		t.Fatal(e)

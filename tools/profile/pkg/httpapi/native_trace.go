@@ -4,6 +4,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -35,6 +36,50 @@ func nativeTraceRoutes(api *http.ServeMux, store models.Repository, config otel.
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"captures": captures})
+	})
+	api.HandleFunc("GET /api/v1/experiments/{id}/event-summary", func(w http.ResponseWriter, r *http.Request) {
+		if !ready(w, r) {
+			return
+		}
+		capture := r.URL.Query().Get("capture")
+		if capture == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "capture is required"})
+			return
+		}
+		var window otel.Window
+		scope := r.URL.Query().Get("scope")
+		if scope != "" && scope != "measurement" && scope != "capture" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid scope"})
+			return
+		}
+		if scope != "capture" {
+			record, err := store.Get(r.PathValue("id"))
+			if err != nil {
+				respondError(w, err)
+				return
+			}
+			for variant, diagnostic := range record.Summary.Diagnostics {
+				if diagnostic.CaptureID != capture {
+					continue
+				}
+				data, err := store.Measurement(r.PathValue("id"), "diagnostic-"+variant)
+				if err != nil || json.Unmarshal(data, &window) != nil || window.Start <= 0 || window.End <= window.Start {
+					writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Capture has no valid measurement window"})
+					return
+				}
+				break
+			}
+			if window.Start == 0 {
+				writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "Capture is not linked to a diagnostic measurement; use scope=capture for the full capture"})
+				return
+			}
+		}
+		report, err := reader.SummaryWindow(r.Context(), r.PathValue("id"), capture, window)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, report)
 	})
 	query := func(w http.ResponseWriter, r *http.Request) {
 		if !ready(w, r) {

@@ -90,11 +90,31 @@ Event Capture::MakeEvent(string_view name, Time start, Time end, uint64_t reques
   Event event;
   event.id = NextId();
   event.request = request;
-  event.name = name;
+  event.name = EventName(name);
   event.start = start;
   event.end = end;
   event.attributes = Labels();
+  if (!node_role_.empty()) {
+    event.attributes["node_role"] = node_role_;
+    event.attributes["epoch"] = epoch_;
+  }
   return event;
+}
+
+void Capture::SetNodeRole(string_view role, int32_t epoch) {
+  node_role_ = role;
+  epoch_ = to_string(epoch);
+}
+
+void Capture::SetEventPrefix(string_view prefix) {
+  assert(events_.empty() && requests_.empty() && io_.empty());
+  event_prefix_ = prefix;
+}
+
+string Capture::EventName(string_view name) const {
+  if (name.starts_with("raft."))
+    return event_prefix_ + string(name.substr(5));
+  return string(name);
 }
 
 map<string, string> Capture::Labels() const {
@@ -129,6 +149,45 @@ bool Capture::Register(FetchTrace* request) {
   }
   requests_.push_back(request);
   return true;
+}
+
+Batch::Batch(Capture& capture, map<string, string> labels)
+    : capture_(capture), labels_(std::move(labels)) {
+  if (!capture.node_role_.empty()) {
+    labels_.try_emplace("node_role", capture.node_role_);
+    labels_.try_emplace("epoch", capture.epoch_);
+  }
+}
+
+Time Batch::Now() const {
+  return capture_.Now();
+}
+
+void Batch::Record(string_view name, Time start, Time end, map<string, string> labels) {
+  if (events_.size() >= 8192) {
+    ++dropped_;
+    return;
+  }
+  Event event;
+  event.name = name;
+  event.start = start;
+  event.end = end;
+  event.attributes = std::move(labels);
+  events_.push_back(std::move(event));
+}
+
+void Batch::Publish() {
+  for (auto& pending : events_) {
+    auto event = capture_.MakeEvent(pending.name, pending.start, pending.end);
+    for (const auto& [key, value] : labels_)
+      event.attributes.insert_or_assign(key, value);
+    for (auto& [key, value] : pending.attributes)
+      event.attributes.insert_or_assign(key, std::move(value));
+    capture_.Emit(std::move(event));
+  }
+  capture_.dropped_ += dropped_;
+  events_.clear();
+  dropped_ = 0;
 }
 
 void Capture::Unregister(FetchTrace* request) {
@@ -177,6 +236,7 @@ FetchTrace::FetchTrace(Capture& capture, int32_t peer, int32_t epoch, uint64_t s
     : capture_(capture), record_(capture.MakePoint("raft.fetch")) {
   record_.request = record_.id;
   record_.attributes["peer_id"] = to_string(peer);
+  record_.attributes["node_role"] = "Follower";
   record_.attributes["epoch"] = to_string(epoch);
   record_.attributes["sequence"] = to_string(sequence);
   record_.attributes["requested_offset"] = to_string(offset);
@@ -189,8 +249,15 @@ FetchTrace::~FetchTrace() {
     Finish("Unfinished");
 }
 
-void FetchTrace::EmitEvent(string_view name, Time start, Time end, string_view outcome) {
+Event FetchTrace::MakeEvent(string_view name, Time start, Time end) {
   auto event = capture_.MakeEvent(name, start, end, id());
+  event.attributes["node_role"] = record_.attributes.at("node_role");
+  event.attributes["epoch"] = record_.attributes.at("epoch");
+  return event;
+}
+
+void FetchTrace::EmitEvent(string_view name, Time start, Time end, string_view outcome) {
+  auto event = MakeEvent(name, start, end);
   event.outcome = outcome;
   capture_.Emit(std::move(event));
 }
@@ -198,7 +265,7 @@ void FetchTrace::EmitEvent(string_view name, Time start, Time end, string_view o
 void FetchTrace::RpcStarted(Time now) {
   rpc_start_ = now;
   record_.start = now;
-  auto report = capture_.MakeEvent("raft.fetch.report", now, now, id());
+  auto report = MakeEvent("raft.fetch.report", now, now);
   report.attributes["reported_offset"] = record_.attributes["requested_offset"];
   capture_.Emit(std::move(report));
 }
@@ -217,8 +284,6 @@ void FetchTrace::RpcReturned(Time now, size_t payload, bool success) {
     Finish("Error");
     return;
   }
-  EmitEvent("raft.fetch.response", now, now);
-
   // Transport completion crosses owners. Replay only the explicitly observed group I/O edges
   // between that original timestamp and delivery of this message, then accumulate on transitions.
   vector<pair<Time, Time>> intervals;
@@ -233,7 +298,7 @@ void FetchTrace::RpcReturned(Time now, size_t payload, bool success) {
   };
   const auto& history = capture_.events();
   for (size_t i = history_start_; i < history.size(); ++i) {
-    if (history[i].name == "raft.folly.fsync")
+    if (history[i].name == capture_.EventName("raft.folly.fsync"))
       intersect(history[i], history[i].end);
   }
   for (const auto& [io, event] : capture_.active_io()) {
@@ -270,8 +335,9 @@ void FetchTrace::LinkIo(uint64_t io, uint64_t flush, bool dependency) {
   if (!rpc_end_ || receiving_ || finished_)
     return;
   dependency = dependency || (gate_start_ && awaited_flush_ == flush);
+  const auto now = capture_.Now();
   auto event =
-      capture_.MakePoint(dependency ? "raft.fetch.io_dependency" : "raft.fetch.io_overlap", id());
+      MakeEvent(dependency ? "raft.fetch.io_dependency" : "raft.fetch.io_overlap", now, now);
   event.attributes["io_id"] = to_string(io);
   event.attributes["flush_id"] = to_string(flush);
   capture_.Emit(std::move(event));
@@ -279,9 +345,11 @@ void FetchTrace::LinkIo(uint64_t io, uint64_t flush, bool dependency) {
 
 void FetchTrace::CheckGate(Gate gate, uint64_t flush) {
   const auto now = capture_.Now();
-  auto event = capture_.MakeEvent(
+  if (gate == Gate::kAllowed && !gate_start_)
+    return;
+  auto event = MakeEvent(
       gate == Gate::kAllowed ? "raft.fetch.flush_gate.ready" : "raft.fetch.flush_gate.blocked", now,
-      now, id());
+      now);
   event.attributes["reason"] = GateName(gate);
   event.attributes["flush_id"] = to_string(flush);
   event.outcome = gate == Gate::kAllowed ? "Accepted" : "Rejected";
@@ -327,7 +395,7 @@ void FetchTrace::ReceiveStarted() {
 
 void FetchTrace::Appended(Time start, size_t bytes, int64_t first, int64_t end, bool success) {
   const auto now = capture_.Now();
-  auto event = capture_.MakeEvent("raft.log.append", start, now, id());
+  auto event = MakeEvent("raft.log.append", start, now);
   event.outcome = success ? "Success" : "Error";
   if (success) {
     append_seen_ = true;
@@ -336,7 +404,6 @@ void FetchTrace::Appended(Time start, size_t bytes, int64_t first, int64_t end, 
     record_.values.push_back({Attribute::kAppendedBytes, int64_t(bytes)});
     record_.values.push_back({Attribute::kAppendedRecords, end - first});
     record_.values.push_back({Attribute::kPartial, bytes < payload_});
-    EmitEvent("raft.fetch.appended", now, now);
   }
   capture_.Emit(std::move(event));
 }

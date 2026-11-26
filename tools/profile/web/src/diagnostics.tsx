@@ -2,16 +2,16 @@ import { Fragment, useEffect, useState } from 'react';
 import { ArrowDownToLine, ArrowUpRight, Flame, Search, Workflow } from 'lucide-react';
 import { api, artifactURL, endpoint, number, targetTitle } from './model';
 import type { DiagnosticCapture, DiagnosticComparison, DiagnosticSummary, ReferenceDiagnostics, Role, Stage } from './model';
-import { NativeTraceView } from './native-trace';
 import type { TimelinePhase } from './timeline';
 
 type Panel = { key: 'current' | 'previous' | 'reference'; title: string; id?: string; capture?: DiagnosticCapture; raft?: boolean };
+type EventSummary = { capture_id: string; complete: boolean; issues: string[]; total: number; event_names: string[]; stages: Stage[]; scope: 'measurement' | 'capture' };
 
 export function DiagnosticsView({ id, view, referenceID }: { id: string; view: 'flamegraphs' | 'trace'; referenceID?: string }) {
   const [comparison, setComparison] = useState<DiagnosticComparison>();
   const [reference, setReference] = useState<ReferenceDiagnostics>();
   const [role, setRole] = useState<Role>('leader');
-  const [traceMode, setTraceMode] = useState<'native' | 'overview'>('native');
+  const [compareWith, setCompareWith] = useState<'previous' | 'reference'>('previous');
   const [request, setRequest] = useState(0);
   const [error, setError] = useState('');
   useEffect(() => {
@@ -31,28 +31,33 @@ export function DiagnosticsView({ id, view, referenceID }: { id: string; view: '
   }, [id, referenceID, request]);
 
   const isCPU = view === 'flamegraphs';
+  const showReference = !!reference && (compareWith === 'reference' || !comparison?.previous_id);
   const panels: Panel[] = [
     { key: 'current', title: '本轮', id, capture: comparison?.current },
-    reference ? {
+    showReference && reference ? {
       key: 'reference', title: reference.target.mode === 'yes' ? '原 Cluster' : '对比参照',
-      id: reference.target.experiment_id, capture: reference.capture, raft: reference.target.mode === 'raft',
+      id: reference.target.id, capture: reference.capture, raft: reference.target.mode === 'raft',
     } : { key: 'previous', title: '上一轮', id: comparison?.previous_id, capture: comparison?.previous },
   ];
 
   return <div className={isCPU ? 'view-content' : 'view-content trace-view'}>
     <div className="section-toolbar">
-      <div><h2>{isCPU ? 'CPU 火焰图' : 'Trace'}</h2><p>{isCPU ? '按节点角色查看。火焰图支持点击缩放和搜索。' : 'Native OTEL traces from Langfuse.'}</p></div>
-      {isCPU ? <NodeRolePicker role={role} setRole={setRole} /> : <div className="segments" role="group" aria-label="Trace 模式">
-        <button aria-pressed={traceMode === 'native'} onClick={() => setTraceMode('native')}>Analysis</button>
-        <button aria-pressed={traceMode === 'overview'} onClick={() => setTraceMode('overview')}>Legacy overview</button>
-      </div>}
+      <div><h2>{isCPU ? 'CPU 火焰图' : 'Trace'}</h2><p>{isCPU ? '按节点角色查看。火焰图支持点击缩放和搜索。' : 'Trace captures and aggregate event durations.'}</p></div>
+      {isCPU && <NodeRolePicker role={role} setRole={setRole} />}
     </div>
-    {!isCPU && traceMode === 'native' ? <NativeTraceView id={id} /> : error ? <div role="alert" className="notice">{error} <button className="text-link" onClick={() => { setError(''); setRequest((n) => n + 1); }}>重试</button></div> :
-      !comparison ? <div className="panel inline-empty" role="status">正在读取诊断记录…</div> : <>
-        <div className="diagnostic-columns">
-          {panels.map((panel) => isCPU ? <FlamegraphPanel key={panel.key} panel={panel} role={role} /> : <TracePanel key={panel.key} panel={panel} />)}
+    {comparison?.previous_id && reference &&
+      <div className="section-toolbar">
+        <h3>对照</h3>
+        <div className="segments" role="group" aria-label="诊断对照">
+          <button aria-pressed={!showReference} onClick={() => setCompareWith('previous')}>上一轮 · {comparison.previous_id}</button>
+          <button aria-pressed={showReference} onClick={() => setCompareWith('reference')}>对比参照 · {reference.target.id}</button>
         </div>
-        {!isCPU && panels.some(({ capture }) => capture) && <TraceComparison panels={panels} />}
+      </div>}
+    {error ? <div role="alert" className="notice">{error} <button className="text-link" onClick={() => { setError(''); setRequest((n) => n + 1); }}>重试</button></div> :
+      !comparison ? <div className="panel inline-empty" role="status">正在读取诊断记录…</div> : <>
+        {isCPU ? <div className="diagnostic-columns">
+          {panels.map((panel) => <FlamegraphPanel key={panel.key} panel={panel} role={role} />)}
+        </div> : <TraceOverview panels={panels} />}
       </>}
   </div>;
 }
@@ -78,7 +83,7 @@ export function ReferenceView({ id }: { id: string }) {
   if (!reference) return <div className="panel inline-empty" role="status">正在读取基准诊断…</div>;
   const { target, capture } = reference;
   const isCluster = target.mode === 'yes';
-  const panel: Panel = { key: 'current', title: 'CPU 火焰图', capture };
+  const panel: Panel = { key: 'current', title: 'CPU 火焰图', id: target.id, capture };
   const tracePanel = { ...panel, title: 'Trace', raft: !isCluster };
   return <>
     <div className="hero">
@@ -90,14 +95,13 @@ export function ReferenceView({ id }: { id: string }) {
     {capture ? <div className="view-content">
       <div className="section-toolbar"><h2>诊断采集</h2><NodeRolePicker role={role} setRole={setRole} /></div>
       <FlamegraphPanel panel={panel} role={role} />
-      <TracePanel panel={tracePanel} />
-      <TraceComparison panels={[tracePanel]} />
+      <TraceOverview panels={[tracePanel]} />
     </div> : <div className="panel inline-empty">这条基准暂无诊断记录</div>}
   </>;
 }
 
 function panelTitle(panel: Panel) {
-  const id = panel.capture?.experiment_id ?? panel.id;
+  const id = panel.id ?? panel.capture?.experiment_id;
   return id ? `${panel.title} · ${id}` : panel.title;
 }
 
@@ -127,15 +131,53 @@ function FlamegraphPanel({ panel, role }: { panel: Panel; role: Role }) {
   </div>;
 }
 
-function TracePanel({ panel }: { panel: Panel }) {
+function TraceOverview({ panels }: { panels: Panel[] }) {
+  const [summaries, setSummaries] = useState<Record<string, EventSummary>>({});
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const sources = JSON.stringify(panels.flatMap(({ key, capture }) => capture?.profile.native
+    ? [{ key, id: capture.experiment_id, capture: capture.profile.capture_id }] : []));
+  useEffect(() => {
+    const abort = new AbortController();
+    const captures: { key: string; id: string; capture?: string }[] = JSON.parse(sources);
+    setSummaries({}); setError(''); setLoading(captures.length > 0);
+    Promise.all(captures.map(async (source) => {
+      if (!source.capture) throw new Error(`${source.id}: missing capture ID`);
+      const summary = await api<EventSummary>(`${endpoint(source.id)}/event-summary?${new URLSearchParams({ capture: source.capture })}`, { signal: abort.signal });
+      return [source.key, summary] as const;
+    })).then((entries) => {
+      if (!abort.signal.aborted) setSummaries(Object.fromEntries(entries));
+    }).catch((e) => { if (!abort.signal.aborted) setError(e.message); })
+      .finally(() => { if (!abort.signal.aborted) setLoading(false); });
+    return () => abort.abort();
+  }, [sources]);
+  const resolved = panels.map((panel) => {
+    const summary = summaries[panel.key];
+    if (!panel.capture || !summary || summary.capture_id !== panel.capture.profile.capture_id) return panel;
+    return { ...panel, capture: { ...panel.capture, observation: { ...panel.capture.observation, stages: summary.stages } } };
+  });
+  return <>
+    <div className="diagnostic-columns">
+      {resolved.map((panel) => <TracePanel key={panel.key} panel={panel}
+        summary={summaries[panel.key]?.capture_id === panel.capture?.profile.capture_id ? summaries[panel.key] : undefined} />)}
+    </div>
+    {loading && <div role="status" className="notice">Loading event statistics…</div>}
+    {error && <div role="alert" className="notice">Event statistics: {error}</div>}
+    {resolved.some(({ capture }) => capture) && <TraceComparison panels={resolved} />}
+  </>;
+}
+
+function TracePanel({ panel, summary }: { panel: Panel; summary?: EventSummary }) {
   const capture = panel.capture;
   return <section className="panel capture-trace">
     <div className="panel-heading"><SourceHeading panel={panel} /><span className="evidence-icon trace"><Workflow size={17} /></span></div>
     {capture ? <div className="capture-trace-body">
-      <div><strong>{number(capture.profile.span_count, 0)}</strong> 条完整事件</div>
+      <div><strong>{capture.profile.native && !summary ? '—' : number(summary?.total ?? capture.profile.span_count, 0)}</strong> events{summary && ` · ${summary.event_names.length} event names`}</div>
+      <p>{capture.profile.native ? `${summary?.scope === 'capture' ? 'Full capture' : 'Measurement window'} · OTEL` : 'Measurement window · archived trace'}</p>
+      {summary && !summary.complete && <p role="alert">Incomplete capture: {summary.issues.join('; ')}</p>}
       {capture.profile.trace_url && <p>Langfuse 已核验 {number(capture.profile.verified_observations ?? 0, 0)} 条展示样本</p>}
       <div className="trace-actions">
-        {capture.profile.capture_id && <a className="button primary" href={`#/${capture.experiment_id}/stages`}>Open event analysis <ArrowUpRight size={15} /></a>}
+        {capture.profile.capture_id && <a className="button primary" href={`#/${capture.experiment_id}/slow`}>Open slow analysis <ArrowUpRight size={15} /></a>}
         {capture.observation.timeline && <a className="button" href={artifactURL(capture.experiment_id, capture.observation.timeline)} download={`${capture.experiment_id}-${capture.observation.variant}-timeline.json`}><ArrowDownToLine size={15} />时间线 JSON</a>}
         {capture.profile.trace_url && <a className="button primary" href={capture.profile.trace_url} target="_blank" rel="noreferrer">打开 Langfuse <ArrowUpRight size={15} /></a>}
       </div>
@@ -150,7 +192,7 @@ const waitMetrics: { label: string; value: (diagnostic: DiagnosticSummary) => st
   { label: 'fsync 中启动编码 / 追加 (次)', value: (trace) => `${trace.nodes.leader.starts_during_fsync} / ${trace.nodes.follower.starts_during_fsync}` },
 ];
 
-type PhaseRow = TimelinePhase & { values: (Stage | undefined)[] };
+type PhaseRow = TimelinePhase & { node: string; groupRole?: string; values: (Stage | undefined)[] };
 
 function TraceComparison({ panels }: { panels: Panel[] }) {
   const [query, setQuery] = useState('');
@@ -159,18 +201,30 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
   const raftPanels = panels.filter((panel) => panel.raft !== false && !panel.capture?.profile.native);
   const grouped = new Map<string, PhaseRow>();
   const search = query.trim().toLowerCase();
+  const splitRoles = new Set<string>();
+  for (const { capture } of panels) {
+    const seen = new Set<string>();
+    for (const stage of capture?.observation.stages ?? []) {
+      const key = `${stage.node}:${stage.stage}`;
+      if (seen.has(key)) splitRoles.add(key);
+      seen.add(key);
+    }
+  }
   panels.forEach(({ capture }, index) => {
     for (const stage of capture?.observation.stages ?? []) {
-      const key = `${stage.role}:${stage.stage}`;
-      const row = grouped.get(key) ?? { key, stage: stage.stage, role: stage.role, values: Array<Stage | undefined>(panels.length).fill(undefined) };
+      const nodeRole = Object.entries(capture?.profile.nodes ?? {}).find(([, info]) => info.node === stage.node)?.[0] ?? stage.role;
+      const groupRole = splitRoles.has(`${stage.node}:${stage.stage}`) ? stage.role : undefined;
+      const key = `${nodeRole}:${stage.node}:${stage.stage}:${groupRole ?? ''}`;
+      const row = grouped.get(key) ?? { key, stage: stage.stage, role: nodeRole, node: stage.node, groupRole, values: Array<Stage | undefined>(panels.length).fill(undefined) };
       row.values[index] = stage;
       grouped.set(key, row);
     }
   });
   const allPhases = [...grouped.values()];
+  const roles = [...new Set(allPhases.map((phase) => phase.role))].sort();
   const longest = (row: PhaseRow) => Math.max(...row.values.map((phase) => phase?.union_ms ?? 0));
   const canCompare = panels.length === 2 && panels.every(({ capture }) => capture);
-  const phases = allPhases.filter((phase) => (role === 'all' || phase.role === role) && phase.stage.toLowerCase().includes(search))
+  const phases = allPhases.filter((phase) => (role === 'all' || phase.role.split(' / ').includes(role) || phase.role === role) && phase.stage.toLowerCase().includes(search))
     .sort((a, b) => longest(b) - longest(a));
   return <>
     {raftPanels.length > 0 && <section className="panel data-panel">
@@ -182,29 +236,29 @@ function TraceComparison({ panels }: { panels: Panel[] }) {
     </section>}
     <section className="panel data-panel">
       <div className="panel-heading phase-heading">
-        <div><h2>阶段耗时</h2><p>{canCompare ? '按两次采集中较长的区间并集排序。' : '按区间并集排序。'}</p></div>
+        <div><h2>Event statistics</h2><p>{canCompare ? 'Sorted by the larger duration union. ' : 'Sorted by duration union. '}Each node is counted separately. Node roles follow the benchmark data group. —: not recorded in this capture.</p></div>
         <div className="phase-controls">
-          <select aria-label="按节点角色筛选" value={role} onChange={(event) => { setRole(event.target.value); setShowAll(false); }}>
-            <option value="all">全部节点</option><option value="leader">Leader</option><option value="follower">Follower</option><option value="client">客户端</option>
+          <select aria-label="Node role" value={role} onChange={(event) => { setRole(event.target.value); setShowAll(false); }}>
+            <option value="all">All roles</option>{roles.map((value) => <option key={value} value={value}>{value}</option>)}
           </select>
-          <label className="search"><Search size={15} /><input placeholder="筛选阶段" aria-label="筛选阶段" value={query} onChange={(event) => { setQuery(event.target.value); setShowAll(false); }} /></label>
+          <label className="search"><Search size={15} /><input placeholder="Filter events" aria-label="Filter events" value={query} onChange={(event) => { setQuery(event.target.value); setShowAll(false); }} /></label>
         </div>
       </div>
       <div className="table-scroll"><table className="data-table diagnostic-table">
         <thead>
-          <tr><th rowSpan={2}>阶段</th><th rowSpan={2}>节点</th>{panels.map((panel) => <th colSpan={3} scope="colgroup" className="phase-start" key={panel.key}>{panelTitle(panel)}</th>)}</tr>
-          <tr>{panels.map(({ key }) => <Fragment key={key}><th className="phase-start">事件数</th><th>并集 ms</th><th>P95 ms</th></Fragment>)}</tr>
+          <tr><th rowSpan={2}>Event</th><th rowSpan={2}>Node</th>{panels.map((panel) => <th colSpan={3} scope="colgroup" className="phase-start" key={panel.key}>{panelTitle(panel)}</th>)}</tr>
+          <tr>{panels.map(({ key }) => <Fragment key={key}><th className="phase-start">Events</th><th>Union ms</th><th>P95 ms</th></Fragment>)}</tr>
         </thead>
         <tbody>{(showAll ? phases : phases.slice(0, 12)).map((phase) => <tr key={phase.key}>
-          <td className="mono strong">{phase.stage}</td><td>{phase.role}</td>
+          <td className="mono strong">{phase.stage}</td><td>{phase.role}{phase.node !== 'client' && ` · ${phase.node}`}{phase.groupRole && <small>Group: {phase.groupRole}</small>}</td>
           {phase.values.map((value, i) => <Fragment key={panels[i].key}>
             <td className="mono phase-start">{value ? number(value.count, 0) : '—'}</td>
             <td className="mono">{value ? number(value.union_ms, 3) : '—'}</td><td className="mono">{value ? number(value.p95_ms, 3) : '—'}</td>
           </Fragment>)}
         </tr>)}</tbody>
       </table></div>
-      {phases.length === 0 && <div className="inline-empty">没有匹配的阶段</div>}
-      {phases.length > 12 && <button className="show-more" onClick={() => setShowAll(!showAll)}>{showAll ? '收起' : `显示全部 ${phases.length} 个阶段`}</button>}
+      {phases.length === 0 && <div className="inline-empty">No matching events</div>}
+      {phases.length > 12 && <button className="show-more" onClick={() => setShowAll(!showAll)}>{showAll ? 'Show less' : `Show all ${phases.length} event groups`}</button>}
     </section>
   </>;
 }

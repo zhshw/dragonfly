@@ -55,7 +55,7 @@ func (c Comparisons) byRole() map[string]*TargetComparison {
 
 func (c Comparisons) allows(ids ChoiceIDs) bool {
 	matches := func(id string, choice *TargetComparison) bool {
-		return id == "" || (choice != nil && id == choice.Target.ID)
+		return id == "" || (choice != nil && canonicalTargetID(id) == canonicalTargetID(choice.Target.ID))
 	}
 	previous := matches(ids.Previous, c.Previous) || (c.Previous != nil && ids.Previous == c.Previous.Target.ExperimentID)
 	return matches(ids.Cumulative, c.Cumulative) && matches(ids.Reference, c.Reference) && previous
@@ -119,7 +119,7 @@ func (s Store) Targets() ([]Target, error) {
 		if err := decodeFile(filepath.Join(catalog, entry.Name()), &target); err != nil {
 			return nil, err
 		}
-		targets = append(targets, target)
+		targets = append(targets, canonicalTarget(target))
 	}
 	records, err := s.records()
 	if err != nil {
@@ -129,7 +129,7 @@ func (s Store) Targets() ([]Target, error) {
 		targets = append(targets, targetsFrom(record.Summary)...)
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].ID < targets[j].ID })
-	return targets, nil
+	return singleClusterReference(targets), nil
 }
 
 func targetsFrom(summary Summary) []Target {
@@ -138,14 +138,9 @@ func targetsFrom(summary Summary) []Target {
 	}
 	var targets []Target
 	for name, variant := range summary.Variants {
-		label, mode, ack := name, variant.Mode, variant.Ack
-		switch name {
-		case "baseline":
+		mode, ack := variant.Mode, variant.Ack
+		if name == "baseline" {
 			continue
-		case "candidate", "current":
-			label = "current"
-		case "cluster":
-			label = "原 Cluster"
 		}
 		if mode == "" {
 			mode, ack = "raft", summary.Workload.AckMode
@@ -156,7 +151,7 @@ func targetsFrom(summary Summary) []Target {
 		workload := summary.Workload
 		workload.AckMode = ack
 		target := Target{
-			ID: summary.Experiment.ID + ":" + name, Title: summary.Experiment.ID + " · " + label,
+			ID:           summary.Experiment.ID + ":" + name,
 			ExperimentID: summary.Experiment.ID, Variant: name, Mode: mode, Ack: ack,
 			SHA: variant.SHA, Harness: summary.Harness, Workload: workload, Metrics: variant.Metrics,
 		}
@@ -166,7 +161,7 @@ func targetsFrom(summary Summary) []Target {
 		if summary.Comparisons.Reference != nil {
 			target.ReferenceID = summary.Comparisons.Reference.Target.ID
 		}
-		targets = append(targets, target)
+		targets = append(targets, canonicalTarget(target))
 	}
 	return targets
 }
@@ -207,17 +202,19 @@ func (s Store) ImportTarget(id, title, archive, variant string) (Target, error) 
 }
 
 func findPreviousTarget(id string, targets []Target) (Target, bool) {
+	id = canonicalTargetID(id)
 	var candidate Target
 	for _, target := range targets {
-		if target.ID == id && target.ExperimentID != "" {
-			return target, true
-		}
-		if target.ExperimentID == id {
+		if target.ExperimentID != "" && (canonicalTargetID(target.ID) == id || target.ExperimentID == id) {
 			switch target.Variant {
 			case "current":
-				return target, true
+				return canonicalTarget(target), true
 			case "candidate":
-				candidate = target
+				candidate = canonicalTarget(target)
+			default:
+				if canonicalTargetID(target.ID) == id {
+					return canonicalTarget(target), true
+				}
 			}
 		}
 	}
@@ -230,6 +227,8 @@ func selectTargets(ids ChoiceIDs, list func() ([]Target, error)) (Comparisons, e
 	if err != nil {
 		return choices, err
 	}
+	ids.Cumulative = resolveTargetID(ids.Cumulative, targets)
+	ids.Reference = resolveTargetID(ids.Reference, targets)
 	if ids.Previous != "" {
 		target, ok := findPreviousTarget(ids.Previous, targets)
 		if !ok {
@@ -243,14 +242,14 @@ func selectTargets(ids ChoiceIDs, list func() ([]Target, error)) (Comparisons, e
 			ids.Cumulative = target.CumulativeID
 		}
 		if ids.Reference == "" {
-			ids.Reference = target.ReferenceID
+			ids.Reference = resolveTargetID(target.ReferenceID, targets)
 		}
 	}
 	for _, target := range targets {
-		if target.ID == ids.Cumulative {
+		if canonicalTargetID(target.ID) == canonicalTargetID(ids.Cumulative) {
 			choices.Cumulative = &TargetComparison{Target: target}
 		}
-		if target.ID == ids.Reference {
+		if canonicalTargetID(target.ID) == canonicalTargetID(ids.Reference) {
 			choices.Reference = &TargetComparison{Target: target}
 		}
 	}
@@ -267,6 +266,7 @@ func selectTargets(ids ChoiceIDs, list func() ([]Target, error)) (Comparisons, e
 	if prev := choices.Previous; prev != nil && !prev.Target.Workload.matches(base.Workload) {
 		return choices, fmt.Errorf("%w: 上一轮基线与基线的负载或测试口径不同", ErrInvalid)
 	}
+	choices.canonicalize()
 	return choices, nil
 }
 

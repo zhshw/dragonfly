@@ -15,8 +15,8 @@
 
 创建实验时选定上一轮，可沿用该实验的基线与对比参照。每项选择会保存测试口径、版本和指标快照。
 v10 的上一轮使用 v9 的历史数据。旧实验按原有版本关系关联上一轮归档。总览的耗时卡片突出批次 P95 较上一轮的变化百分比，下方显示两轮各自的 P95 三轮中位数。
-总览、运行记录、火焰图、阶段分析和 Trace 都使用选定版本的数据。首个版本没有上一轮时，火焰图和 Trace 展示本轮与所选对比参照。
-阶段分析使用 Event Slow Path 和 Fetch delay，先排序事件或请求，再展开关联时序。
+总览、运行记录、火焰图、Slow 分析和 Trace 都使用选定版本的数据。首个版本没有上一轮时，火焰图和 Trace 展示本轮与所选对比参照。
+Slow 分析默认打开 Slow path，可切换 Fetch delay；先排序事件或请求，再展开关联时序。Trace 页独立展示采集概览与事件统计，原生事件复用 OTEL 查询包，按节点、事件名和角色统计数量、耗时并集与 P95；比较表的 Node 使用压测 data group 的角色与编号。原生与历史统计均裁剪到各轮测量窗口，避免混入启动和恢复期间的空等待；并集在同一节点的各进程内合并后相加，零耗时事件也计数。
 运行记录的 Diff 表按指标展示 `baseline`、上一轮、本轮的三轮算术平均值，以及本轮与上一轮的均值差。表底每组有一个入口，可读取合并后的三轮原始日志。本轮的正确性验证和独立诊断放在同一张卡片。
 总览的「查看基准诊断」打开所选参照的独立页面，展示 CPU 火焰图、Trace 和阶段耗时。
 
@@ -104,7 +104,7 @@ profile slow-path -id v15 -limit 5
 
 默认最近一轮 capture、降序 Top 10。耗时属性与输出统一为 ms，沿用原 `raft.*` trace 名称。`slow-path -min-duration-ms 10` 筛选事件耗时；`fetch-delay -min-return-wait-ms 10` 筛选 RPC 返回后的等待。Fetch 的其他字段可用 `-min-rpc-ms`、`-min-io-wait-ms`、`-min-appended-bytes` 等参数，一次选择一个阈值并按该字段排序；无阈值时可用 `-attribute` 选择排序字段。`-capture` 固定轮次，`-selected TRACE_ID:SPAN_ID` 查看指定请求，`-start-ns/-end-ns` 用原始单调时钟筛选请求起点，`-json` 输出 Web 使用的同一 DTO。`complete=false` 表示记录缺失或未排空，不能当作完整排名。此处 JSON 是 HTTP 查询响应，不是导入文件。
 
-页面的 `Event Slow Path` 和 `Fetch delay` 使用相同轮次 tabs。前者默认对全部事件按 duration 排序，不需要选择 attribute；Node 和 Event name 使用整轮采样生成下拉选项，不受当前筛选或 Top 10 限制。列表标题为 `Slow path`，左侧为编号列，点击编号或事件名打开时序。节点显示角色和编号；同一轮换主时，下拉列出该节点出现过的角色。后者默认按 `raft.fetch.return_wait` 排序，页面初始条件为 ≥ 10 ms：RPC 已返回到 Follower 开始处理响应之间的延迟。可修改阈值或切换其他 Fetch 属性。两者先看 Top 10，再看关联时序；事件详情不按特定事件名定制。`Event order` 支持开始时间或耗时排序。`Legacy overview` 仅显示历史文件归档。
+`Slow 分析` 页的 `Slow path` 和 `Fetch delay` 使用相同轮次 tabs，默认打开 `Slow path`。前者默认对全部事件按 duration 排序，不需要选择 attribute；Node 和 Event name 使用整轮采样生成下拉选项，不受当前筛选或 Top 10 限制。列表标题为 `Slow path`，左侧为编号列，点击编号或事件名打开时序。节点显示角色和编号；同一轮换主时，下拉列出该节点出现过的角色。后者默认按 `raft.fetch.return_wait` 排序，页面初始条件为 ≥ 10 ms：RPC 已返回到 Follower 开始处理响应之间的延迟。可修改阈值或切换其他 Fetch 属性。两者先看 Top 10，再看关联时序；事件详情不按特定事件名定制。`Event order` 支持开始时间或耗时排序。`Trace` 页展示采集概览与阶段耗时，并提供到 Slow 分析的入口。
 
 ## CLI
 
@@ -114,13 +114,15 @@ CLI 和页面使用同一份实验记录。CLI 自动读取系统环境变量 `P
 profile create -id v11 -title '本轮优化' -previous v10
 profile run -id v11
 profile show -id v11
-profile comparisons -id v16 -baseline v3:current -previous v15 -reference v3:cluster
+profile comparisons -id v16 -baseline v3 -previous v15 -reference v0:cluster
 profile trace -id v11 -run diagnostic-current -role follower -stage raft. -sort p95 -limit 5
 profile flamegraph -id v11 -run diagnostic-current -role leader -view inclusive -limit 5
 profile delete -id v11
 ```
 
 已完成实验可在总览点击「配置对照」，或使用 `comparisons` 修改基准、上一轮和参照。CLI 未指定的字段保持原值，显式传空值可清除；不同压测版本仍展示历史数值和差值，并标明差异。配置仅更新对照关系，不重跑实验。
+
+Cluster 对照统一使用 `v0:cluster`；火焰图页可在上一轮和此参照之间切换。
 
 `run -id` 等到入库后退出，失败后再次运行可继续。`show` 输出三轮指标。页面和 CLI 都能删除 PostgreSQL 实验及其平台归档。正在运行或被其他实验用作对照时，删除请求返回具体原因。对外发布的诊断由各自服务管理。
 
@@ -171,6 +173,7 @@ profile summarize -compare "$compare_dir" \
 | POST | `/api/v1/experiments/{id}/execution` | 启动或继续执行，`{"restart":true}` 从头运行 |
 | GET | `/api/v1/experiments/{id}/execution/log` | 当前执行的进度日志 |
 | GET | `/api/v1/experiments/{id}/diagnostic-comparison` | 本轮与上一轮的阶段统计和产物 ID，每份诊断保留各自的实验 ID |
+| GET | `/api/v1/experiments/{id}/event-summary?capture=ID` | 测量窗口内的事件总数、事件名、完整性和分组耗时统计；`scope=capture` 查看完整采集 |
 | GET | `/api/v1/experiments/{id}/trace` | 指定诊断运行的阶段统计和分页，支持 `run`、`role`、`stage`、`sort`、`order`、`min_union_ms`、`limit`、`offset`。`analysis=apply-to-confirm` 增加逐 offset 的应用后确认分析 |
 | GET | `/api/v1/experiments/{id}/flamegraph` | 指定诊断运行的 CPU 热点和原图 ID，支持 `run`、`role`、`view`、`limit`。`symbol` 和可选的 `caller_depth` 按调用路径返回匹配样本 |
 | GET | `/api/v1/experiments/{id}/run-comparison` | baseline、上一轮与本轮的运行记录 |

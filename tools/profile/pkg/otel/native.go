@@ -45,6 +45,7 @@ type NativeCapture struct {
 	Workload   string `json:"workload"`
 	Started    string `json:"started"`
 	Streams    int    `json:"streams"`
+	Client     bool   `json:"client,omitempty"`
 }
 
 type NativeQuery struct {
@@ -182,6 +183,7 @@ func NativeCaptures(ctx context.Context, config LangfuseConfig, experiment strin
 			byID[id] = &NativeCapture{ID: id, Experiment: experiment, Release: e.Fields["release"], BinarySHA: e.Fields["binary_sha"], Workload: e.Fields["workload"], Started: row.Start}
 		}
 		byID[id].Streams++
+		byID[id].Client = byID[id].Client || e.Fields["node_id"] == "client"
 		if row.Start < byID[id].Started {
 			byID[id].Started = row.Start
 		}
@@ -428,13 +430,37 @@ func (data *nativeCaptureData) rank(q NativeQuery) (NativeReport, error) {
 func nativeOptions(events []NativeEvent) ([]NativeNode, []string) {
 	type nodeKey struct{ group, node string }
 	type epochKey struct{ group, node, epoch string }
+	type clockKey struct{ process, group, node string }
+	type roleKey struct{ epoch, role string }
+	type roleRange struct {
+		roleKey
+		Interval
+	}
 	roles := map[nodeKey]map[string]bool{}
 	epochRoles := map[epochKey]map[string]bool{}
+	ranges := map[clockKey][]roleRange{}
 	requests := map[string]NativeEvent{}
 	nodes := map[string]map[string]bool{}
 	names := map[string]bool{}
+	clock := func(e NativeEvent) clockKey {
+		process := e.Fields["process_instance"]
+		if process == "" {
+			process = e.TraceID
+		}
+		return clockKey{process, e.Fields["group_id"], e.Fields["node_id"]}
+	}
+	observe := func(e NativeEvent, role string) {
+		start, a := strconv.ParseInt(e.Start, 10, 64)
+		end, b := strconv.ParseInt(e.End, 10, 64)
+		if role == "" || a != nil || b != nil || end < start {
+			return
+		}
+		key := clock(e)
+		identity := roleKey{e.Fields["epoch"], role}
+		ranges[key] = append(ranges[key], roleRange{identity, Interval{start, end}})
+	}
 	add := func(group, node, epoch, role string) {
-		if group == "" || node == "" || role == "" {
+		if group == "" || node == "" || role == "" || role == "Unknown" {
 			return
 		}
 		key := nodeKey{group, node}
@@ -460,6 +486,7 @@ func nativeOptions(events []NativeEvent) ([]NativeNode, []string) {
 		}
 		names[e.Name] = true
 		add(f["group_id"], f["node_id"], f["epoch"], f["node_role"])
+		observe(e, f["node_role"])
 		requests[e.TraceID+":"+f["event_id"]] = e
 
 		// A successful Fetch identifies its follower and leader in this group/epoch.
@@ -467,7 +494,26 @@ func nativeOptions(events []NativeEvent) ([]NativeNode, []string) {
 		if e.Name == "raft.fetch" && (f["outcome"] == "Data" || f["outcome"] == "Empty") && f["epoch"] != "" && f["peer_id"] != "" && f["peer_id"] != f["node_id"] {
 			add(f["group_id"], f["node_id"], f["epoch"], "Follower")
 			add(f["group_id"], f["peer_id"], f["epoch"], "Leader")
+			observe(e, "Follower")
 		}
+	}
+	for key, observations := range ranges {
+		sort.SliceStable(observations, func(i, j int) bool {
+			if observations[i].Begin != observations[j].Begin {
+				return observations[i].Begin < observations[j].Begin
+			}
+			return observations[i].End < observations[j].End
+		})
+		merged := []roleRange{}
+		for _, next := range observations {
+			if len(merged) > 0 && merged[len(merged)-1].roleKey == next.roleKey {
+				last := &merged[len(merged)-1]
+				last.End = max(last.End, next.End)
+			} else {
+				merged = append(merged, next)
+			}
+		}
+		ranges[key] = merged
 	}
 	for i := range events {
 		e := &events[i]
@@ -478,12 +524,36 @@ func nativeOptions(events []NativeEvent) ([]NativeNode, []string) {
 		}
 		observed := epochRoles[epochKey{f["group_id"], f["node_id"], epoch}]
 		if epoch == "" {
-			observed = roles[nodeKey{f["group_id"], f["node_id"]}]
+			// Older events may lack a role/epoch. Require a containing role interval in this
+			// process, bracketed by recorded evidence, with no conflicting interval. Never
+			// label a single event with every role the node held during the whole capture.
+			observed = map[string]bool{}
+			start, a := strconv.ParseInt(e.Start, 10, 64)
+			end, b := strconv.ParseInt(e.End, 10, 64)
+			if a == nil && b == nil && end >= start {
+				for _, bounds := range ranges[clock(*e)] {
+					if bounds.role == "Unknown" || start < bounds.Begin || end > bounds.End {
+						continue
+					}
+					conflict := false
+					for _, interval := range ranges[clock(*e)] {
+						if interval.role != bounds.role && interval.Begin <= end && interval.End >= start {
+							conflict = true
+						}
+					}
+					if !conflict {
+						observed[bounds.role] = true
+					}
+				}
+			}
 		}
 		if role := f["node_role"]; role != "" {
 			observed = map[string]bool{role: true}
 		}
-		e.NodeRoles = sortedNativeRoles(observed)
+		e.NodeRoles = []string{}
+		if len(observed) == 1 {
+			e.NodeRoles = sortedNativeRoles(observed)
+		}
 	}
 	for key, observed := range roles {
 		if nodes[key.node] != nil {

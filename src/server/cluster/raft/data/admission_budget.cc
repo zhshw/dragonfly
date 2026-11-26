@@ -19,6 +19,13 @@ Admission::~Admission() {
   Refresh();
 }
 
+void Admission::SetEpoch(int32_t epoch) {
+  if (epoch_ != epoch)
+    Finish("Cancelled");
+  epoch_ = epoch;
+  capture_->SetNodeRole("Leader", epoch);
+}
+
 void Admission::Refresh() {
   erase_if(tickets_, [&](const auto& ticket) {
     auto retired = ticket->retired.load(memory_order_acquire);
@@ -28,6 +35,10 @@ void Admission::Refresh() {
     event.attributes["ticket_id"] = to_string(ticket->id);
     event.attributes["connection_id"] = to_string(connection_);
     event.attributes["released_bytes"] = to_string(ticket->bytes);
+    if (ticket->epoch >= 0) {
+      event.attributes["node_role"] = "Leader";
+      event.attributes["epoch"] = to_string(ticket->epoch);
+    }
     capture_->Emit(std::move(event));
     return true;
   });
@@ -73,6 +84,7 @@ void Admission::Admitted(const void* command, AdmissionBudget::Reservation* rese
   auto ticket = make_shared<AdmissionBudget::Ticket>();
   ticket->id = capture_->NextId();
   ticket->bytes = reservation->bytes();
+  ticket->epoch = epoch_;
 
   // The clock is immutable; calling it does not mutate the connection's capture on another owner.
   ticket->clock = capture_->clock();

@@ -78,7 +78,9 @@ func TestNativeNodeRolesRespectEpochAndExplicitRequestIdentity(t *testing.T) {
 	failed.Fields["epoch"], failed.Fields["peer_id"], failed.Fields["outcome"] = "9", "99", "Error"
 	explicit := nativeEvent("7", "custom.role", "0", 111)
 	explicit.Fields["node_role"] = "Leader"
-	rows := []NativeEvent{first, second, child, io, other, failed, explicit}
+	unknown := nativeEvent("8", "custom.role", "0", 90)
+	unknown.Fields["node_role"], unknown.Fields["epoch"] = "Unknown", "7"
+	rows := []NativeEvent{first, second, child, io, other, failed, explicit, unknown}
 	r, err := RankNative("capture", rows, NativeQuery{Name: "custom.child", Node: "11", Limit: 1, Selected: "stream:3"})
 	if err != nil {
 		t.Fatal(err)
@@ -95,10 +97,11 @@ func TestNativeNodeRolesRespectEpochAndExplicitRequestIdentity(t *testing.T) {
 	}{
 		{"stream:1", []string{"Follower"}},
 		{"stream:2", []string{"Follower"}},
-		{"stream:4", []string{"Follower", "Leader"}},
+		{"stream:4", []string{"Leader"}},
 		{"other:5", []string{}},
 		{"stream:6", []string{}},
 		{"stream:7", []string{"Leader"}},
+		{"stream:8", []string{"Unknown"}},
 	} {
 		r, err := RankNative("capture", rows, NativeQuery{Limit: 1, Selected: tc.selected})
 		if err != nil || !reflect.DeepEqual(r.Selected.NodeRoles, tc.roles) {
@@ -107,6 +110,41 @@ func TestNativeNodeRolesRespectEpochAndExplicitRequestIdentity(t *testing.T) {
 	}
 	if rows[0].NodeRoles != nil || rows[0].Fields["node_role"] != "" {
 		t.Fatal("query mutated original capture")
+	}
+}
+
+func TestLegacyEventRolesUseTheirOwnProcessAndTimeInterval(t *testing.T) {
+	span := func(id, role, epoch string, start, end int64) NativeEvent {
+		e := nativeEvent(id, "custom.event", "0", start)
+		e.End, e.Duration = strconv.FormatInt(end, 10), milliseconds(end-start)
+		e.Fields["node_role"], e.Fields["epoch"] = role, epoch
+		return e
+	}
+	rows := []NativeEvent{
+		span("unknown-before", "Unknown", "7", 0, 1),
+		span("leader-before", "Leader", "7", 10, 20),
+		span("leader-after", "Leader", "7", 80, 90),
+		span("unknown-after", "Unknown", "7", 95, 96),
+		span("follower", "Follower", "8", 100, 150),
+		span("during-leader", "", "", 40, 60),
+		span("during-follower", "", "", 120, 130),
+		span("cross-transition", "", "", 85, 110),
+		span("restarted", "", "", 40, 60),
+	}
+	rows[len(rows)-1].Fields["process_instance"] = "another-process"
+	for _, tc := range []struct {
+		id    string
+		roles []string
+	}{
+		{"during-leader", []string{"Leader"}},
+		{"during-follower", []string{"Follower"}},
+		{"cross-transition", []string{}},
+		{"restarted", []string{}},
+	} {
+		r, err := RankNative("capture", rows, NativeQuery{Limit: 1, Selected: "stream:" + tc.id})
+		if err != nil || !reflect.DeepEqual(r.Selected.NodeRoles, tc.roles) {
+			t.Fatalf("roles for %s: %+v %v", tc.id, r.Selected, err)
+		}
 	}
 }
 
@@ -251,6 +289,69 @@ func TestNativeReaderReusesCaptureWithFullMetadata(t *testing.T) {
 	r, err = reader.Query(context.Background(), "v15", "capture", NativeQuery{Limit: 10, Name: "raft.fetch", Selected: "stream:1"})
 	if err != nil || !r.Complete || r.Selected == nil || r.Selected.Fields["ticket_ids"] != tickets || calls.Load() != 3 {
 		t.Fatalf("second query did not reuse the complete capture: %+v %v (calls %d)", r, err, calls.Load())
+	}
+	summary, err := reader.Summary(context.Background(), "v15", "capture")
+	if err != nil || !summary.Complete || summary.Total != r.Total || len(summary.Stages) != 1 || calls.Load() != 3 {
+		t.Fatalf("summary did not reuse the ranked capture: %+v %v (calls %d)", summary, err, calls.Load())
+	}
+}
+
+func TestNativeSummaryCountsPointsAndSeparatesProcessClocks(t *testing.T) {
+	span := func(id, name, stream, process, role string, start, end int64) NativeEvent {
+		e := nativeEvent(id, name, "0", start)
+		e.End, e.Duration = strconv.FormatInt(end, 10), milliseconds(end-start)
+		e.TraceID, e.Fields["process_instance"], e.Fields["node_role"] = stream, process, role
+		return e
+	}
+
+	// Preserve integer timestamp precision; merge overlapping streams only within one process.
+	const origin int64 = 9007199254740993
+	rows := []NativeEvent{
+		span("1", "custom.operation", "stream", "process", "Follower", origin, origin+10_000_000),
+		span("2", "custom.operation", "other-stream", "process", "Follower", origin+5_000_000, origin+15_000_000),
+		span("3", "custom.operation", "restarted-stream", "restarted-process", "Follower", origin, origin+10_000_000),
+		span("4", "custom.operation", "stream", "process", "Leader", origin, origin+1_000_000),
+		span("5", "checkpoint", "stream", "process", "Leader", origin, origin),
+		nativeManifest(3),
+	}
+	otherNode := span("6", "custom.operation", "node-12-stream", "node-12-process", "Follower", origin+30_000_000, origin+32_000_000)
+	otherNode.Fields["node_id"] = "12"
+	rows = append(rows, otherNode)
+	data, err := prepareNativeCapture("capture", rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := data.eventSummary()
+	if err != nil || r.Total != 6 || r.Complete || len(r.Issues) == 0 || len(r.EventNames) != 2 || len(r.Stages) != 4 {
+		t.Fatalf("wrong counts or lost incomplete status: %+v %v", r, err)
+	}
+	for _, s := range r.Stages {
+		switch {
+		case s.Node == "12":
+			if s.Count != 1 || s.Union != 2 || s.P95 != 2 {
+				t.Fatalf("nodes sharing a role were combined: %+v", s)
+			}
+		case s.Role == "follower":
+			if s.Count != 3 || s.Sum != 30 || s.Union != 25 || s.P50 != 10 || s.P95 != 10 || s.Max != 10 {
+				t.Fatalf("incorrect overlapping stream statistics: %+v", s)
+			}
+		case s.Name == "checkpoint":
+			if s.Count != 1 || s.Union != 0 || s.P95 != 0 {
+				t.Fatalf("zero-duration event was lost: %+v", s)
+			}
+		case s.Role == "leader":
+			if s.Count != 1 || s.P95 != 1 {
+				t.Fatalf("roles were combined or duplicated: %+v", s)
+			}
+		}
+	}
+	windowed, err := data.eventSummary(Window{Start: origin + 9_000_000, End: origin + 11_000_000})
+	if err != nil || windowed.Scope != "measurement" || windowed.Total != 3 || len(windowed.Stages) != 1 {
+		t.Fatalf("incorrect window filtering: %+v %v", windowed, err)
+	}
+	s := windowed.Stages[0]
+	if s.Count != 3 || s.Union != 3 || s.Sum != 4 || s.P95 != 2 {
+		t.Fatalf("did not clip intervals at the measurement bounds: %+v", s)
 	}
 }
 

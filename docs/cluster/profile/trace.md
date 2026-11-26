@@ -22,14 +22,22 @@ Raft C++ → 有界内存缓冲与延后定稿 → OTEL trace exporter → Langf
 | 事件或属性 | 边界 / 含义 |
 | --- | --- |
 | `raft.set.admission.wait` | 首次额度拒绝到成功准入 |
+| `raft.set.input_lifetime` | AsyncPendingSet 接管输入前到 ReleaseInput 开始释放；保留 reserved_bytes、input_heap_bytes |
+| `client.pipeline` / `client.final_wait` | Go 压测中每批命令开始准备至全部回复 / 最后一批回复至 WAIT 1 完成；诊断轮直接记录并上报 OTEL |
 | `raft.set.admission.retired_tickets` / `full_wave_retired` | 等待期间实际退役的票据数 / 当时在途票据是否全部退役 |
 | `raft.set.admission.wal_idle` | max(0, wait.end − max(first_retirement, last_wal_completion))，限定本 connection/group |
 | `raft.fetch.rpc` | RPC 发出到返回 |
 | `raft.fetch.return_wait` | RPC 返回到进入响应处理，包含没有活动事件的空档 |
 | `raft.fetch.receive` / `raft.fetch` | 响应处理耗时 / RPC 发出到处理完成的总耗时 |
-| `raft.fetch.flush_gate.ready/blocked` | 实际 gate 判断、拒绝原因和 flush ID |
+| `raft.fetch.flush_gate.ready/blocked` | 拒绝原因和 flush ID，以及阻塞后的放行；直接通过不单独记点 |
 | `raft.fetch.await_flush` | gate 首次拒绝到允许；重试不重置起点 |
-| `raft.await_io` | 返回空档内，请求真正等待 I/O 的区间并集 |
+| `raft.await_io` | 事件记录实际 I/O 等待起止；Fetch 同名属性仅统计返回空档内的等待并集 |
+| `raft.worker.queue` / `raft.folly.queue` | 提交到对应执行器至回调开始 |
+| `raft.set.admission_queue` / `raft.set.encode_queue` | 准入请求创建至出队 / 编码任务提交至执行开始 |
+| `raft.apply.lane_queue` / `shard_queue` / `owner_queue` / `complete_queue` | Apply lane、shard、owner、完成回调各自的入队至执行开始 |
+| `journal.apply` | JournalExecutor 的 DispatchCommand 起止，不含 shard 排队 |
+| `metadata.fetch.*` / `metadata.worker.queue` / `metadata.await_io` / `metadata.await_commit` | 数据节点 metadata observer 的 Fetch、worker 排队和实际等待；边界与 data group 相同 |
+| `metadata.peer.backoff` / `metadata.apply` | metadata peer 循环的退避休眠 / 已提交 metadata 的本地应用 |
 | `raft.fetch.fsync_overlap` / `io_fsync_overlap` | 返回空档与同 group fsync 的交集 / 再与 await_io 相交；重叠区间不重复累计 |
 | `raft.folly.fsync` / `raft.flush` | 同步提交到完成回调 / 整个后台 flush 生命周期 |
 | `raft.fetch.payload_bytes` / `appended_bytes` / `appended_records` | 响应字节 / 实际成功追加的完整前缀字节 / 记录数 |
@@ -39,6 +47,10 @@ Raft C++ → 有界内存缓冲与延后定稿 → OTEL trace exporter → Langf
 `raft.fetch = rpc + return_wait + receive`；gate、await_io 和 fsync overlap 可互相重叠，不能再加到总耗时。`return_wait`、`await_flush` 和 gate 原因是新增显式证据，不是历史事件的改名。
 
 关联使用 capture、process instance、group、epoch、request、event、io、flush 等明确身份；共享 fsync 只保存一次。时间相交与真实等待依赖分别标记，不能通过“时间最近”猜配对，也不能相减不同机器的单调时钟。缺失或未完成值保留 `Unsupported`、`Incomplete`，只有完整观测到的零值才写 0。
+
+不再采集无具体操作身份的 `raft.worker.operation`，保留 worker 排队和具体执行事件。`raft.fetch.response`、`raft.fetch.appended` 两个重复端点不再单独上报，其边界分别保留在 `raft.fetch.rpc` 和 `raft.log.append` 中；请求的字节、offset 和耗时属性不变。历史记录仍可查询。
+
+metadata observer 使用独立的 group 0 stream，事件与耗时属性沿用 `metadata.*`、ms；原始事件角色表示该组的实际角色。统计按节点分开计算，比较表的 Node 使用压测 data group 的角色与编号，对齐历史记录，不能把两个 metadata Follower 合并后与历史单节点比较。`input_lifetime` 在 group owner 释放输入时记录，不能用等待回复结束的 ticket 生命周期代替。client 使用独立 stream，恢复和回读校验成功后上报；新诊断轮缺少 client stream 不通过完整性验证。
 
 ## 采集与完整性
 
@@ -52,8 +64,9 @@ Raft C++ → 有界内存缓冲与延后定稿 → OTEL trace exporter → Langf
 
 - **Slow path**：整轮所有事件按 duration 降序取 Top 10；event name、node、group 和 `-min-duration-ms` 均为可选过滤。点击编号或事件名展开关联时序。
 - **Fetch delay**：按已存 `raft.fetch.return_wait` 排序，展示 RPC、返回空档、gate 和 I/O 证据。页面初始过滤 ≥ 10 ms；CLI 使用 `-min-return-wait-ms`，默认 0。
+- **Trace 统计**：按各轮测量窗口裁剪相交事件，再计算数量、并集和分位数。Fetch RPC 包含正常的无数据长轮询（最多 100 ms），不能仅凭 RPC 耗时判定复制阻塞。
 - `-capture` 固定轮次，`-selected TRACE_ID:SPAN_ID` 选择详情，`-json` 输出同一 API DTO。可复查命令集中在 [v16 文档](v16-wal-encode-overlap.md#1-分析查询)。
-- Node / Event name 下拉来自整轮 capture。节点显示角色和编号，优先采用显式角色，否则依据 Fetch 的 group/epoch 身份；无法确定时显示 `Unknown`。角色切换且缺少任期时保留本轮全部角色，不将 fsync 文件类型当节点角色。
+- Node / Event name 下拉来自整轮 capture。下拉可列出节点经历过的角色，单个事件只归属一个角色：优先使用记录的角色或所属请求的 group/epoch；旧事件缺少身份时，须被同一进程内无冲突的角色时段完整覆盖，否则显示 `Unknown`。不将整轮角色集合填入事件，也不将 fsync 文件类型当节点角色。
 
 ## Langfuse 与 Metrics
 

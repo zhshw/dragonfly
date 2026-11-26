@@ -20,7 +20,7 @@ func TestSelectPreviousExperiment(t *testing.T) {
 	base := Target{ID: "initial", Mode: "raft", Ack: "memory"}
 	reference := Target{ID: "reference", Mode: "yes"}
 	current := Target{
-		ID: "v10:current", ExperimentID: "v10", Variant: "current", Mode: "raft", Ack: "memory",
+		ID: "v10", ExperimentID: "v10", Variant: "current", Mode: "raft", Ack: "memory",
 		CumulativeID: base.ID, ReferenceID: reference.ID,
 	}
 	legacy := current
@@ -32,8 +32,9 @@ func TestSelectPreviousExperiment(t *testing.T) {
 	}{
 		{"experiment ID", "v10", current.ID, targets},
 		{"target ID", current.ID, current.ID, targets},
-		{"legacy experiment ID", "v10", legacy.ID, targets[:3]},
-		{"legacy target ID", legacy.ID, legacy.ID, targets},
+		{"old current ID", "v10:current", current.ID, targets},
+		{"legacy experiment ID", "v10", current.ID, targets[:3]},
+		{"legacy target ID", legacy.ID, current.ID, targets},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			choices, err := selectTargets(ChoiceIDs{Previous: tc.input}, func() ([]Target, error) { return tc.targets, nil })

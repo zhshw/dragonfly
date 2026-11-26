@@ -106,5 +106,43 @@ TEST(FollyIoTest, GroupAwaitKeepsCompletionAliveAcrossThreads) {
   }
 }
 
+TEST(FollyIoTest, QueueTimingEndsAtDispatchBeforeIoCompletion) {
+  FollyIo io;
+  folly::Baton<> parked, release, completed;
+  io.Run([&] {
+    parked.post();
+    release.wait();
+  });
+  parked.wait();
+  auto now = [] {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  };
+  int64_t begin = 0, end = 0, finish = 0;
+  unsigned count = 0;
+  io.Submit(
+      -1, -1, {},
+      [&](int result) {
+        EXPECT_EQ(result, -EBADF);
+        finish = now();
+        completed.post();
+        return true;
+      },
+      [&](int64_t start, int64_t stop) {
+        begin = start;
+        end = stop;
+        ++count;
+      });
+  const auto released = now();
+  release.post();
+  completed.wait();
+  io.Drain();
+  EXPECT_EQ(count, 1u);
+  EXPECT_LE(begin, released);
+  EXPECT_GE(end, released);
+  EXPECT_LE(end, finish);
+}
+
 }  // namespace
 }  // namespace dfly::cluster::raft

@@ -104,10 +104,10 @@ string EncodeTraceBatch(const trace::Capture& capture, const TraceIdentity& iden
       Attribute(span.get(), key, value);
     for (const auto& value : event.values) {
       const auto& def = trace::Definitions().at(size_t(value.attribute));
-      Attribute(span.get(), absl::StrCat("state.", def.name), value.state);
+      const auto name = capture.EventName(def.name);
+      Attribute(span.get(), absl::StrCat("state.", name), value.state);
       if (value.value)
-        Attribute(span.get(), absl::StrCat("value.", def.name),
-                  AttributeValue(*value.value, def.unit));
+        Attribute(span.get(), absl::StrCat("value.", name), AttributeValue(*value.value, def.unit));
     }
     spans.push_back(std::move(span));
   };
@@ -139,7 +139,7 @@ string EncodeTraceBatch(const trace::Capture& capture, const TraceIdentity& iden
     manifest.attributes["dropped_streams"] = to_string(identity.dropped_streams);
     manifest.attributes["expected_nodes"] = identity.expected_nodes;
     for (const auto& def : trace::Definitions())
-      manifest.attributes[absl::StrCat("unit.", def.name)] = def.unit;
+      manifest.attributes[absl::StrCat("unit.", capture.EventName(def.name))] = def.unit;
     add(manifest);
   }
   ot::proto::collector::trace::v1::ExportTraceServiceRequest request;

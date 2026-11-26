@@ -27,7 +27,8 @@ class FetchReplication;
 class PartitionLog;
 namespace trace {
 class Capture;
-}
+class Batch;
+}  // namespace trace
 
 // All partition state, including application and I/O completion callbacks, runs on its worker.
 class RaftGroup {
@@ -65,6 +66,9 @@ class RaftGroup {
 
   // Install before capture traffic; all recording remains on this group's serial owner.
   void SetTraceCapture(std::shared_ptr<trace::Capture> capture);
+
+  // Called on the serial group owner; return remote timings to that owner before publishing.
+  std::shared_ptr<trace::Batch> NewTraceBatch();
   void WakeData();
 
   using ApplyStep = std::function<absl::StatusOr<int64_t>(const PartitionLog&, int64_t)>;

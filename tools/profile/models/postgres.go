@@ -68,7 +68,31 @@ func (p *Postgres) migrate(ctx context.Context) error {
 		if err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext('dragonfly-raft-workflow-schema'))`).Error; err != nil {
 			return err
 		}
-		return tx.Exec(schemaSQL).Error
+		if err := tx.Exec(schemaSQL).Error; err != nil {
+			return err
+		}
+		var applied bool
+		if err := tx.Raw("SELECT EXISTS (SELECT FROM raft_workflow.schema_migrations WHERE version=4)").Scan(&applied).Error; err != nil {
+			return err
+		}
+		if !applied {
+			if err := migrateTargetIDs(tx); err != nil {
+				return err
+			}
+			if err := tx.Exec("INSERT INTO raft_workflow.schema_migrations (version) VALUES (4)").Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Raw("SELECT EXISTS (SELECT FROM raft_workflow.schema_migrations WHERE version=5)").Scan(&applied).Error; err != nil {
+			return err
+		}
+		if applied {
+			return nil
+		}
+		if err := consolidateClusterReference(tx); err != nil {
+			return err
+		}
+		return tx.Exec("INSERT INTO raft_workflow.schema_migrations (version) VALUES (5)").Error
 	})
 }
 
@@ -123,7 +147,7 @@ func (p *Postgres) Create(in CreateRequest) (Summary, error) {
 	if err := p.write(ctx, []Record{record}, nil); err != nil {
 		return Summary{}, err
 	}
-	return record.Summary, nil
+	return p.Summary(in.ID)
 }
 
 const experimentDetail = `SELECT jsonb_build_object(
@@ -352,7 +376,7 @@ func (p *Postgres) Import(ctx context.Context, config ImportConfig) (Summary, er
 	if err := p.write(ctx, []Record{record}, targetsFrom(record.Summary)); err != nil {
 		return empty, err
 	}
-	return record.Summary, nil
+	return p.Summary(label.ID)
 }
 
 func (p *Postgres) write(ctx context.Context, records []Record, targets []Target) error {
@@ -371,7 +395,7 @@ func (p *Postgres) write(ctx context.Context, records []Record, targets []Target
 				return fmt.Errorf("%s: %w", record.Summary.Experiment.ID, err)
 			}
 		}
-		return nil
+		return consolidateClusterReference(tx)
 	}))
 }
 
@@ -391,6 +415,7 @@ func (p *Postgres) writeRecord(tx *gorm.DB, r Record) error {
 		return err
 	}
 	digest := manifestHash(encoded)
+	r.Summary.Comparisons.canonicalize()
 	id, state := r.Summary.Experiment.ID, r.Summary.Experiment.State
 	var dir string
 	if r.dir != "" {

@@ -10,7 +10,7 @@ import { api, decisionNames, endpoint, number, percent, referenceHref, targetTit
 import type { Detail, ExperimentLabel, Metrics, Summary, View } from './model';
 import { RunsView } from './evidence';
 import { DiagnosticsView, ReferenceView } from './diagnostics';
-import { StageAnalysis } from './stages';
+import { SlowAnalysisView } from './native-trace';
 import { CreateExperiment, TargetDetails } from './create';
 import { ExecutionPanel } from './execution';
 import { DeleteExperiment } from './delete';
@@ -20,7 +20,7 @@ const views = [
   { id: 'overview', label: '总览', icon: ChartNoAxesCombined },
   { id: 'runs', label: '运行记录', icon: ListOrdered },
   { id: 'flamegraphs', label: '火焰图', icon: Flame },
-  { id: 'stages', label: '阶段分析', icon: ChartBar },
+  { id: 'slow', label: 'Slow 分析', icon: ChartBar },
   { id: 'trace', label: 'Trace', icon: Workflow },
 ] as const;
 
@@ -33,8 +33,8 @@ function route(): { id?: string; view: View; reference?: string; requestAnalysis
       return { view: 'overview' };
     }
   }
-  return { id, view: views.find(({ id }) => id === tab)?.id || 'overview',
-    requestAnalysis: tab === 'stages' && section === 'requests' };
+  return { id, view: tab === 'stages' ? 'slow' : views.find(({ id }) => id === tab)?.id || 'overview',
+    requestAnalysis: (tab === 'stages' || tab === 'slow') && section === 'requests' };
 }
 
 function href(id: string, view: View) {
@@ -296,9 +296,12 @@ function App() {
           </nav>
           {page.view === 'overview' && <Overview summary={active.summary} configure={() => setConfiguring(true)} />}
           {page.view === 'runs' && <RunsView key={experiment.id} id={experiment.id} />}
-          {page.view === 'stages' && <StageAnalysis key={experiment.id} detail={active} requests={page.requestAnalysis} />}
+          {page.view === 'slow' && <div className="view-content trace-view">
+            <SlowAnalysisView key={`${experiment.id}-${page.requestAnalysis}`} id={experiment.id}
+              initialMode={page.requestAnalysis ? 'requests' : 'events'} />
+          </div>}
           {(page.view === 'flamegraphs' || page.view === 'trace') && <DiagnosticsView key={experiment.id} id={experiment.id} view={page.view}
-            referenceID={!active.summary.comparisons.previous ? active.summary.comparisons.reference?.target.id : undefined} />}
+            referenceID={active.summary.comparisons.reference?.target.id} />}
           </>}
         </>}
       </div>

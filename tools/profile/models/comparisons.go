@@ -43,7 +43,7 @@ func configuredComparisons(summary Summary, ids ChoiceIDs, targets []Target) (Co
 			target, _ = findPreviousTarget(selection.id, targets)
 		} else {
 			for _, candidate := range targets {
-				if candidate.ID == selection.id {
+				if candidate.ID == resolveTargetID(selection.id, targets) {
 					target = candidate
 					break
 				}

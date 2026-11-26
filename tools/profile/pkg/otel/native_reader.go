@@ -46,14 +46,22 @@ func NewNativeReader(config NativeConfig) *NativeReader {
 
 // Query returns a read-only report. Incomplete captures are read again on the next request.
 func (r *NativeReader) Query(ctx context.Context, experiment, capture string, q NativeQuery) (NativeReport, error) {
-	if capture == "" || experiment == "" {
-		return NativeReport{}, errors.New("experiment and capture are required")
-	}
-	if err := ctx.Err(); err != nil {
+	data, err := r.load(ctx, experiment, capture)
+	if err != nil {
 		return NativeReport{}, err
 	}
+	return data.rank(q)
+}
+
+func (r *NativeReader) load(ctx context.Context, experiment, capture string) (*nativeCaptureData, error) {
+	if capture == "" || experiment == "" {
+		return nil, errors.New("experiment and capture are required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if data := r.cached(experiment, capture); data != nil {
-		return data.rank(q)
+		return data, nil
 	}
 
 	// Switching filters can cancel an HTTP request while another request still needs its capture.
@@ -77,12 +85,12 @@ func (r *NativeReader) Query(ctx context.Context, experiment, capture string, q 
 	})
 	select {
 	case <-ctx.Done():
-		return NativeReport{}, ctx.Err()
+		return nil, ctx.Err()
 	case result := <-loaded:
 		if result.Err != nil {
-			return NativeReport{}, result.Err
+			return nil, result.Err
 		}
-		return result.Val.(*nativeCaptureData).rank(q)
+		return result.Val.(*nativeCaptureData), nil
 	}
 }
 
