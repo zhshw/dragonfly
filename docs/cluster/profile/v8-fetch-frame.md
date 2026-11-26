@@ -1,6 +1,6 @@
 # v8：Fetch 直接封帧
 
-[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#v8-frame-experiment) · [v7 Follower 复用接收批次](v7-follower-cache.md)
 
 ## P1-7 实验：Fetch 直接封帧，减少 leader 复制（v8）
 
@@ -10,7 +10,7 @@
 
 同机未插桩 Folly Release，**1 连接 / pipeline 64**，256 MiB、256 KiB/value、64 笔预热和 5 秒静置，
 三版本交错各三轮，计时包含 SET + 原写连接 WAIT 1。基线是 `88f83cd7` 的 P1-4 完整版本，
-使用本轮复测 **299.55** 计算增量；原始 **169.56 MiB/s** 与上一轮 **300.25** 都保留原含义。
+表中为三轮中位数及确认吞吐范围，使用本轮复测 **299.55** 计算增量。相对 v3 初始基线 **169.56 MiB/s**，确认吞吐跨轮提高 **91.9%**。 [v3 基线](v3-baseline.md)
 
 | 版本 | 确认吞吐 MiB/s（范围） | 仅 SET 吞吐 MiB/s | 末尾 WAIT ms | 批次 P95 ms |
 | --- | ---: | ---: | ---: | ---: |

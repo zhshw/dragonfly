@@ -1,6 +1,6 @@
 # 未保留试验：follower 接收确认快路径（无收益，已回退）
 
-[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#p0-1b-receipt-experiment)
 
 原采集使用 `v10` 试验代号；本次代码未保留。保留版本 v10 的 P1-6 实验见[后台同步与普通追加并行](v10-memory-flush-overlap.md)。
 

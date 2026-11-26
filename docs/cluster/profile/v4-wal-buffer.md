@@ -1,11 +1,28 @@
 # v4：共享 WAL 缓冲与直接编码
 
-[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#wal-buffer-remaining) · [v3 基线](v3-baseline.md) · [v5 批量应用](v5-batched-apply.md) · [v6 直接聚合](v6-drain-sharing.md)
+
+## 三轮未插桩结果
+
+2026-11-23，沿用 v3 的机器和负载。未插桩 Folly Release，1 连接、pipeline 64、256 MiB、256 KiB/value，计时到原写连接 `WAIT 1` 成功。Raft 两版均显式使用 `memory`，与原 cluster 交错各跑三轮。表中为三轮中位数及吞吐范围。
+
+| 版本 | 确认吞吐 MiB/s（范围） | 批次 P95 ms |
+| --- | ---: | ---: |
+| v3 本轮复测 `5f185e62b82d…` | 164.59（162.18–168.49） | 129.00 |
+| 共享缓冲 + 直接编码 `b8362f34fc6e…` | **203.44（196.54–223.93）** | **83.38** |
+| 原 cluster，同一新版二进制 | 607.46（605.95–626.61） | 35.51 |
+
+- 同轮确认吞吐 **+23.6%**、批次 P95 **−35.4%**，新旧吞吐范围不重叠。原 cluster 的吞吐是本轮新版的 **2.99 倍**。v3 首次测得 169.56 MiB/s，本轮增量使用同版复测值 164.59 MiB/s。
+- 单独共享缓冲的先行对照为 170.20 → 172.36 MiB/s（+1.3%），三轮范围重叠。直接编码和共享缓冲的组合收益以本轮对照为准。
+- 聚合 WAL 通过 move 和不可变共享所有权交给 I/O。SET 的 DFKV 头、key、value 直接写入最终 batch，去掉中间 payload/body/records。两版使用相同的日志格式、CRC、提交和应用确认条件。effect 缓存副本、drain 聚合复制和逐笔应用仍存在。
+- 9 轮均通过 `WAIT 1`、离线副本恢复、`WAIT 2` 和全部 1088 个值读回。Debug、Release 单元回归，57 项 ASAN/UBSAN 检查和 11 项集群回归通过。
+
+复测时将 A/B 示例中的 `-baseline-build` 指向冻结的 v3 构建，`-output-dir` 可用 `docs/cluster/benchmarks/profile-buffer-c1`。正式原始数据和两阶段二进制在测试机 `docs/cluster/benchmarks/profile-buffer-20261123/`。 [本地 A/B 命令](../profile.md#local-benchmark)
 
 ## 上轮复采：复制下降，应用与 RSS 尚未改善（v4）
 
 同一负载分别复采优化前、优化后及原 cluster，三轮均通过恢复和逐值读回。
-旧诊断二进制为 `72f222abed27…`，新诊断二进制为 `9371d68cbce0…`；正式吞吐见对应的[三轮未插桩结果](../replication-benchmark.md#memory-优化共享-wal-缓冲与直接编码)。
+旧诊断二进制为 `72f222abed27…`，新诊断二进制为 `9371d68cbce0…`。
 按角色对照：旧 Raft leader 为 node 11，新 Raft leader 为 node 12，不能直接比较同编号节点。
 
 | 单次诊断指标 | 优化前 raft.memory | 优化后 raft.memory | 原 cluster |

@@ -1,6 +1,6 @@
 # v9：SET 输入所有权转交
 
-[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#v9-input-experiment) · [v8 Fetch 直接封帧](v8-fetch-frame.md)
 
 <a id="input-ownership"></a>
 

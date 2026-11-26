@@ -25,7 +25,7 @@ Linux 数据组使用异步文件 I/O，Folly / Helio 仍由编译宏选择；�
 未发布尾部丢失另有回归覆盖。单连接 pipeline 64 的三轮未插桩对照中，
 `raft.memory` 相对 `raft.flush` 确认吞吐仅提高 4.4%，原 cluster 仍快 3.71 倍。
 独立火焰图和 trace 显示 worker 内编码、数据复制、应用及排队仍有明显成本，后台刷盘也仍会阻塞。
-见 [benchmark 文档](replication-benchmark.md) 和 [性能分析结论](replication-observability.md)。
+见 [v3 确认模式实测](profile/v3-baseline.md#ack-modes) 和 [性能分析结论](replication-observability.md)。
 
 | 开关 | 行为 |
 | --- | --- |
@@ -52,7 +52,7 @@ Release 的两副本、条件写、WAIT、断连、关闭排空、换主及快�
 因缺少 classpath 跳过。显式关闭两个开关的条件写与 WAIT 回归也通过。
 二进制 `--helpfull` 确认两项默认值为 `true`；随后重跑的 1、2、8 连接 benchmark 见下节链接。
 
-### 同连接 SET 提交与确认解耦（本轮）
+### 同连接 SET 提交与确认解耦
 
 `raft_drain_writes=true` 时，RESP V2 的普通 `SET key value` 使用非等待入队接口，
 后续 SET 无须等前一笔确认。入队顺序决定日志顺序，同 key 也可连续提交。
@@ -71,19 +71,7 @@ V1 及关闭 drain 时保留串行行为；文件 I/O 仍使用原来的 Folly �
 真实集群断连、同 key、条件写、WAIT、DB 切换、窗口饱和、超限请求、崩溃恢复和关机
 回归通过；新增三个集群用例另在 ASAN+UBSAN（开启泄漏检查）下通过。
 
-历史未插桩旧/新 Release 和原 cluster 保留 18 轮单连接配对测试：单连接 pipeline 64 的复制确认吞吐
-中位数由 81.48 增至 163.75 MiB/s（2.01 倍），批次 P95 降低 49.4%。单连接逐笔吞吐
-回退 9.5%，需继续减少提交与完成调度开销。
-原 cluster 相同 pipeline 负载为 613.00 MiB/s。完整口径、范围、回退及数据见
-[复制 benchmark](replication-benchmark.md#本轮同连接-set-已能提前提交)。
-
-最新实现的 1、2、8 连接重跑见 [复制 benchmark](replication-benchmark.md#latest-pipeline)，
-每连接 pipeline 64，比较改动前 Raft、当前 Raft 和原 cluster。27 轮全部通过；
-当前 Raft 相对已支持 pipeline 的改前版确认吞吐分别变化 +4.2% / −0.3% / +2.4%，
-8 连接 SET 窗口仅提高 0.2%，尚无稳定整体收益。原始数据仅保存在本地和测试机，不纳入 Git。
-历史样本中的 64 连接档位
-及对应结论已删除，pipeline 深度和预热笔数中的 64 保留。
-队首容量回退、票据释放、WAL 排空与应用等待的实际占比尚待 trace/火焰图分析。
+普通 SET 可按连接顺序提前入队，仍等多数落盘及 leader 应用后回复。历史首次保留的 18 轮未插桩 Release 对照中，单连接 pipeline 64 的确认吞吐中位数由 81.48 增至 163.75 MiB/s（+101.0%），计时包含批末 `WAIT 1`，批次 P95 降低 49.4%。逐笔等回复的吞吐回退 9.5%，原 cluster 相同 pipeline 负载为 613.00 MiB/s。随后使用同样支持 pipeline 的两版做了段边界和入队任期配对。 [1、2、8 连接结果](profile/early-replication-benchmarks.md#flush-段边界与入队任期)
 
 ### Folly 编译变体
 
@@ -134,7 +122,7 @@ Folly + liburing 2.15 已通过 Debug / Release 的 37 项单测（新增 2 项�
 
 Folly 单连接吞吐中位数提高 8.2%，P95 基本持平（增加 0.5%）；8 连接吞吐下降 2.2%，P95 增加 5.2%。三轮吞吐范围明显重叠：单连接 Helio / Folly 分别为 63.98–72.35 / 64.51–76.38 MiB/s，8 连接分别为 154.75–181.78 / 156.15–175.87 MiB/s。样本较少，尚不能判定 Folly 存在稳定的整体性能优势，`WITH_RAFT_FOLLY` 保持默认关闭。
 
-这是相同持久化协议下两种适配及其调度策略的整体对照，不能单独归因于库本身：例如本机 Helio 启用 DEFER_TASKRUN，而 Folly 保持默认关闭。吞吐以 64 MiB 客户端有效负载除以写入耗时；重启至 WAIT 2 包含进程启动、追赶和客户端轮询，不是纯磁盘恢复耗时。当前以在线副本确认完成为终点的对照见 [复制 benchmark](replication-benchmark.md#latest-pipeline)。完整日志和二进制保留在远端 `~/workspace/db/dragonfly-io-uring-20261123/results-folly/`。
+这是相同持久化协议下两种适配及其调度策略的整体对照，不能单独归因于库本身：例如本机 Helio 启用 DEFER_TASKRUN，而 Folly 保持默认关闭。吞吐以 64 MiB 客户端有效负载除以写入耗时；重启至 WAIT 2 包含进程启动、追赶和客户端轮询，不是纯磁盘恢复耗时。完整日志和二进制保留在远端 `~/workspace/db/dragonfly-io-uring-20261123/results-folly/`。 [后续流水线测试（计至副本应用）](profile/early-replication-benchmarks.md#flush-段边界与入队任期)
 
 ### Folly 压测源码审查与后续试验
 
@@ -247,7 +235,7 @@ runner 交替运行三组单笔追加探针、三组单连接客户端，以及�
 
 ## Ubuntu 26.04 NVMe 结果（2026-11-23）
 
-当前原 cluster 与 Folly 异步 Raft 的比较见 [复制确认完成 benchmark](replication-benchmark.md#latest-pipeline)。下面只保留历史 Helio 异步追加的独立插桩数据，用于分析 Fetch、刷盘重叠和 drain 摊销，不与当前客户端对照混算。同步 Raft 样本已删除。
+当前原 cluster 与 Folly 异步 Raft 的比较见 [同期确认吞吐比较](profile/early-replication-benchmarks.md#flush-段边界与入队任期)。下面只保留历史 Helio 异步追加的独立插桩数据，用于分析 Fetch、刷盘重叠和 drain 摊销，不与当前客户端对照混算。同步 Raft 样本已删除。
 
 主机 `172.31.23.2`，i7-13700KF、Linux 7.0.0-43 x86_64、GCC 15.2 Release，WD_BLACK SN770 1TB，日志目录位于 `/dev/nvme0n1p4` 的 ext4。网络固定 epoll、数据节点 2 个网络线程。每项三轮交替运行，下表各列取三轮中位数；逐轮结果仅保存在本地 `docs/cluster/benchmarks/io-uring-ubuntu-20261123.csv`。最初的 `/tmp` 位于 tmpfs，相关调度诊断数字未计入下表。
 
@@ -260,7 +248,7 @@ runner 交替运行三组单笔追加探针、三组单连接客户端，以及�
 
 同步次数为两个在线数据节点合计，分别统计段和标记；单笔在途每千笔各为 2000 次。异步三轮分别有 1、176、202 笔出现两端同步区间交集，交集时间 P50 的三轮中位数为 0.176 ms。数据组 Fetch 入队至处理 P95 的中位数为 1.249 ms。
 
-8 连接下，drain 相比仅启用异步，段和标记的同步次数各下降约 9%，吞吐提高约 6%；drain 排队字节峰值为 2,097,228。进程内探针与客户端测试的计时范围、应用成本和下一笔调度不同，不能把两者延迟直接相减。
+8 连接下，drain 相比仅启用异步，段和标记的同步次数各下降约 9.1%，吞吐提高约 6%；drain 排队字节峰值为 2,097,228。进程内探针与客户端测试的计时范围、应用成本和下一笔调度不同，不能把两者延迟直接相减。
 
 这些历史样本说明 Fetch 路径和 drain 在本机、该负载下有效，当时两个开关默认关闭；当前默认值见文首。没有测量设备掉电，也没有把 tmpfs 的结果外推到 NVMe。
 

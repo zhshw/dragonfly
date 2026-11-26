@@ -1,6 +1,6 @@
 # v7：follower 复用接收批次
 
-[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#v7-follower-experiment) · [v6 effect/WAL 共享](v6-drain-sharing.md)
 
 ## P1-4 实验：follower 复用接收批次，确认吞吐提高，RSS 未下降（v7）
 
@@ -10,7 +10,7 @@
 缓存按唯一 capacity 限额，超预算/控制记录/恢复走 WAL；截断与快照内容代次、任期变化会使缓存失效。
 
 正式性能仍为同机未插桩 Folly Release，**1 连接 / pipeline 64**，256 MiB、256 KiB/value，
-三版本交错各三轮，计时包含 SET + 原写连接 WAIT 1。基线是完整 P0-1 版，本轮复测为 252.11；
+三版本交错各三轮，计时包含 SET + 原写连接 WAIT 1，表中为三轮中位数及确认吞吐范围。基线是完整 P0-1 版，本轮复测为 252.11；
 不用上一轮 242.79 计算增量，原始基线 **169.56 MiB/s** 保留。
 
 | 版本 | 确认吞吐 MiB/s（范围） | 仅 SET 吞吐 MiB/s | 末尾 WAIT ms | 批次 P95 ms |

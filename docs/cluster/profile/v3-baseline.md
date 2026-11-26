@@ -1,6 +1,32 @@
 # v3：初始基线与诊断
 
-[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#experiments)
+
+<a id="ack-modes"></a>
+
+## raft.flush、raft.memory 与原 cluster 正式结果
+
+2026-11-23 在 `172.31.23.2`（Ubuntu 26.04、i7-13700KF、NVMe ext4）运行同一未插桩 Folly Release 二进制 `5f185e62b82d…`。1 连接、pipeline 64、256 MiB、256 KiB/value，使用不同 key，预热 64 笔并静置 5 秒。三副本停一台，计时从首笔 SET 发出至原写连接 `WAIT 1` 成功。9 轮均通过离线副本恢复、`WAIT 2` 和全部 1088 个值读回。表中为三轮中位数。
+
+| 模式 | 确认吞吐 MiB/s | 批次 P95 ms |
+| --- | ---: | ---: |
+| raft.flush | 162.38 | 114.15 |
+| raft.memory | 169.56 | 113.75 |
+| 原 cluster | 628.87 | 22.89 |
+
+`raft.memory` 确认吞吐较 `raft.flush` 提高 **4.4%**，原 cluster 为 `raft.memory` 的 **3.71 倍**。`flush` 默认要求多数持久化，`memory` 改为多数写入 page cache 后确认并后台刷盘。逐轮刷盘只解释了当时的一小部分差距。独立采样中 leader 的后台 fsync 区间并集约 138 ms，`memcpy/memset` 占 leader CPU 样本的 68.8%。当时先在 1 连接 / pipeline 64 负载下验证减少复制与批量应用。 [确认模式语义](../io_uring.md#当前实现默认开启) · [v4 共享 WAL 缓冲](v4-wal-buffer.md) · [v5 批量应用](v5-batched-apply.md)
+
+用同一份 Release 二进制复测三个模式。原始结果位于测试机隔离仓库的 `docs/cluster/benchmarks/ack-modes-20261123-c1/`，由 Git 忽略。
+
+```sh
+mkdir -p "$PWD/docs/cluster/benchmarks"
+profile benchmark \
+  -build-dir build-opt -ack-modes flush,memory -include-cluster \
+  -clients 1 -pipeline-depth 64 \
+  -output-dir "$PWD/docs/cluster/benchmarks/ack-modes-c1"
+```
+
+## 火焰图与 Trace 诊断
 
 以下采用 2026-11-23 的 `memory-c1-p64-v3` / `cluster-c1-p64-v3` 初始采样，作为选择优化项的依据。
 同机、同一插桩二进制（SHA-256 前缀 `72f222abed27`）、1 连接、pipeline 64、256 MiB、256 KiB/value；
@@ -8,7 +34,6 @@
 
 | 指标 | raft.memory | 原 cluster |
 | --- | ---: | ---: |
-| 未插桩三轮确认吞吐中位数 | 169.56 MiB/s | 628.87 MiB/s |
 | 插桩 SET + WAIT 1 | 1512.14 ms | 415.31 ms |
 | leader CPU 样本 / 估计 CPU 时间 | 628 / 1256 ms | 191 / 382 ms |
 | leader memcpy | 366 样本 / 732 ms | 116 样本 / 232 ms |
@@ -34,5 +59,5 @@
 
 原始证据入口：[Raft 火焰图](http://172.31.23.2:3137/memory-c1-p64-v3/index.html)、
 [原 cluster 火焰图](http://172.31.23.2:3137/cluster-c1-p64-v3/index.html)、
-[trace 结论及链接](../replication-observability.md)、[未插桩 benchmark](../replication-benchmark.md)。
+[trace 结论及链接](../replication-observability.md)。
 原始 `*.folded`、`stages.csv` 和 `summary.json` 位于 `docs/cluster/benchmarks/observability-20261123/`，由 Git 忽略。

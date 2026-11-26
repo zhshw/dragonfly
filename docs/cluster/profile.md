@@ -1,12 +1,18 @@
 # Raft 复制 Profile
 
-逐轮 benchmark、验证日志、Trace 和火焰图按实验 ID 查询。 [实验平台](http://172.31.23.2:8787/)
-
-[Raft 原生 OTEL traces](otel/trace.md)：C++ 现场计算请求属性，记录等待与 I/O 证据，直接上报 Langfuse，CLI/Web 共用查询；保留准入空档和 flush gate 两个强制复现场景。[OTEL Metrics](otel/metrics.md) 延后。
+按实验查阅正式 benchmark、验证日志、Trace 和火焰图。各轮文档注明负载、计时终点与统计口径，平台「运行记录」的 Diff 表展示算术均值。 [实验平台](http://172.31.23.2:8787/)
 
 <a id="experiments"></a>
 
 ## 实验索引
+
+### v3 之前的实验
+
+- [SET 提交与确认解耦](io_uring.md#同连接-set-提交与确认解耦)
+- [flush 段边界与入队任期，1、2、8 连接](profile/early-replication-benchmarks.md#flush-段边界与入队任期)
+- [CRC 指令优化（未合入）](profile/early-replication-benchmarks.md#crc-指令优化)
+
+### v3 起的实验
 
 - [v3 初始基线与诊断](profile/v3-baseline.md)
 - <a id="wal-buffer-remaining"></a>[v4 P0-1 共享 WAL 缓冲与直接编码](profile/v4-wal-buffer.md)
@@ -30,7 +36,8 @@
 
 - <a id="ticket-completion-review"></a>[P1-3 按 applied offset 批量完成票据](profile/p1-3-review.md)
 - [批次事件循环的设计与验证](raft-batch-event-loop.md)
-- [历史 benchmark](replication-benchmark.md) · [初始火焰图与 Trace](replication-observability.md)
+- [WAL 与 io_uring 实验](io_uring.md) · [v3 初始火焰图与 Trace](replication-observability.md)
+- [Raft 原生 OTEL Trace 与复现场景](otel/trace.md) · [OTEL Metrics](otel/metrics.md)
 
 ## 使用 profile
 
@@ -50,6 +57,21 @@ profile show -id "$experiment_id"
 ```
 
 `run` 等待本轮 benchmark 和诊断结果入库，`show` 查看三轮正式数据。需要独立测量时，在执行机用 `profile run -config FILE`，配置中的 `output` 指向新目录。 [CLI 参数](../../tools/profile/README.md#cli)
+
+<a id="local-benchmark"></a>
+
+### 用本地二进制做 A/B 对照
+
+在真实磁盘目录运行，保留改动前的 `dragonfly`、`raft_storage`，并将输出指向新目录。下面以 v9 和 v10 为例，两版使用同一个 Go 压测器重采。历史 Python 压测结果保留原记录。 [Folly 构建方法](io_uring.md#folly-编译变体) · [v10 首次同轮验证](profile/v10-memory-flush-overlap.md#首次同轮验证)
+
+```sh
+ninja -C build-opt dragonfly raft_storage
+mkdir -p "$PWD/docs/cluster/benchmarks"
+profile benchmark \
+  -build-dir build-opt -baseline-build /path/to/v9-build \
+  -ack-mode memory -include-cluster -clients 1 -pipeline-depth 64 \
+  -output-dir "$PWD/docs/cluster/benchmarks/profile-flush-overlap-c1"
+```
 
 ### Trace 和火焰图分析示例
 

@@ -1,6 +1,6 @@
 # v10：memory 后台同步与普通追加并行
 
-[Profile 索引](../profile.md#memory-flush-separation) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#memory-flush-separation) · [v9 输入所有权转交](v9-input-ownership.md)
 
 **P1-6 已保留。** 将追加与后台同步分开管理，同任期、同一段的普通 memory 写可在 fsync 期间继续编码、追加、复制和确认。
 
@@ -21,4 +21,4 @@ Ubuntu 同机未插桩 Folly Release，1 连接、pipeline 64、256 MiB。三轮
 
 Debug / Release / ASAN+UBSAN 各 86 项相关单测，Debug 和 sanitizer 各 14 项集群回归通过。覆盖并发完成顺序、短写、两类 I/O 失败、固定切点崩溃恢复及新尾部计数。首次同轮测试与诊断均通过原连接 `WAIT 1`、离线副本恢复、`WAIT 2` 和全量读回。
 
-原始 benchmark、验证日志和复现资料在本地及测试机的 `docs/cluster/benchmarks/profile-flush-overlap-20261124/`，由 Git 忽略。
+原始 benchmark、验证日志和复现资料在本地及测试机的 `docs/cluster/benchmarks/profile-flush-overlap-20261124/`，由 Git 忽略。 [本地 A/B 命令](../profile.md#local-benchmark)

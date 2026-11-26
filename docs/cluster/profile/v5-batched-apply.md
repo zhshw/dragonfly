@@ -1,14 +1,27 @@
 # v5：批量应用与借用参数
 
-[Profile 索引](../profile.md) · [benchmark](../replication-benchmark.md)
+[Profile 索引](../profile.md#experiments) · [v4 共享 WAL 缓冲](v4-wal-buffer.md)
+
+## 三轮未插桩结果
+
+沿用 v4 的机器和负载。未插桩 Folly Release，1 连接、pipeline 64、256 MiB、256 KiB/value，计时到原写连接 `WAIT 1` 成功。Raft 两版均为 `memory`，与原 cluster 交错各跑三轮。表中为三轮中位数及吞吐范围。
+
+| 版本 | 确认吞吐 MiB/s（范围） | 批次 P95 ms |
+| --- | ---: | ---: |
+| v4 本轮复测 `b8362f34fc6e…` | 206.56（192.83–211.18） | 90.91 |
+| 批量应用 + 借用参数 `f039be66100f…` | **224.69（223.36–228.81）** | **75.08** |
+| 原 cluster，同一新版二进制 | 607.34（444.33–619.21） | 33.71 |
+
+本轮确认吞吐 **+8.8%**、批次 P95 **−17.4%**。三轮新版均快于对应改前版，吞吐范围不重叠。原 cluster 首轮偏低，三轮中位数约为 v5 的 **2.70 倍**。相对 v3 首次测得的 169.56 MiB/s，v5 确认吞吐跨轮提高 **32.5%**。 [v3 基线](v3-baseline.md)
+
+复测时将 A/B 示例中的 `-baseline-build` 指向历史归档 `profile-buffer-20261123/encoded-bin`。9 轮均通过原写连接 `WAIT 1`、离线副本恢复、`WAIT 2` 和全部 1088 个值读回。 [本地 A/B 命令](../profile.md#local-benchmark)
 
 <a id="diagnostic-results"></a>
 
 ## 诊断结果
 
 对照上一轮直接编码版与本轮批量应用版，仍为 1 连接、pipeline 64、256 MiB、256 KiB/value。
-三个诊断负载都完成 WAIT 1、离线副本恢复、WAIT 2 和全部值读回；正式吞吐三轮未插桩结果为本轮增量 **+8.8%**，
-相对原始 169.56 MiB/s 基线累计 **+32.5%**（跨轮比较）。
+三个诊断负载都完成 WAIT 1、离线副本恢复、WAIT 2 和全部值读回。
 旧/新 Raft leader 均为 node 12，原 cluster leader 为 node 11。
 
 | 单次诊断指标 | 上一版 raft.memory | 本轮 raft.memory | 原 cluster |
@@ -178,7 +191,6 @@ leader 重合区间对 worker operation、encode、submit、apply、Folly queue/
 owner 每完成一笔检查 1 ms 预算，超时返回已完成前缀；单笔执行不能被强行中断。控制、no-op、迁移记录先排空批次，日志游标与 slot generation
 仍由组 worker 更新；执行失败只推进成功前缀。`JournalExecutor::ExecuteSet` 同步借用 key/value，
 省去 `BackedArguments` 的大块复制和清零，继续执行原有 SET 事务。新增 owner 排队、批次、WAL 读取及解码 trace。
-相对已优化的上一轮 `encoded-bin`，1 连接 / pipeline 64 三轮确认吞吐增量提高 8.8%。
 
 v14b 将普通缓存前缀交给独立 ApplyLane，v15 再将相邻同 shard 的普通 SET 合并为一次投递，按实际成功前缀发布应用进度。 [v14b ApplyLane](v14b-batch-progress.md) · [v15 shard 合批](v15-shard-apply.md)
 
